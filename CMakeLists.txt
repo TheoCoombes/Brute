@@ -1,0 +1,84 @@
+cmake_minimum_required(VERSION 3.18...3.27)
+project(${SKBUILD_PROJECT_NAME} LANGUAGES CXX)
+
+find_package(Python 3.8 REQUIRED COMPONENTS Interpreter Development.Module)
+
+execute_process(
+  COMMAND "${Python_EXECUTABLE}" -c "import torch; print(torch.utils.cmake_prefix_path)"
+  OUTPUT_VARIABLE TORCH_CMAKE_PREFIX
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+  RESULT_VARIABLE _torch_rc
+)
+if(NOT _torch_rc EQUAL 0)
+  message(FATAL_ERROR "PyTorch not found. Run: pip install torch")
+endif()
+list(APPEND CMAKE_PREFIX_PATH "${TORCH_CMAKE_PREFIX}")
+find_package(Torch REQUIRED)
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS}")
+
+# Optional CUDA
+if(CMAKE_CUDA_COMPILER OR Torch_CUDA)
+  enable_language(CUDA)
+  set(HAVE_CUDA TRUE)
+  message(STATUS "brute: CUDA backend enabled")
+endif()
+
+# Metal/MPS (macOS only)
+if(APPLE)
+  enable_language(OBJCXX)
+  set(HAVE_MPS TRUE)
+  message(STATUS "brute: Metal/MPS backend enabled")
+endif()
+
+# libpopcnt – header-only
+add_library(libpopcnt INTERFACE)
+target_include_directories(libpopcnt INTERFACE
+  "${CMAKE_CURRENT_SOURCE_DIR}/third_party/libpopcnt")
+
+# Sources
+set(BRUTE_SOURCES
+  cbrute/core/tensor.cpp
+  cbrute/core/ops.cpp
+  cbrute/backend/cpu/ops_cpu.cpp
+  cbrute/python/bindings.cpp
+)
+if(HAVE_CUDA)
+  list(APPEND BRUTE_SOURCES cbrute/backend/cuda/ops_cuda.cu)
+endif()
+if(HAVE_MPS)
+  list(APPEND BRUTE_SOURCES cbrute/backend/metal/ops_metal.mm)
+  set_source_files_properties(cbrute/backend/metal/ops_metal.mm
+    PROPERTIES COMPILE_FLAGS "-x objective-c++")
+endif()
+
+python_add_library(_C MODULE ${BRUTE_SOURCES} WITH_SOABI)
+
+target_include_directories(_C PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/cbrute/include"
+  "${CMAKE_CURRENT_SOURCE_DIR}/cbrute/backend/cpu"
+  "${CMAKE_CURRENT_SOURCE_DIR}/cbrute/backend/metal"
+  "${CMAKE_CURRENT_SOURCE_DIR}/cbrute/backend/cuda"
+  ${TORCH_INCLUDE_DIRS}
+)
+
+target_link_libraries(_C PRIVATE ${TORCH_LIBRARIES} libpopcnt)
+
+if(HAVE_MPS)
+  target_link_libraries(_C PRIVATE
+    "-framework Metal"
+    "-framework MetalPerformanceShaders"
+    "-framework MetalPerformanceShadersGraph"
+    "-framework Foundation")
+endif()
+
+target_compile_definitions(_C PRIVATE
+  $<$<BOOL:${HAVE_CUDA}>:HAVE_CUDA>
+  $<$<BOOL:${HAVE_MPS}>:HAVE_MPS>
+)
+
+set_property(TARGET _C PROPERTY CXX_STANDARD 17)
+if(HAVE_CUDA)
+  set_property(TARGET _C PROPERTY CUDA_STANDARD 17)
+endif()
+
+install(TARGETS _C LIBRARY DESTINATION ${SKBUILD_PROJECT_NAME})

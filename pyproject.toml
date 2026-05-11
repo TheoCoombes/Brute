@@ -1,0 +1,18 @@
+[build-system]
+requires = ["scikit-build-core >= 0.4.3"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "brute"
+version = "0.0.1"
+description = "1-bit tensor library built on PyTorch."
+readme = "README.md"
+dependencies = ["torch >= 2.0"]
+
+[tool.scikit-build]
+minimum-version = "build-system.requires"
+build-dir = "build/{wheel_tag}"
+wheel.packages = ["brute"]
+
+# Install with: pip install --no-build-isolation -ve .
+# (--no-build-isolation so the build can find the already-installed torch)
