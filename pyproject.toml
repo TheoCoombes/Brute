@@ -30,3 +30,11 @@ markers = [
     "cuda: requires CUDA",
     "mps: requires MPS",
 ]
+# Benchmark defaults — when running `pytest tests/benchmarks --benchmark-only`,
+# results are auto-grouped by op (group=...) and sorted by name so scales read
+# tiny→huge top-to-bottom. Override on the CLI if needed (e.g. --benchmark-sort=mean).
+#
+# Recommended invocation:
+#   pytest tests/benchmarks --benchmark-only \
+#       --benchmark-group-by=group --benchmark-sort=name \
+#       --benchmark-columns=mean,stddev,median,ops,rounds

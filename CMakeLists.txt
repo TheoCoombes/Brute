@@ -21,6 +21,11 @@ if(CMAKE_CUDA_COMPILER OR Torch_CUDA)
   enable_language(CUDA)
   set(HAVE_CUDA TRUE)
   message(STATUS "brute: CUDA backend enabled")
+  # Build for Volta → Hopper. CUTLASS B1 XOR-popc tensor-core path activates on sm_80+;
+  # earlier sms fall back to the hand-tuned XNOR kernel automatically.
+  if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES "70;75;80;86;89;90")
+  endif()
 endif()
 
 # Metal/MPS (macOS only)
@@ -50,9 +55,67 @@ if(HAVE_MPS)
   list(APPEND BRUTE_SOURCES cbrute/metal/ops_metal.mm)
   set_source_files_properties(cbrute/metal/ops_metal.mm
     PROPERTIES COMPILE_FLAGS "-x objective-c++")
+
+  # ── AOT MSL kernel compilation ──────────────────────────────────────────────
+  # Each .metal source → .air via `xcrun metal`, all linked into a single
+  # .metallib via `xcrun metallib`, then embedded into a generated header
+  # (brute_kernels_data.h) and #included by ops_metal.mm. The result is one
+  # .so with kernels validated at build time and zero runtime compile cost.
+  find_program(XCRUN_EXECUTABLE xcrun REQUIRED)
+  set(BRUTE_METAL_SRCS
+    cbrute/metal/kernels/packing.metal
+    cbrute/metal/kernels/popcount.metal
+    cbrute/metal/kernels/reductions.metal
+    cbrute/metal/kernels/matmul.metal
+    cbrute/metal/kernels/bitwise.metal
+  )
+  set(BRUTE_METAL_AIRS "")
+  foreach(src IN LISTS BRUTE_METAL_SRCS)
+    get_filename_component(name "${src}" NAME_WE)
+    set(air "${CMAKE_CURRENT_BINARY_DIR}/${name}.air")
+    add_custom_command(
+      OUTPUT  "${air}"
+      COMMAND "${XCRUN_EXECUTABLE}" -sdk macosx metal
+              -c -O3 -ffast-math
+              -I "${CMAKE_CURRENT_SOURCE_DIR}/cbrute/metal/kernels"
+              "${CMAKE_CURRENT_SOURCE_DIR}/${src}"
+              -o "${air}"
+      DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${src}"
+      COMMENT "metal: compiling ${name}.air"
+      VERBATIM
+    )
+    list(APPEND BRUTE_METAL_AIRS "${air}")
+  endforeach()
+  set(BRUTE_METALLIB "${CMAKE_CURRENT_BINARY_DIR}/brute_kernels.metallib")
+  add_custom_command(
+    OUTPUT  "${BRUTE_METALLIB}"
+    COMMAND "${XCRUN_EXECUTABLE}" -sdk macosx metallib
+            ${BRUTE_METAL_AIRS} -o "${BRUTE_METALLIB}"
+    DEPENDS ${BRUTE_METAL_AIRS}
+    COMMENT "metal: linking brute_kernels.metallib"
+    VERBATIM
+  )
+  set(BRUTE_METALLIB_H "${CMAKE_CURRENT_BINARY_DIR}/brute_kernels_data.h")
+  add_custom_command(
+    OUTPUT  "${BRUTE_METALLIB_H}"
+    COMMAND "${CMAKE_COMMAND}"
+            -DIN=${BRUTE_METALLIB}
+            -DOUT=${BRUTE_METALLIB_H}
+            -DSYM=kBruteKernelsMetallib
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedBinary.cmake"
+    DEPENDS "${BRUTE_METALLIB}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedBinary.cmake"
+    COMMENT "metal: embedding metallib bytes into brute_kernels_data.h"
+    VERBATIM
+  )
+  add_custom_target(brute_metallib DEPENDS "${BRUTE_METALLIB_H}")
 endif()
 
 python_add_library(_cbrute MODULE ${BRUTE_SOURCES} WITH_SOABI)
+if(HAVE_MPS)
+  # Ensure the generated metallib header exists before ops_metal.mm compiles.
+  add_dependencies(_cbrute brute_metallib)
+endif()
 
 target_include_directories(_cbrute PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/cbrute"
@@ -60,8 +123,18 @@ target_include_directories(_cbrute PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/cbrute/metal"
   "${CMAKE_CURRENT_SOURCE_DIR}/cbrute/cuda"
   "${CMAKE_CURRENT_SOURCE_DIR}/third_party/highway"
+  "${CMAKE_CURRENT_BINARY_DIR}"            # for brute_kernels_data.h (HAVE_MPS)
   ${TORCH_INCLUDE_DIRS}
 )
+
+if(HAVE_CUDA)
+  # CUTLASS is header-only; we only need its include tree (no add_subdirectory
+  # — that would build their tests and tools).
+  target_include_directories(_cbrute PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/cutlass/include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/cutlass/tools/util/include"
+  )
+endif()
 
 target_link_libraries(_cbrute PRIVATE ${TORCH_LIBRARIES} hwy)
 

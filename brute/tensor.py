@@ -35,22 +35,17 @@ def _to_bool(t: torch.Tensor) -> torch.Tensor:
     return t.bool()
 
 def _pack_bool(bool_t: torch.Tensor, pack_dtype: torch.dtype) -> torch.Tensor:
-    """Pack a bool tensor to uint storage.
+    """Pack a bool tensor to uint storage via `brute.pack_bool`.
 
-    CPU: direct bool→packed via `brute.pack_bool` (skips the float intermediate).
-    Other devices: fall back to `(bool*2-1).float()` → `brute.pack_bits` since
-    only CPU has the bool-fast-path kernel.
+    CPU + CUDA have native fast-path kernels; other backends (MPS, future)
+    transparently fall through to the CompositeExplicitAutograd composite
+    registered in ext.cpp, which decomposes to `(bool*2-1).float() → pack_bits`.
     """
     if bool_t.dtype != torch.bool:
         bool_t = bool_t.bool()
     if bool_t.dim() == 0:
         bool_t = bool_t.unsqueeze(0)
-    bool_t = bool_t.contiguous()
-
-    if bool_t.device.type == 'cpu':
-        return torch.ops.brute.pack_bool(bool_t, _PACK_BITS[pack_dtype])
-    pm1 = (bool_t.float() * 2 - 1).contiguous()
-    return torch.ops.brute.pack_bits(pm1, _PACK_BITS[pack_dtype])
+    return torch.ops.brute.pack_bool(bool_t.contiguous(), _PACK_BITS[pack_dtype])
 
 
 def _unpack_pm1(packed: torch.Tensor, logical_shape: list, pack_dtype: torch.dtype) -> torch.Tensor:
