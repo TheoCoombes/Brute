@@ -1,5 +1,21 @@
 import torch as _t
 
+try:
+    from . import _cbrute
+except ImportError:
+    # Try site-packages location (i.e. for editable installs).
+    try:
+        import importlib.util
+        spec = importlib.util.find_spec('_cbrute')
+        if spec and spec.origin:
+            _cbrute = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(_cbrute)
+    except Exception:
+        raise ImportError(
+            "brute requires the compiled _cbrute extension. "
+            "Install with: pip install --no-build-isolation -ve ."
+        )
+
 from brute.tensor import Tensor, bit1
 
 # Re-export torch dtypes
