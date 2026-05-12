@@ -27,12 +27,19 @@ def _to_bool(t: torch.Tensor) -> torch.Tensor:
 
 def _pack_bool(bool_t: torch.Tensor, pack_dtype: torch.dtype) -> torch.Tensor:
     """Pack a bool tensor to uint storage (True→1 bit, False→0 bit, {+1,-1} encoding)."""
+    if bool_t.dim() == 0:
+        # The underlying pack_bits op requires >=1 dim; promote scalars to (1,) for packing.
+        pm1 = (bool_t.float() * 2 - 1).unsqueeze(0).contiguous()
+        return torch.ops.brute.pack_bits(pm1, _PACK_BITS[pack_dtype])
     pm1 = (bool_t.float() * 2 - 1).contiguous()
     return torch.ops.brute.pack_bits(pm1, _PACK_BITS[pack_dtype])
 
 
 def _unpack_pm1(packed: torch.Tensor, logical_shape: list, pack_dtype: torch.dtype) -> torch.Tensor:
     """Unpack packed buffer → float32 (+1.0 = True, −1.0 = False)."""
+    if len(logical_shape) == 0:
+        out = torch.ops.brute.unpack_bits(packed, [1], _PACK_BITS[pack_dtype])
+        return out.squeeze(0)
     return torch.ops.brute.unpack_bits(packed, logical_shape, _PACK_BITS[pack_dtype])
 
 def _rebuild_brute_tensor(plain_tensor: torch.Tensor, is_bit1: bool = False, pack_dtype: torch.dtype = None):
@@ -315,8 +322,17 @@ class Tensor(torch.Tensor):
             return Tensor._make_bit1(base, raw_pt)
 
         if getattr(self, '_is_bit1', False):
+            # Detect whether the caller explicitly asked for a non-bit1 dtype
+            # (e.g. .to(torch.bool)) — in that case we must NOT re-promote to bit1.
+            explicit_dtype = kwargs.get('dtype')
+            if explicit_dtype is None:
+                for a in args:
+                    if isinstance(a, torch.dtype):
+                        explicit_dtype = a
+                        break
             new_base = self.as_subclass(torch.Tensor).to(*args, **kwargs)
-            if new_base.dtype == torch.bool:
+            if explicit_dtype is None and new_base.dtype == torch.bool:
+                # Device-only / format-only conversion — preserve bit1.
                 return Tensor._make_bit1(new_base, self._pack_dtype)
             return Tensor._make_plain(new_base)
 
@@ -411,10 +427,14 @@ class Tensor(torch.Tensor):
             if not isinstance(r, torch.Tensor):
                 return r
             if promote_to_bit1 and r.dtype == torch.bool:
-                if r.dim() == 0:
-                    # 0-dim bool scalars (all/any/scalar-index) can't be packed.
+                # 0-dim bool results from reductions (all/any) should NOT be promoted
+                # back to bit1 — they are logical scalars. Only promote when the
+                # operation preserves the bit1 element-wise structure (e.g. clone).
+                if r.dim() == 0 and func in (
+                    torch.all, torch.any, torch.Tensor.all, torch.Tensor.any,
+                ):
                     return Tensor._make_plain(r)
-                
+
                 # Use existing bit1 pack_dtype, or detect optimal for new bit1 tensors
                 if bit1_ins:
                     pack_dtype = bit1_ins[0]._pack_dtype

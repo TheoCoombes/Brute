@@ -18,7 +18,15 @@ wheel.packages = ["brute"]
 # (--no-build-isolation so the build can find the already-installed torch)
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
-pythonpath = ["tests"]
-addopts = "-v --tb=short"
+testpaths = ["tests/unit", "tests/fuzz", "tests/stress"]
+pythonpath = ["."]
+addopts = "-v --tb=short -ra"
 filterwarnings = ["ignore::UserWarning"]
+python_files = ["test_*.py", "bench_*.py"]
+markers = [
+    "slow: marks tests as slow",
+    "stress: long-running stress tests",
+    "fuzz: hypothesis-driven fuzz tests",
+    "cuda: requires CUDA",
+    "mps: requires MPS",
+]
