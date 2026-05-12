@@ -1,4 +1,4 @@
-#include <torch/library.h>
+#include <torch/extension.h>
 #include "ops_cpu.h"
 #ifdef HAVE_MPS
 #include "ops_metal.h"
@@ -6,6 +6,10 @@
 #ifdef HAVE_CUDA
 #include "ops_cuda.h"
 #endif
+
+PYBIND11_MODULE(_cbrute, m) {
+    m.doc() = "brute C++ backend — 1-bit tensors on a PyTorch foundation";
+}
 
 // ── Schema ────────────────────────────────────────────────
 TORCH_LIBRARY(brute, m) {

@@ -37,16 +37,14 @@ target_include_directories(libpopcnt INTERFACE
 
 # Sources
 set(BRUTE_SOURCES
-  cbrute/core/tensor.cpp
-  cbrute/core/ops.cpp
-  cbrute/backend/cpu/ops_cpu.cpp
-  cbrute/python/bindings.cpp
+  cbrute/ext.cpp
+  cbrute/cpu/ops_cpu.cpp
 )
 if(HAVE_CUDA)
-  list(APPEND BRUTE_SOURCES cbrute/backend/cuda/ops_cuda.cu)
+  list(APPEND BRUTE_SOURCES cbrute/cuda/ops_cuda.cu)
 endif()
 if(HAVE_MPS)
-  list(APPEND BRUTE_SOURCES cbrute/backend/metal/ops_metal.mm)
+  list(APPEND BRUTE_SOURCES cbrute/metal/ops_metal.mm)
   set_source_files_properties(cbrute/backend/metal/ops_metal.mm
     PROPERTIES COMPILE_FLAGS "-x objective-c++")
 endif()
@@ -54,10 +52,9 @@ endif()
 python_add_library(_cbrute MODULE ${BRUTE_SOURCES} WITH_SOABI)
 
 target_include_directories(_cbrute PRIVATE
-  "${CMAKE_CURRENT_SOURCE_DIR}/cbrute/include"
-  "${CMAKE_CURRENT_SOURCE_DIR}/cbrute/backend/cpu"
-  "${CMAKE_CURRENT_SOURCE_DIR}/cbrute/backend/metal"
-  "${CMAKE_CURRENT_SOURCE_DIR}/cbrute/backend/cuda"
+  "${CMAKE_CURRENT_SOURCE_DIR}/cbrute/cpu"
+  "${CMAKE_CURRENT_SOURCE_DIR}/cbrute/metal"
+  "${CMAKE_CURRENT_SOURCE_DIR}/cbrute/cuda"
   ${TORCH_INCLUDE_DIRS}
 )
 
@@ -82,19 +79,3 @@ if(HAVE_CUDA)
 endif()
 
 install(TARGETS _cbrute LIBRARY DESTINATION ${SKBUILD_PROJECT_NAME})
-
-# ── CTest integration ─────────────────────────────────────────────────────────
-# Tests are NOT run during `pip install` (that would block installation when
-# hardware like MPS/CUDA is unavailable and adds unacceptable install time).
-# After building, run:   ctest --test-dir <build-dir> -V
-#                    or: pytest tests/
-include(CTest)
-add_test(
-  NAME brute_pytest
-  COMMAND "${Python_EXECUTABLE}" -m pytest "${CMAKE_SOURCE_DIR}/tests" -v --tb=short
-  WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
-)
-set_tests_properties(brute_pytest PROPERTIES
-  LABELS "python"
-  TIMEOUT 300
-)

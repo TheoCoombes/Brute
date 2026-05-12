@@ -4,16 +4,9 @@ from typing import Optional
 import torch
 import copy
 
-from brute.dtypes import (
-    float32, float64, float16, bfloat16,
-    complex64, complex128,
-    float8_e4m3fn, float8_e5m2,
-    # Signed int
-    int8, int16, int32, int64,
-    # Unsigned int  (uint8 / uint32 / uint64 also serve as bit1 pack dtypes)
-    uint8, uint16, uint32, uint64,
-    _Bit1DType, _resolve_pack_dtype,
-    _PACK_BITS,
+from brute.dtype import (
+    bit1, _Bit1DType,
+    _resolve_pack_dtype, _PACK_BITS,
 )
 
 
