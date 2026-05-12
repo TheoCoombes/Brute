@@ -9,7 +9,8 @@ import torch
 # ── Dtype sentinel ─────────────────────────────────────────────────────────────
 
 class _Bit1DType:
-    """Sentinel dtype for 1-bit packed tensors.
+    """
+    Sentinel dtype for 1-bit packed tensors.
 
     Compares equal to torch.bool so that downstream code checking
     `tensor.dtype == torch.bool` still works for bit1 tensors.
@@ -23,8 +24,6 @@ class _Bit1DType:
 
 
 bit1 = _Bit1DType()
-
-# Dtype aliases
 float32  = torch.float32
 float16  = torch.float16
 bfloat16 = torch.bfloat16
@@ -52,7 +51,7 @@ def _to_bool(data: torch.Tensor) -> torch.Tensor:
 def _pack_bool(bool_t: torch.Tensor, pack_dtype: str) -> torch.Tensor:
     """Pack a bool tensor into a uint buffer using {−1, +1} encoding."""
     pw = _PACK_WIDTH[pack_dtype]
-    # True→+1.0, False→−1.0; pack_bits treats ≥0 as bit=1
+    # True = +1.0, False = −1.0; pack_bits treats ≥ 0 as bit = 1
     return torch.ops.brute.pack_bits((bool_t.float() * 2 - 1).contiguous(), pw)
 
 
@@ -64,22 +63,16 @@ def _unpack_pm1(packed: torch.Tensor, logical_shape: list, pack_dtype: str) -> t
 # ── Tensor ─────────────────────────────────────────────────────────────────────
 
 class Tensor(torch.Tensor):
-    """torch.Tensor subclass with native bit1 support.
+    """
+    `torch.Tensor` subclass with native 1-bit support.
 
-    For dtype=bit1
-    ─────────────
     The base PyTorch storage is a BoolTensor (correct logical shape, full bool
-    semantics). An additional ``_packed_buf`` caches the {−1,+1}-encoded uint
-    representation used by ``xnor_popcount_matmul``.
+    semantics). An additional `_packed_buf` caches the {−1,+1}-encoded uint
+    representation used by `xnor_popcount_matmul`.
 
-    All standard boolean ops (``&``, ``|``, ``^``, ``~``, indexing, reductions,
-    shape ops, ``torch.cat``, etc.) work natively through the bool base.  Only
+    All standard boolean ops (`&`, `|`, `^`, `~`, indexing, reductions,
+    shape ops, `torch.cat`, etc.) work natively through the bool base.  Only
     matmul is overridden to use the packed kernel.
-
-    For other dtypes
-    ────────────────
-    Transparent torch.Tensor subclass.  Every op behaves identically to plain
-    torch; the only effect is that the returned tensor is a ``brute.Tensor``.
     """
 
     # ── Construction ────────────────────────────────────────────────────────────
@@ -235,6 +228,9 @@ class Tensor(torch.Tensor):
             if not isinstance(r, torch.Tensor):
                 return r
             if any_bit1 and r.dtype == torch.bool:
+                if r.dim() == 0:
+                    # 0-dim scalars (from all/any/scalar-index) can't be packed
+                    return Tensor._make_plain(r)
                 return Tensor._make_bit1(r, pack_str)
             if not isinstance(r, cls):
                 return Tensor._make_plain(r)
@@ -260,5 +256,9 @@ class Tensor(torch.Tensor):
     def __repr__(self):
         base = self.as_subclass(torch.Tensor).__repr__()
         if getattr(self, '_is_bit1', False):
-            base = base.replace('dtype=torch.bool', 'dtype=brute.bit1')
+            if 'dtype=torch.bool' in base:
+                base = base.replace('dtype=torch.bool', 'dtype=brute.bit1')
+            else:
+                # PyTorch omits dtype for bool — insert it before closing paren
+                base = base[:-1] + ', dtype=brute.bit1)'
         return base.replace('tensor(', 'brute.Tensor(')
