@@ -25,7 +25,6 @@ def _to_bool(t: torch.Tensor) -> torch.Tensor:
         return t > 0
     return t.bool()
 
-
 def _pack_bool(bool_t: torch.Tensor, pack_dtype: torch.dtype) -> torch.Tensor:
     """Pack a bool tensor to uint storage (True→1 bit, False→0 bit, {+1,-1} encoding)."""
     pm1 = (bool_t.float() * 2 - 1).contiguous()
@@ -36,6 +35,17 @@ def _unpack_pm1(packed: torch.Tensor, logical_shape: list, pack_dtype: torch.dty
     """Unpack packed buffer → float32 (+1.0 = True, −1.0 = False)."""
     return torch.ops.brute.unpack_bits(packed, logical_shape, _PACK_BITS[pack_dtype])
 
+def _rebuild_brute_tensor(plain_tensor: torch.Tensor, is_bit1: bool = False, pack_dtype: torch.dtype = None):
+    """Reconstructs a brute.Tensor from a pickled base tensor."""
+    t = plain_tensor.as_subclass(Tensor)
+    t._is_bit1 = is_bit1
+    t._pack_dtype = pack_dtype
+    # The packed buffer will automatically lazy-load on next access
+    t._packed_buf = None 
+    return t
+
+if hasattr(torch.serialization, "add_safe_globals"):
+    torch.serialization.add_safe_globals([_rebuild_brute_tensor])
 
 # ── Tensor ─────────────────────────────────────────────────────────────────────
 
@@ -78,7 +88,8 @@ class Tensor(torch.Tensor):
             pack_dtype = resolve_pack_dtype(pack_dtype)
             if device is not None:
                 bool_t = bool_t.to(device=device)
-            instance = torch.Tensor._make_subclass(cls, bool_t)
+            
+            instance = bool_t.as_subclass(cls)
             instance._is_bit1    = True
             instance._pack_dtype = pack_dtype
             instance._packed_buf = _pack_bool(bool_t, pack_dtype)
@@ -90,31 +101,33 @@ class Tensor(torch.Tensor):
             t = torch.tensor(raw, dtype=dtype, device=device)
         else:
             t = torch.as_tensor(raw, dtype=dtype, device=device)
-        instance = torch.Tensor._make_subclass(cls, t)
+            
+        instance = t.as_subclass(cls)
         instance._is_bit1    = False
         instance._pack_dtype = None
         instance._packed_buf = None
         return instance
-
+    
     def __init__(self, data, *, dtype=None, pack_dtype=None, device=None):
         pass
 
     @classmethod
-    def _make_bit1(cls, bool_t: torch.Tensor, pack_dtype: torch.dtype = None) -> 'Tensor':
-        """Internal: wrap an already-prepared bool tensor as a bit1 brute.Tensor."""
+    def _make_bit1(cls, bool_t: torch.Tensor, pack_dtype: torch.dtype = None) -> Tensor:
+        # Unwrap brute.Tensor inputs to their underlying torch.Tensor.
         if pack_dtype is None:
             pack_dtype = get_optimal_pack_dtype(bool_t.device)
         pack_dtype = resolve_pack_dtype(pack_dtype)
-        instance = torch.Tensor._make_subclass(cls, bool_t)
+
+        instance = bool_t.as_subclass(cls)
         instance._is_bit1    = True
         instance._pack_dtype = pack_dtype
         instance._packed_buf = _pack_bool(bool_t, pack_dtype)
         return instance
 
     @classmethod
-    def _make_plain(cls, t: torch.Tensor) -> 'Tensor':
+    def _make_plain(cls, t: torch.Tensor) -> Tensor:
         """Internal: wrap a non-bit1 torch.Tensor as a brute.Tensor."""
-        instance = torch.Tensor._make_subclass(cls, t)
+        instance = t.as_subclass(cls)
         instance._is_bit1    = False
         instance._pack_dtype = None
         instance._packed_buf = None
@@ -205,7 +218,7 @@ class Tensor(torch.Tensor):
 
     # ── Factory methods (preserve bit1 dtype) ───────────────────────────────────
 
-    def new_tensor(self, data, *, dtype=None, device=None, **kwargs) -> 'Tensor':
+    def new_tensor(self, data, *, dtype=None, device=None, **kwargs) -> Tensor:
         """Create a new tensor from *data* with the same dtype/device as self by default."""
         eff_dtype = dtype if dtype is not None else self.dtype
         base = self.as_subclass(torch.Tensor)
@@ -216,7 +229,7 @@ class Tensor(torch.Tensor):
             return Tensor._make_bit1(bool_t, pd)
         return Tensor._make_plain(base.new_tensor(data, dtype=dtype, device=device, **kwargs))
 
-    def new_empty(self, size, *, dtype=None, device=None, **kwargs) -> 'Tensor':
+    def new_empty(self, size, *, dtype=None, device=None, **kwargs) -> Tensor:
         """Return an uninitialised tensor of *size* with the same dtype/device as self."""
         eff_dtype = dtype if dtype is not None else self.dtype
         base = self.as_subclass(torch.Tensor)
@@ -227,7 +240,7 @@ class Tensor(torch.Tensor):
             return Tensor._make_bit1(bool_t, pd)
         return Tensor._make_plain(base.new_empty(size, dtype=dtype, device=device, **kwargs))
 
-    def new_full(self, size, fill_value, *, dtype=None, device=None, **kwargs) -> 'Tensor':
+    def new_full(self, size, fill_value, *, dtype=None, device=None, **kwargs) -> Tensor:
         """Return a tensor of *size* filled with *fill_value*, same dtype/device as self."""
         eff_dtype = dtype if dtype is not None else self.dtype
         base = self.as_subclass(torch.Tensor)
@@ -238,7 +251,7 @@ class Tensor(torch.Tensor):
             return Tensor._make_bit1(bool_t, pd)
         return Tensor._make_plain(base.new_full(size, fill_value, dtype=dtype, device=device, **kwargs))
 
-    def new_ones(self, size, *, dtype=None, device=None, **kwargs) -> 'Tensor':
+    def new_ones(self, size, *, dtype=None, device=None, **kwargs) -> Tensor:
         """Return an all-ones tensor of *size* with the same dtype/device as self."""
         eff_dtype = dtype if dtype is not None else self.dtype
         base = self.as_subclass(torch.Tensor)
@@ -249,7 +262,7 @@ class Tensor(torch.Tensor):
             return Tensor._make_bit1(bool_t, pd)
         return Tensor._make_plain(base.new_ones(size, dtype=dtype, device=device, **kwargs))
 
-    def new_zeros(self, size, *, dtype=None, device=None, **kwargs) -> 'Tensor':
+    def new_zeros(self, size, *, dtype=None, device=None, **kwargs) -> Tensor:
         """Return an all-zeros tensor of *size* with the same dtype/device as self."""
         eff_dtype = dtype if dtype is not None else self.dtype
         base = self.as_subclass(torch.Tensor)
@@ -262,7 +275,7 @@ class Tensor(torch.Tensor):
 
     # ── Conversion ──────────────────────────────────────────────────────────────
 
-    def bool(self) -> 'Tensor':
+    def bool(self) -> Tensor:
         """
         Return a bool-typed brute.Tensor (dtype=torch.bool).
 
@@ -274,7 +287,7 @@ class Tensor(torch.Tensor):
             return Tensor._make_plain(base)
         return Tensor._make_plain(base.bool())
 
-    def to(self, *args, **kwargs) -> 'Tensor':
+    def to(self, *args, **kwargs) -> Tensor:
         # Extract brute-specific pack_dtype before forwarding to torch.
         kwargs = dict(kwargs)
         pack_dtype_arg = kwargs.pop('pack_dtype', None)
@@ -315,7 +328,7 @@ class Tensor(torch.Tensor):
             raise TypeError("unpack_pm1() is only valid for bit1 tensors")
         return _unpack_pm1(self._packed_buf, list(self.shape), self._pack_dtype)
 
-    def popcount(self) -> 'Tensor':
+    def popcount(self) -> Tensor:
         """
         Count the number of 1-bits (True values) in this tensor.
 
@@ -436,6 +449,28 @@ class Tensor(torch.Tensor):
         # After deepcopy the underlying bool storage is a new tensor at version 0,
         # so the version check will recompute on first access — no explicit copy needed.
         return new_t
+
+    def __reduce_ex__(self, _):
+        """Tells pickle how to serialize and reconstruct this subclass."""
+        # Demote to plain tensor to prevent infinite recursion during serialization
+        plain_t = self.as_subclass(torch.Tensor)
+        return (
+            _rebuild_brute_tensor,
+            (plain_t, getattr(self, '_is_bit1', False), getattr(self, '_pack_dtype', None))
+        )
+
+    def __array__(self, dtype=None, copy=None):
+        """NumPy 2.0+ interop hook."""
+        base_t = self.as_subclass(torch.Tensor)
+        
+        # For bit1, base_t is already torch.bool storage, so just convert to numpy natively
+        arr = base_t.numpy(force=True)
+            
+        if dtype is not None:
+            return arr.astype(dtype, copy=copy if copy is not None else False)
+        if copy:
+            return arr.copy()
+        return arr
 
     # ── Repr ─────────────────────────────────────────────────────────────────────
 
