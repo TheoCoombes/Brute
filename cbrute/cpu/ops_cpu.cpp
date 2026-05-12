@@ -1,5 +1,5 @@
 #include "ops_cpu.h"
-#include <libpopcnt.h>
+#include "fastlibpopcnt.h"
 #include <ATen/Parallel.h>
 #include <climits>
 
@@ -212,6 +212,9 @@ at::Tensor xnor_popcount_matmul(const at::Tensor& A, const at::Tensor& B, int64_
 
 // ──────────────────────────────────────────────────────────
 // popcount — per-element popcount of each packed word into int32.
+// Uses popcnt64 (libpopcnt: hardware POPCNT / builtin / bitwise fallback)
+// with at::parallel_for for threading. Grain size keeps single-word
+// tensors on the calling thread (no parallel overhead).
 // ──────────────────────────────────────────────────────────
 at::Tensor popcount(const at::Tensor& packed) {
     auto p   = packed.contiguous();
@@ -219,20 +222,32 @@ at::Tensor popcount(const at::Tensor& packed) {
     int64_t n = p.numel();
     int32_t* o = out.data_ptr<int32_t>();
 
+    // Below this many elements, run on the calling thread.
+    constexpr int64_t GRAIN = 2048;
+
     switch (p.scalar_type()) {
     case at::kByte: {
         const uint8_t* in = p.data_ptr<uint8_t>();
-        for (int64_t i = 0; i < n; i++) o[i] = __builtin_popcount(in[i]);
+        at::parallel_for(0, n, GRAIN, [&](int64_t s, int64_t e) {
+            for (int64_t i = s; i < e; i++)
+                o[i] = (int32_t)popcnt64((uint64_t)in[i]);
+        });
         break;
     }
     case at::kInt: {
         const int32_t* in = p.data_ptr<int32_t>();
-        for (int64_t i = 0; i < n; i++) o[i] = __builtin_popcount((uint32_t)in[i]);
+        at::parallel_for(0, n, GRAIN, [&](int64_t s, int64_t e) {
+            for (int64_t i = s; i < e; i++)
+                o[i] = (int32_t)popcnt64((uint64_t)(uint32_t)in[i]);
+        });
         break;
     }
     default: { // kLong
         const int64_t* in = p.data_ptr<int64_t>();
-        for (int64_t i = 0; i < n; i++) o[i] = __builtin_popcountll((uint64_t)in[i]);
+        at::parallel_for(0, n, GRAIN, [&](int64_t s, int64_t e) {
+            for (int64_t i = s; i < e; i++)
+                o[i] = (int32_t)popcnt64((uint64_t)in[i]);
+        });
         break;
     }
     }

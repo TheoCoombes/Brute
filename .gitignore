@@ -6,3 +6,4 @@ build/
 .vscode/
 .claude/
 .pytest_cache/
+.benchmarks/

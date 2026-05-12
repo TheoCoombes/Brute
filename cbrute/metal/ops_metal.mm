@@ -1,5 +1,5 @@
 #ifdef HAVE_MPS
-#include <libpopcnt.h>
+#include <fastlibpopcnt.h>
 #import <Metal/Metal.h>
 #import <MetalPerformanceShadersGraph/MetalPerformanceShadersGraph.h>
 #include <torch/torch.h>

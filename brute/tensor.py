@@ -7,8 +7,8 @@ import copy
 from brute.dtype import (
     bit1,
     _Bit1DType,
-    _resolve_pack_dtype,
-    _get_optimal_pack_dtype,
+    resolve_pack_dtype,
+    get_optimal_pack_dtype,
     _PACK_BITS,
 )
 
@@ -75,8 +75,8 @@ class Tensor(torch.Tensor):
             bool_t = _to_bool(raw) if isinstance(raw, torch.Tensor) else \
                      torch.as_tensor(raw, dtype=torch.bool)
             if pack_dtype is None:
-                pack_dtype = _get_optimal_pack_dtype(device)
-            pack_dtype = _resolve_pack_dtype(pack_dtype)
+                pack_dtype = get_optimal_pack_dtype(device)
+            pack_dtype = resolve_pack_dtype(pack_dtype)
             if device is not None:
                 bool_t = bool_t.to(device=device)
             instance = torch.Tensor._make_subclass(cls, bool_t)
@@ -104,8 +104,8 @@ class Tensor(torch.Tensor):
     def _make_bit1(cls, bool_t: torch.Tensor, pack_dtype: torch.dtype = None) -> 'Tensor':
         """Internal: wrap an already-prepared bool tensor as a bit1 brute.Tensor."""
         if pack_dtype is None:
-            pack_dtype = _get_optimal_pack_dtype(bool_t.device)
-        pack_dtype = _resolve_pack_dtype(pack_dtype)
+            pack_dtype = get_optimal_pack_dtype(bool_t.device)
+        pack_dtype = resolve_pack_dtype(pack_dtype)
         instance = torch.Tensor._make_subclass(cls, bool_t)
         instance._is_bit1    = True
         instance._pack_dtype = pack_dtype
@@ -179,11 +179,11 @@ class Tensor(torch.Tensor):
             if device_arg:
                 base = base.to(device=device_arg)
             if pack_dtype_arg:
-                raw_pt = _resolve_pack_dtype(pack_dtype_arg)
+                raw_pt = resolve_pack_dtype(pack_dtype_arg)
             elif getattr(self, '_pack_dtype', None):
                 raw_pt = self._pack_dtype
             else:
-                raw_pt = _get_optimal_pack_dtype(base.device)
+                raw_pt = get_optimal_pack_dtype(base.device)
             return Tensor._make_bit1(base, raw_pt)
 
         if getattr(self, '_is_bit1', False):
@@ -298,7 +298,7 @@ class Tensor(torch.Tensor):
                             if isinstance(x, torch.Tensor):
                                 device_for_pack = x.device
                                 break
-                    pack_dtype = _get_optimal_pack_dtype(device_for_pack)
+                    pack_dtype = get_optimal_pack_dtype(device_for_pack)
 
                 return Tensor._make_bit1(r, pack_dtype)
             if not isinstance(r, cls):

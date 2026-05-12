@@ -16,7 +16,7 @@ _PACK_BITS: dict[torch.dtype, int] = {
     torch.uint64: 64,
 }
 
-def _get_optimal_pack_dtype(device: torch.device | str | None = None) -> torch.dtype:
+def get_optimal_pack_dtype(device: torch.device | str | None = None) -> torch.dtype:
     """
     Detect the optimal pack dtype for a given device.
 
@@ -55,7 +55,7 @@ def _get_optimal_pack_dtype(device: torch.device | str | None = None) -> torch.d
         # 32-bit systems: use uint32 for alignment and address space
         return torch.uint32
 
-def _resolve_pack_dtype(pt) -> torch.dtype:
+def resolve_pack_dtype(pt) -> torch.dtype:
     """Validate and return a pack dtype (torch.uint8 / uint32 / uint64)."""
     if pt in _PACK_BITS:
         return pt
