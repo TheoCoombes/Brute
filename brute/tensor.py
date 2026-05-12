@@ -14,6 +14,15 @@ from brute.dtype import (
 
 _MATMUL_FUNCS = frozenset([torch.matmul, torch.mm, torch.bmm])
 
+# Reductions where the fast-path on bit1 is a direct call to packed_popcount.
+_SUM_FUNCS = frozenset([
+    torch.sum,        torch.Tensor.sum,
+    torch.count_nonzero, torch.Tensor.count_nonzero,
+])
+_ALL_FUNCS   = frozenset([torch.all, torch.Tensor.all])
+_ANY_FUNCS   = frozenset([torch.any, torch.Tensor.any])
+_EQUAL_FUNCS = frozenset([torch.equal])
+
 
 # ── Internal helpers ───────────────────────────────────────────────────────────
 
@@ -26,11 +35,20 @@ def _to_bool(t: torch.Tensor) -> torch.Tensor:
     return t.bool()
 
 def _pack_bool(bool_t: torch.Tensor, pack_dtype: torch.dtype) -> torch.Tensor:
-    """Pack a bool tensor to uint storage (True→1 bit, False→0 bit, {+1,-1} encoding)."""
+    """Pack a bool tensor to uint storage.
+
+    CPU: direct bool→packed via `brute.pack_bool` (skips the float intermediate).
+    Other devices: fall back to `(bool*2-1).float()` → `brute.pack_bits` since
+    only CPU has the bool-fast-path kernel.
+    """
+    if bool_t.dtype != torch.bool:
+        bool_t = bool_t.bool()
     if bool_t.dim() == 0:
-        # The underlying pack_bits op requires >=1 dim; promote scalars to (1,) for packing.
-        pm1 = (bool_t.float() * 2 - 1).unsqueeze(0).contiguous()
-        return torch.ops.brute.pack_bits(pm1, _PACK_BITS[pack_dtype])
+        bool_t = bool_t.unsqueeze(0)
+    bool_t = bool_t.contiguous()
+
+    if bool_t.device.type == 'cpu':
+        return torch.ops.brute.pack_bool(bool_t, _PACK_BITS[pack_dtype])
     pm1 = (bool_t.float() * 2 - 1).contiguous()
     return torch.ops.brute.pack_bits(pm1, _PACK_BITS[pack_dtype])
 
@@ -416,6 +434,42 @@ class Tensor(torch.Tensor):
                     a.shape[-1], _PACK_BITS[a._pack_dtype],
                 )
 
+        # Fast path: full-tensor reductions on bit1 driven by packed_popcount.
+        # Pad bits in the packed buffer are zero, so the total popcount equals
+        # the count of True logical bits — no correction needed.
+        if bit1_ins and not non_bit1_bool_ins:
+            # Only the full-reduction form is short-circuited. If `dim` is
+            # provided (positionally or as kw), fall through to the bool path.
+            no_dim = (len(args) <= 1 and 'dim' not in kwargs)
+
+            if func in _SUM_FUNCS and no_dim and len(bit1_ins) == 1:
+                a = bit1_ins[0]
+                return Tensor._make_plain(
+                    torch.ops.brute.packed_popcount(a._packed_buf)
+                )
+
+            if func in _ANY_FUNCS and no_dim and len(bit1_ins) == 1:
+                a = bit1_ins[0]
+                total = torch.ops.brute.packed_popcount(a._packed_buf).item()
+                return Tensor._make_plain(torch.tensor(bool(total), dtype=torch.bool))
+
+            if func in _ALL_FUNCS and no_dim and len(bit1_ins) == 1:
+                a = bit1_ins[0]
+                total = torch.ops.brute.packed_popcount(a._packed_buf).item()
+                return Tensor._make_plain(
+                    torch.tensor(int(total) == a.numel(), dtype=torch.bool)
+                )
+
+            # torch.equal(a, b) -> Python bool. Fused XOR+popcount, no temp.
+            if func in _EQUAL_FUNCS and len(bit1_ins) >= 2:
+                a, b = bit1_ins[0], bit1_ins[1]
+                if (a.shape == b.shape
+                        and a._pack_dtype == b._pack_dtype
+                        and a._packed_buf.shape == b._packed_buf.shape):
+                    return torch.ops.brute.bit1_hamming_total(
+                        a._packed_buf, b._packed_buf
+                    ).item() == 0
+
         def _unwrap(x):
             return x.as_subclass(torch.Tensor) if isinstance(x, Tensor) else x
 
@@ -491,6 +545,47 @@ class Tensor(torch.Tensor):
         if copy:
             return arr.copy()
         return arr
+    
+    def __tensor_flatten__(self):
+        """Tells torch.compile how to extract standard tensors from this subclass."""
+        # AOTAutograd needs string attribute names to extract tensors.
+        # Since we use .as_subclass(), we temporarily attach the plain tensor data.
+        self._base_data = self.as_subclass(torch.Tensor)
+        
+        tensor_attrs = ["_base_data"]
+        
+        # Dynamo MUST know about any cached tensors hiding in __dict__
+        if self.__dict__.get('_packed_buf_cache') is not None:
+            tensor_attrs.append("_packed_buf_cache")
+            
+        metadata = {
+            "is_bit1": getattr(self, '_is_bit1', False),
+            "pack_dtype": getattr(self, '_pack_dtype', None),
+            "packed_ver": self.__dict__.get('_packed_ver')
+        }
+        return tensor_attrs, metadata
+
+    @classmethod
+    def __tensor_unflatten__(cls, inner_tensors, metadata, outer_size, outer_stride):
+        """Tells torch.compile how to rebuild this subclass from the standard tensors."""
+        base_data = inner_tensors["_base_data"]
+        
+        # Rebuild using your internal factories
+        if metadata["is_bit1"]:
+            # We don't want to re-trigger _pack_bool if we already have the cache, 
+            # so we manually rebuild the instance state.
+            instance = base_data.as_subclass(cls)
+            instance._is_bit1 = True
+            instance._pack_dtype = metadata["pack_dtype"]
+        else:
+            instance = cls._make_plain(base_data)
+            
+        # Restore the cache if it existed in the graph
+        if "_packed_buf_cache" in inner_tensors:
+            instance.__dict__['_packed_buf_cache'] = inner_tensors["_packed_buf_cache"]
+            instance.__dict__['_packed_ver'] = metadata["packed_ver"]
+            
+        return instance
 
     # ── Repr ─────────────────────────────────────────────────────────────────────
 

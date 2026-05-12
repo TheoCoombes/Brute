@@ -13,27 +13,41 @@ PYBIND11_MODULE(_cbrute, m) {
 
 // ── Schema ────────────────────────────────────────────────
 TORCH_LIBRARY(brute, m) {
+    // packing / unpacking
     m.def("pack_bits(Tensor input, int pack_width) -> Tensor");
+    m.def("pack_bool(Tensor input, int pack_width) -> Tensor");
     m.def("unpack_bits(Tensor packed, int[] logical_shape, int pack_width) -> Tensor");
+    m.def("unpack_bool(Tensor packed, int[] logical_shape, int pack_width) -> Tensor");
+
+    // matmul
     m.def("xnor_popcount_matmul(Tensor A, Tensor B, int K, int pack_width) -> Tensor");
-    m.def("popcount(Tensor packed) -> Tensor");
-    m.def("packed_popcount(Tensor packed) -> Tensor");
+
+    // popcount / hamming
+    m.def("popcount(Tensor x) -> Tensor");
+    m.def("packed_popcount(Tensor x) -> Tensor");
     m.def("hamming_distance(Tensor A, Tensor B) -> Tensor");
+    m.def("bit1_hamming_total(Tensor A, Tensor B) -> Tensor");
+
+    // bitwise (pass-through to at:: for non-bit1 paths)
     m.def("bitwise_and(Tensor A, Tensor B) -> Tensor");
     m.def("bitwise_or(Tensor A, Tensor B) -> Tensor");
     m.def("bitwise_xor(Tensor A, Tensor B) -> Tensor");
     m.def("bitwise_not(Tensor A) -> Tensor");
+
     m.def("randomize_bits(Tensor(a!) out) -> Tensor(a!)");
 }
 
 // ── CPU ───────────────────────────────────────────────────
 TORCH_LIBRARY_IMPL(brute, CPU, m) {
     m.impl("pack_bits",            cbrute::cpu::pack_bits);
+    m.impl("pack_bool",            cbrute::cpu::pack_bool);
     m.impl("unpack_bits",          cbrute::cpu::unpack_bits);
+    m.impl("unpack_bool",          cbrute::cpu::unpack_bool);
     m.impl("xnor_popcount_matmul", cbrute::cpu::xnor_popcount_matmul);
     m.impl("popcount",             cbrute::cpu::popcount);
     m.impl("packed_popcount",      cbrute::cpu::packed_popcount);
     m.impl("hamming_distance",     cbrute::cpu::hamming_distance);
+    m.impl("bit1_hamming_total",   cbrute::cpu::bit1_hamming_total);
     m.impl("bitwise_and",          cbrute::cpu::bitwise_and);
     m.impl("bitwise_or",           cbrute::cpu::bitwise_or);
     m.impl("bitwise_xor",          cbrute::cpu::bitwise_xor);
@@ -41,7 +55,7 @@ TORCH_LIBRARY_IMPL(brute, CPU, m) {
     m.impl("randomize_bits",       cbrute::cpu::randomize_bits);
 }
 
-// ── Metal/MPS ─────────────────────────────────────────────
+// ── Metal/MPS (out of scope this pass; new ops fall through to CompositeImplicitAutograd) ─
 #ifdef HAVE_MPS
 TORCH_LIBRARY_IMPL(brute, MPS, m) {
     m.impl("pack_bits",            cbrute::mps::pack_bits);

@@ -30,10 +30,13 @@ if(APPLE)
   message(STATUS "brute: Metal/MPS backend enabled")
 endif()
 
-# libpopcnt – header-only
-add_library(libpopcnt INTERFACE)
-target_include_directories(libpopcnt INTERFACE
-  "${CMAKE_CURRENT_SOURCE_DIR}/third_party/libpopcnt")
+# ── Google Highway (vendored submodule, static dispatch) ──────────────────────
+set(HWY_ENABLE_CONTRIB  OFF CACHE BOOL "" FORCE)
+set(HWY_ENABLE_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(HWY_ENABLE_TESTS    OFF CACHE BOOL "" FORCE)
+set(HWY_ENABLE_INSTALL  OFF CACHE BOOL "" FORCE)
+set(HWY_FORCE_STATIC_LIBS ON CACHE BOOL "" FORCE)
+add_subdirectory(third_party/highway EXCLUDE_FROM_ALL)
 
 # Sources
 set(BRUTE_SOURCES
@@ -45,20 +48,22 @@ if(HAVE_CUDA)
 endif()
 if(HAVE_MPS)
   list(APPEND BRUTE_SOURCES cbrute/metal/ops_metal.mm)
-  set_source_files_properties(cbrute/backend/metal/ops_metal.mm
+  set_source_files_properties(cbrute/metal/ops_metal.mm
     PROPERTIES COMPILE_FLAGS "-x objective-c++")
 endif()
 
 python_add_library(_cbrute MODULE ${BRUTE_SOURCES} WITH_SOABI)
 
 target_include_directories(_cbrute PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/cbrute"
   "${CMAKE_CURRENT_SOURCE_DIR}/cbrute/cpu"
   "${CMAKE_CURRENT_SOURCE_DIR}/cbrute/metal"
   "${CMAKE_CURRENT_SOURCE_DIR}/cbrute/cuda"
+  "${CMAKE_CURRENT_SOURCE_DIR}/third_party/highway"
   ${TORCH_INCLUDE_DIRS}
 )
 
-target_link_libraries(_cbrute PRIVATE ${TORCH_LIBRARIES} libpopcnt)
+target_link_libraries(_cbrute PRIVATE ${TORCH_LIBRARIES} hwy)
 
 if(HAVE_MPS)
   target_link_libraries(_cbrute PRIVATE
@@ -72,6 +77,15 @@ target_compile_definitions(_cbrute PRIVATE
   $<$<BOOL:${HAVE_CUDA}>:HAVE_CUDA>
   $<$<BOOL:${HAVE_MPS}>:HAVE_MPS>
 )
+
+# Optimize for the host CPU and enable Highway's recommended baseline.
+# (Torch typically already sets -O3; we add -march=native for SIMD breadth.)
+if(NOT MSVC)
+  target_compile_options(_cbrute PRIVATE -O3 -fno-math-errno -fno-trapping-math)
+  if(NOT APPLE OR CMAKE_OSX_ARCHITECTURES MATCHES "x86_64")
+    target_compile_options(_cbrute PRIVATE -march=native)
+  endif()
+endif()
 
 set_property(TARGET _cbrute PROPERTY CXX_STANDARD 17)
 if(HAVE_CUDA)
