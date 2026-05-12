@@ -18,7 +18,7 @@ except ImportError:
 
 from brute.tensor import Tensor, bit1
 
-# Re-export torch dtypes
+# ── dtypes ────────────────────────────────────────────────────────────────────
 bool            = _t.bool
 float32         = _t.float32
 float64         = _t.float64
@@ -37,17 +37,109 @@ complex128      = _t.complex128
 float8_e4m3fn   = _t.float8_e4m3fn
 float8_e5m2     = _t.float8_e5m2
 
-# Factory and utility functions
+# ── Factory / creator functions ───────────────────────────────────────────────
 from brute.functional import (
-    # creators
+    # Bit1-aware creators
     zeros, ones, empty, full,
     tensor, as_tensor, from_numpy,
-    # random
+    # Random creators
     rand, randn, randint,
-    rand_like, randn_like, zeros_like, ones_like,
-    # range / grid
+    rand_like, randn_like, zeros_like, ones_like, full_like, empty_like,
+    # Range / grid
     arange, linspace, eye,
-    # reductions & ops (re-exported from torch, work via __torch_function__)
+)
+
+# ── Reductions ────────────────────────────────────────────────────────────────
+from brute.functional import (
     all, any, sum, max, min, mean, prod,
-    cat, stack, where,
+    amax, amin, aminmax,
+    argmax, argmin,
+    count_nonzero, nonzero, argwhere,
+    nansum, nanmean, logsumexp,
+)
+
+# ── Combining / stacking ──────────────────────────────────────────────────────
+from brute.functional import cat, stack
+
+# ── Shape manipulation ────────────────────────────────────────────────────────
+from brute.functional import (
+    reshape, flatten, squeeze, unsqueeze,
+    permute, transpose, t,
+    movedim, moveaxis, swapaxes, swapdims,
+    broadcast_to, broadcast_tensors,
+    narrow, select,
+    atleast_1d, atleast_2d, atleast_3d,
+)
+
+# ── Splitting ─────────────────────────────────────────────────────────────────
+from brute.functional import (
+    split, chunk, unbind, tensor_split,
+    hsplit, vsplit, dsplit,
+)
+
+# ── Clone / detach ────────────────────────────────────────────────────────────
+from brute.functional import clone, detach
+
+# ── Logical (bit1-relevant) ───────────────────────────────────────────────────
+from brute.functional import (
+    where,
+    logical_and, logical_or, logical_xor, logical_not,
+)
+
+# ── Bitwise ───────────────────────────────────────────────────────────────────
+from brute.functional import (
+    bitwise_and, bitwise_or, bitwise_xor, bitwise_not,
+    bitwise_left_shift, bitwise_right_shift,
+)
+
+# ── Comparison ────────────────────────────────────────────────────────────────
+from brute.functional import (
+    eq, ne, lt, le, gt, ge,
+    equal, allclose, isclose,
+    isnan, isinf, isfinite, isneginf, isposinf,
+)
+
+# ── Arithmetic ────────────────────────────────────────────────────────────────
+from brute.functional import (
+    add, sub, mul, div, divide,
+    neg, negative, abs, absolute,
+    sign, sgn,
+    clamp, clip,
+    pow, sqrt, rsqrt,
+)
+
+# ── Cumulative ────────────────────────────────────────────────────────────────
+from brute.functional import cumsum, cumprod, cummax, cummin
+
+# ── Sorting / selection ───────────────────────────────────────────────────────
+from brute.functional import (
+    sort, argsort, topk, kthvalue, msort,
+    unique, unique_consecutive,
+)
+
+# ── Indexing / masking ────────────────────────────────────────────────────────
+from brute.functional import (
+    gather, index_select, masked_select, take, scatter,
+)
+
+# ── Rearrangement / replication ───────────────────────────────────────────────
+from brute.functional import (
+    roll, flip, fliplr, flipud, rot90,
+    tile, repeat_interleave,
+)
+
+# ── Matrix / linear algebra ───────────────────────────────────────────────────
+from brute.functional import (
+    mm, bmm, matmul, mv, dot, inner, outer, vdot, cross,
+)
+
+# ── Diagonal / triangular ─────────────────────────────────────────────────────
+from brute.functional import (
+    diagonal, diag, diag_embed, diagflat,
+    tril, triu, trace,
+)
+
+# ── Misc ──────────────────────────────────────────────────────────────────────
+from brute.functional import (
+    nan_to_num, diff, block_diag, cartesian_prod,
 )

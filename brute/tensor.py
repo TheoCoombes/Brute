@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import Optional
 import torch
-import copy
 
 from brute.dtype import (
     bit1,
@@ -86,7 +85,7 @@ class Tensor(torch.Tensor):
             return instance
 
         if isinstance(raw, torch.Tensor):
-            t = raw.to(dtype=dtype, device=device) if (dtyspe is not None or device is not None) else raw
+            t = raw.to(dtype=dtype, device=device) if (dtype is not None or device is not None) else raw
         elif isinstance(raw, (list, tuple)):
             t = torch.tensor(raw, dtype=dtype, device=device)
         else:
@@ -134,6 +133,39 @@ class Tensor(torch.Tensor):
         """Pack dtype (torch.uint8/uint32/uint64) for bit1 tensors, None otherwise."""
         return getattr(self, '_pack_dtype', None)
 
+    @property
+    def _packed_buf(self) -> Optional[torch.Tensor]:
+        """Packed bit buffer.
+
+        Lazily recomputed whenever the underlying bool storage has been modified
+        in-place (detected via PyTorch's per-storage version counter).  This makes
+        in-place ops such as fill_(), copy_(), index_put_(), and __setitem__
+        automatically correct without needing per-op overrides.
+        """
+        if not getattr(self, '_is_bit1', False):
+            return self.__dict__.get('_packed_buf_cache')
+        cache = self.__dict__.get('_packed_buf_cache')
+        try:
+            cur_ver = self._version
+        except Exception:
+            cur_ver = None
+        if cache is None or self.__dict__.get('_packed_ver') != cur_ver:
+            cache = _pack_bool(self.as_subclass(torch.Tensor), self._pack_dtype)
+            self.__dict__['_packed_buf_cache'] = cache
+            self.__dict__['_packed_ver'] = cur_ver
+        return cache
+
+    @_packed_buf.setter
+    def _packed_buf(self, val: Optional[torch.Tensor]) -> None:
+        self.__dict__['_packed_buf_cache'] = val
+        if val is not None:
+            try:
+                self.__dict__['_packed_ver'] = self._version
+            except Exception:
+                self.__dict__['_packed_ver'] = None
+        else:
+            self.__dict__.pop('_packed_ver', None)
+
     # ── element_size ──────────────────────────────────────────────────────────────
 
     def element_size(self) -> int:
@@ -144,6 +176,89 @@ class Tensor(torch.Tensor):
                 "the total storage footprint of the packed buffer."
             )
         return super().element_size()
+
+    @property
+    def nbytes(self) -> int:
+        """Total bytes consumed by the packed storage (bit1) or the raw tensor data."""
+        if getattr(self, '_is_bit1', False):
+            pb = self._packed_buf
+            return pb.nbytes if pb is not None else 0
+        return super().nbytes
+
+    @property
+    def itemsize(self) -> int:
+        if getattr(self, '_is_bit1', False):
+            raise TypeError(
+                "itemsize is not defined for bit1 tensors: a logical element "
+                "occupies less than one byte."
+            )
+        return super().itemsize
+
+    def type(self, dtype=None, non_blocking: bool = False, **kwargs):
+        """Return the type string, or cast to *dtype* (mirrors torch.Tensor.type)."""
+        if dtype is None:
+            if getattr(self, '_is_bit1', False):
+                return 'brute.Bit1Tensor'
+            return super().type()
+        result = self.as_subclass(torch.Tensor).type(dtype, non_blocking=non_blocking, **kwargs)
+        return Tensor._make_plain(result)
+
+    # ── Factory methods (preserve bit1 dtype) ───────────────────────────────────
+
+    def new_tensor(self, data, *, dtype=None, device=None, **kwargs) -> 'Tensor':
+        """Create a new tensor from *data* with the same dtype/device as self by default."""
+        eff_dtype = dtype if dtype is not None else self.dtype
+        base = self.as_subclass(torch.Tensor)
+        if isinstance(eff_dtype, _Bit1DType):
+            bool_t = base.new_tensor(data, dtype=torch.bool, device=device)
+            pd = getattr(self, '_pack_dtype', None) or get_optimal_pack_dtype(
+                torch.device(device) if device else base.device)
+            return Tensor._make_bit1(bool_t, pd)
+        return Tensor._make_plain(base.new_tensor(data, dtype=dtype, device=device, **kwargs))
+
+    def new_empty(self, size, *, dtype=None, device=None, **kwargs) -> 'Tensor':
+        """Return an uninitialised tensor of *size* with the same dtype/device as self."""
+        eff_dtype = dtype if dtype is not None else self.dtype
+        base = self.as_subclass(torch.Tensor)
+        if isinstance(eff_dtype, _Bit1DType):
+            bool_t = base.new_empty(size, dtype=torch.bool, device=device)
+            pd = getattr(self, '_pack_dtype', None) or get_optimal_pack_dtype(
+                torch.device(device) if device else base.device)
+            return Tensor._make_bit1(bool_t, pd)
+        return Tensor._make_plain(base.new_empty(size, dtype=dtype, device=device, **kwargs))
+
+    def new_full(self, size, fill_value, *, dtype=None, device=None, **kwargs) -> 'Tensor':
+        """Return a tensor of *size* filled with *fill_value*, same dtype/device as self."""
+        eff_dtype = dtype if dtype is not None else self.dtype
+        base = self.as_subclass(torch.Tensor)
+        if isinstance(eff_dtype, _Bit1DType):
+            bool_t = base.new_full(size, bool(fill_value), dtype=torch.bool, device=device)
+            pd = getattr(self, '_pack_dtype', None) or get_optimal_pack_dtype(
+                torch.device(device) if device else base.device)
+            return Tensor._make_bit1(bool_t, pd)
+        return Tensor._make_plain(base.new_full(size, fill_value, dtype=dtype, device=device, **kwargs))
+
+    def new_ones(self, size, *, dtype=None, device=None, **kwargs) -> 'Tensor':
+        """Return an all-ones tensor of *size* with the same dtype/device as self."""
+        eff_dtype = dtype if dtype is not None else self.dtype
+        base = self.as_subclass(torch.Tensor)
+        if isinstance(eff_dtype, _Bit1DType):
+            bool_t = base.new_ones(size, dtype=torch.bool, device=device)
+            pd = getattr(self, '_pack_dtype', None) or get_optimal_pack_dtype(
+                torch.device(device) if device else base.device)
+            return Tensor._make_bit1(bool_t, pd)
+        return Tensor._make_plain(base.new_ones(size, dtype=dtype, device=device, **kwargs))
+
+    def new_zeros(self, size, *, dtype=None, device=None, **kwargs) -> 'Tensor':
+        """Return an all-zeros tensor of *size* with the same dtype/device as self."""
+        eff_dtype = dtype if dtype is not None else self.dtype
+        base = self.as_subclass(torch.Tensor)
+        if isinstance(eff_dtype, _Bit1DType):
+            bool_t = base.new_zeros(size, dtype=torch.bool, device=device)
+            pd = getattr(self, '_pack_dtype', None) or get_optimal_pack_dtype(
+                torch.device(device) if device else base.device)
+            return Tensor._make_bit1(bool_t, pd)
+        return Tensor._make_plain(base.new_zeros(size, dtype=dtype, device=device, **kwargs))
 
     # ── Conversion ──────────────────────────────────────────────────────────────
 
@@ -317,7 +432,9 @@ class Tensor(torch.Tensor):
         new_t = super().__deepcopy__(memo)
         new_t._is_bit1    = getattr(self, '_is_bit1', False)
         new_t._pack_dtype = getattr(self, '_pack_dtype', None)
-        new_t._packed_buf = copy.deepcopy(getattr(self, '_packed_buf', None), memo)
+        # _packed_buf is a lazy property backed by _packed_buf_cache / _packed_ver.
+        # After deepcopy the underlying bool storage is a new tensor at version 0,
+        # so the version check will recompute on first access — no explicit copy needed.
         return new_t
 
     # ── Repr ─────────────────────────────────────────────────────────────────────

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import torch
 
-from brute.tensor import Tensor, _Bit1DType, _resolve_pack_dtype, bit1
+from brute.tensor import Tensor, _Bit1DType, resolve_pack_dtype, bit1
 
 
 # ── Internal normaliser ───────────────────────────────────────────────────────
@@ -27,7 +27,7 @@ def zeros(*size, dtype=None, device=None, pack_dtype: torch.dtype = torch.uint8,
     size = _norm_size(size)
     if isinstance(dtype, _Bit1DType):
         return Tensor._make_bit1(torch.zeros(size, dtype=torch.bool, device=device),
-                                 _resolve_pack_dtype(pack_dtype))
+                                 resolve_pack_dtype(pack_dtype))
     return Tensor._make_plain(torch.zeros(size, dtype=dtype, device=device, **kwargs))
 
 
@@ -35,7 +35,7 @@ def ones(*size, dtype=None, device=None, pack_dtype: torch.dtype = torch.uint8, 
     size = _norm_size(size)
     if isinstance(dtype, _Bit1DType):
         return Tensor._make_bit1(torch.ones(size, dtype=torch.bool, device=device),
-                                 _resolve_pack_dtype(pack_dtype))
+                                 resolve_pack_dtype(pack_dtype))
     return Tensor._make_plain(torch.ones(size, dtype=dtype, device=device, **kwargs))
 
 
@@ -43,7 +43,7 @@ def empty(*size, dtype=None, device=None, pack_dtype: torch.dtype = torch.uint8,
     size = _norm_size(size)
     if isinstance(dtype, _Bit1DType):
         return Tensor._make_bit1(torch.empty(size, dtype=torch.bool, device=device),
-                                 _resolve_pack_dtype(pack_dtype))
+                                 resolve_pack_dtype(pack_dtype))
     return Tensor._make_plain(torch.empty(size, dtype=dtype, device=device, **kwargs))
 
 
@@ -53,7 +53,7 @@ def full(size, fill_value, *, dtype=None, device=None, pack_dtype: torch.dtype =
     if isinstance(dtype, _Bit1DType):
         return Tensor._make_bit1(
             torch.full(size, bool(fill_value), dtype=torch.bool, device=device),
-            _resolve_pack_dtype(pack_dtype),
+            resolve_pack_dtype(pack_dtype),
         )
     return Tensor._make_plain(torch.full(size, fill_value, dtype=dtype, device=device, **kwargs))
 
@@ -61,7 +61,7 @@ def full(size, fill_value, *, dtype=None, device=None, pack_dtype: torch.dtype =
 def tensor(data, *, dtype=None, device=None, pack_dtype: torch.dtype = torch.uint8, **kwargs) -> Tensor:
     if isinstance(dtype, _Bit1DType):
         return Tensor._make_bit1(torch.tensor(data, dtype=torch.bool, device=device),
-                                 _resolve_pack_dtype(pack_dtype))
+                                 resolve_pack_dtype(pack_dtype))
     return Tensor._make_plain(torch.tensor(data, dtype=dtype, device=device, **kwargs))
 
 
@@ -74,7 +74,7 @@ def as_tensor(data, *, dtype=None, device=None, pack_dtype: torch.dtype = torch.
             bool_t = torch.as_tensor(data, dtype=torch.bool, device=device)
         if device is not None:
             bool_t = bool_t.to(device=device)
-        return Tensor._make_bit1(bool_t, _resolve_pack_dtype(pack_dtype))
+        return Tensor._make_bit1(bool_t, resolve_pack_dtype(pack_dtype))
     return Tensor._make_plain(torch.as_tensor(data, dtype=dtype, device=device))
 
 
@@ -90,7 +90,7 @@ def rand(*size, dtype=None, device=None, pack_dtype: torch.dtype = torch.uint8,
     gen_kw = {'generator': generator} if generator is not None else {}
     if isinstance(dtype, _Bit1DType):
         bool_t = torch.rand(size, device=device, **gen_kw) >= 0.5
-        return Tensor._make_bit1(bool_t, _resolve_pack_dtype(pack_dtype))
+        return Tensor._make_bit1(bool_t, resolve_pack_dtype(pack_dtype))
     return Tensor._make_plain(torch.rand(size, dtype=dtype, device=device, **gen_kw, **kwargs))
 
 
@@ -100,7 +100,7 @@ def randn(*size, dtype=None, device=None, pack_dtype: torch.dtype = torch.uint8,
     gen_kw = {'generator': generator} if generator is not None else {}
     if isinstance(dtype, _Bit1DType):
         bool_t = torch.randn(size, device=device, **gen_kw) >= 0
-        return Tensor._make_bit1(bool_t, _resolve_pack_dtype(pack_dtype))
+        return Tensor._make_bit1(bool_t, resolve_pack_dtype(pack_dtype))
     return Tensor._make_plain(torch.randn(size, dtype=dtype, device=device, **gen_kw, **kwargs))
 
 
@@ -110,7 +110,7 @@ def randint(low_or_high, high=None, size=None, *, dtype=None, device=None,
     if isinstance(dtype, _Bit1DType):
         s = size if size is not None else (low_or_high,)
         bool_t = torch.randint(0, 2, s, device=device, **gen_kw).bool()
-        return Tensor._make_bit1(bool_t, _resolve_pack_dtype(pack_dtype))
+        return Tensor._make_bit1(bool_t, resolve_pack_dtype(pack_dtype))
     if high is None:
         return Tensor._make_plain(torch.randint(low_or_high, size, dtype=dtype, device=device, **gen_kw, **kwargs))
     return Tensor._make_plain(torch.randint(low_or_high, high, size, dtype=dtype, device=device, **gen_kw, **kwargs))
@@ -119,7 +119,7 @@ def randint(low_or_high, high=None, size=None, *, dtype=None, device=None,
 def _inherit_pack_dtype(input: Tensor, pack_dtype: torch.dtype) -> torch.dtype:
     """Return the caller-supplied pack_dtype if explicitly set, else inherit from input."""
     if pack_dtype is not torch.uint8:
-        return _resolve_pack_dtype(pack_dtype)
+        return resolve_pack_dtype(pack_dtype)
     inherited = getattr(input, '_pack_dtype', None)
     return inherited if inherited is not None else torch.uint8
 
@@ -162,6 +162,31 @@ def ones_like(input: Tensor, *, dtype=None, device=None,
     return Tensor._make_plain(torch.ones_like(input.as_subclass(torch.Tensor), dtype=dtype, device=device))
 
 
+def full_like(input: Tensor, fill_value, *, dtype=None, device=None,
+              pack_dtype: torch.dtype = torch.uint8, **kwargs) -> Tensor:
+    eff_dtype = dtype if dtype is not None else input.dtype
+    if isinstance(eff_dtype, _Bit1DType):
+        bool_t = torch.full_like(input.as_subclass(torch.Tensor), bool(fill_value),
+                                 dtype=torch.bool, device=device)
+        return Tensor._make_bit1(bool_t, _inherit_pack_dtype(input, pack_dtype))
+    return Tensor._make_plain(torch.full_like(
+        input.as_subclass(torch.Tensor) if isinstance(input, Tensor) else input,
+        fill_value, dtype=dtype, device=device, **kwargs,
+    ))
+
+
+def empty_like(input: Tensor, *, dtype=None, device=None,
+               pack_dtype: torch.dtype = torch.uint8, **kwargs) -> Tensor:
+    eff_dtype = dtype if dtype is not None else input.dtype
+    if isinstance(eff_dtype, _Bit1DType):
+        bool_t = torch.empty_like(input.as_subclass(torch.Tensor), dtype=torch.bool, device=device)
+        return Tensor._make_bit1(bool_t, _inherit_pack_dtype(input, pack_dtype))
+    return Tensor._make_plain(torch.empty_like(
+        input.as_subclass(torch.Tensor) if isinstance(input, Tensor) else input,
+        dtype=dtype, device=device, **kwargs,
+    ))
+
+
 # ── Arange / linspace / eye ───────────────────────────────────────────────────
 
 def arange(start, end=None, step=1, *, dtype=None, device=None, **kwargs) -> Tensor:
@@ -180,8 +205,12 @@ def eye(n, m=None, *, dtype=None, device=None, **kwargs) -> Tensor:
     return Tensor._make_plain(torch.eye(n, m, dtype=dtype, device=device, **kwargs))
 
 
-# ── Re-exports: work via __torch_function__ ────────────────────────────────────
+# ── Re-exports: work correctly via __torch_function__ ─────────────────────────
+# All of the ops below unwrap brute.Tensor inputs to their bool/underlying base,
+# execute the standard torch op, and re-wrap results (including bit1 promotion)
+# via brute.Tensor.__torch_function__. No custom implementation is needed.
 
+# Reductions
 all   = torch.all
 any   = torch.any
 sum   = torch.sum
@@ -189,6 +218,157 @@ max   = torch.max
 min   = torch.min
 mean  = torch.mean
 prod  = torch.prod
+amax  = torch.amax
+amin  = torch.amin
+aminmax       = torch.aminmax
+argmax        = torch.argmax
+argmin        = torch.argmin
+count_nonzero = torch.count_nonzero
+nonzero       = torch.nonzero
+argwhere      = torch.argwhere
+nansum        = torch.nansum
+nanmean       = torch.nanmean
+logsumexp     = torch.logsumexp
+
+# Combining / stacking
 cat   = torch.cat
 stack = torch.stack
-where = torch.where
+
+# Shape manipulation
+reshape           = torch.reshape
+flatten           = torch.flatten
+squeeze           = torch.squeeze
+unsqueeze         = torch.unsqueeze
+permute           = torch.permute
+transpose         = torch.transpose
+t                 = torch.t
+movedim           = torch.movedim
+moveaxis          = torch.moveaxis
+swapaxes          = torch.swapaxes
+swapdims          = torch.swapdims
+broadcast_to      = torch.broadcast_to
+broadcast_tensors = torch.broadcast_tensors
+narrow            = torch.narrow
+select            = torch.select
+atleast_1d        = torch.atleast_1d
+atleast_2d        = torch.atleast_2d
+atleast_3d        = torch.atleast_3d
+
+# Splitting
+split         = torch.split
+chunk         = torch.chunk
+unbind        = torch.unbind
+tensor_split  = torch.tensor_split
+hsplit        = torch.hsplit
+vsplit        = torch.vsplit
+dsplit        = torch.dsplit
+
+# Clone / detach
+clone  = torch.clone
+detach = torch.detach
+
+# Logical (particularly meaningful for bit1)
+where         = torch.where
+logical_and   = torch.logical_and
+logical_or    = torch.logical_or
+logical_xor   = torch.logical_xor
+logical_not   = torch.logical_not
+
+# Bitwise (meaningful for bool/bit1)
+bitwise_and         = torch.bitwise_and
+bitwise_or          = torch.bitwise_or
+bitwise_xor         = torch.bitwise_xor
+bitwise_not         = torch.bitwise_not
+bitwise_left_shift  = torch.bitwise_left_shift
+bitwise_right_shift = torch.bitwise_right_shift
+
+# Comparison
+eq            = torch.eq
+ne            = torch.ne
+lt            = torch.lt
+le            = torch.le
+gt            = torch.gt
+ge            = torch.ge
+equal         = torch.equal
+allclose      = torch.allclose
+isclose       = torch.isclose
+isnan         = torch.isnan
+isinf         = torch.isinf
+isfinite      = torch.isfinite
+isneginf      = torch.isneginf
+isposinf      = torch.isposinf
+
+# Arithmetic
+add      = torch.add
+sub      = torch.sub
+mul      = torch.mul
+div      = torch.div
+divide   = torch.divide
+neg      = torch.neg
+negative = torch.negative
+abs      = torch.abs
+absolute = torch.absolute
+sign     = torch.sign
+sgn      = torch.sgn
+clamp    = torch.clamp
+clip     = torch.clamp
+pow      = torch.pow
+sqrt     = torch.sqrt
+rsqrt    = torch.rsqrt
+
+# Cumulative
+cumsum    = torch.cumsum
+cumprod   = torch.cumprod
+cummax    = torch.cummax
+cummin    = torch.cummin
+
+# Sorting / selection
+sort              = torch.sort
+argsort           = torch.argsort
+topk              = torch.topk
+kthvalue          = torch.kthvalue
+msort             = torch.msort
+unique            = torch.unique
+unique_consecutive = torch.unique_consecutive
+
+# Indexing / masking
+gather        = torch.gather
+index_select  = torch.index_select
+masked_select = torch.masked_select
+take          = torch.take
+scatter       = torch.scatter
+
+# Rearrangement / replication
+roll              = torch.roll
+flip              = torch.flip
+fliplr            = torch.fliplr
+flipud            = torch.flipud
+rot90             = torch.rot90
+tile              = torch.tile
+repeat_interleave = torch.repeat_interleave
+
+# Matrix / linear algebra
+mm      = torch.mm
+bmm     = torch.bmm
+matmul  = torch.matmul
+mv      = torch.mv
+dot     = torch.dot
+inner   = torch.inner
+outer   = torch.outer
+vdot    = torch.vdot
+cross   = torch.cross
+
+# Diagonal / triangular
+diagonal   = torch.diagonal
+diag       = torch.diag
+diag_embed = torch.diag_embed
+diagflat   = torch.diagflat
+tril       = torch.tril
+triu       = torch.triu
+trace      = torch.trace
+
+# Misc
+nan_to_num        = torch.nan_to_num
+diff              = torch.diff
+block_diag        = torch.block_diag
+cartesian_prod    = torch.cartesian_prod
