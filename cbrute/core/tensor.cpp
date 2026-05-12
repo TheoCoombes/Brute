@@ -1,2 +1,1 @@
-#include "tensor.h"
-// Bit1Tensor is fully defined in tensor.h (all methods inline).
+// Tensor-related utilities. Bit1Tensor and PackDType have been removed.

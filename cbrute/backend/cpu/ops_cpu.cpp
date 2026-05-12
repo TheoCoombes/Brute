@@ -19,19 +19,26 @@ at::ScalarType pack_scalar_type(int64_t pw) {
 // ──────────────────────────────────────────────────────────
 // pack_bits
 // Converts a float tensor to a packed-bit integer tensor.
-// Bit = 1 when input element >= 0, else 0. Packs along last dim (LSB first).
+// Bit = 1 when input element > 0, else 0. Packs along last dim (LSB first).
+// Padding bits beyond the logical size are set to 0.
 // ──────────────────────────────────────────────────────────
 at::Tensor pack_bits(const at::Tensor& input, int64_t pw) {
     TORCH_CHECK(input.dim() >= 1, "pack_bits: input must have >=1 dim");
     TORCH_CHECK(pw == 8 || pw == 32 || pw == 64, "pack_bits: pack_width must be 8, 32, or 64");
 
-    auto inp       = input.contiguous().to(at::kFloat);
-    int64_t ld     = inp.size(-1);                       // logical last dim
-    int64_t pd     = (ld + pw - 1) / pw;                // packed last dim
-    int64_t batch  = inp.numel() / ld;
+    auto inp   = input.contiguous().to(at::kFloat);
+    int64_t ld = inp.size(-1);
 
     auto out_shape = inp.sizes().vec();
+    if (ld == 0) {
+        out_shape.back() = 0;
+        return at::zeros(out_shape, pack_scalar_type(pw));
+    }
+
+    int64_t pd    = (ld + pw - 1) / pw;
+    int64_t batch = inp.numel() / ld;
     out_shape.back() = pd;
+
     auto output = at::zeros(out_shape, pack_scalar_type(pw));
     const float* in_ptr = inp.data_ptr<float>();
 
@@ -85,13 +92,18 @@ at::Tensor pack_bits(const at::Tensor& input, int64_t pw) {
 at::Tensor unpack_bits(const at::Tensor& packed, at::IntArrayRef logical_shape, int64_t pw) {
     TORCH_CHECK(pw == 8 || pw == 32 || pw == 64, "unpack_bits: pack_width must be 8, 32, or 64");
 
-    auto p          = packed.contiguous();
-    int64_t ll      = logical_shape.back();   // logical last dim
-    int64_t pl      = p.size(-1);             // packed last dim
-    int64_t batch   = p.numel() / pl;
+    auto p        = packed.contiguous();
+    int64_t ll    = logical_shape.back();
 
-    auto output   = at::empty(logical_shape.vec(), at::kFloat);
-    float* out    = output.data_ptr<float>();
+    if (ll == 0 || p.numel() == 0) {
+        return at::empty(logical_shape.vec(), at::kFloat);
+    }
+
+    int64_t pl    = p.size(-1);
+    int64_t batch = p.numel() / pl;
+
+    auto output = at::empty(logical_shape.vec(), at::kFloat);
+    float* out  = output.data_ptr<float>();
 
     if (pw == 8) {
         const uint8_t* in = p.data_ptr<uint8_t>();
@@ -135,11 +147,15 @@ at::Tensor unpack_bits(const at::Tensor& packed, at::IntArrayRef logical_shape, 
 
 // ──────────────────────────────────────────────────────────
 // xnor_popcount_matmul
-// A: (M, Kp), B: (N, Kp) — both packed. K = logical dim.
+// A: (M, Kp), B: (N, Kp) — both packed. K = logical last dim.
 // C(m,n) = 2 * popcount(~(A[m] ^ B[n])) - K  ∈ [-K, K]
 //
-// Uses libpopcnt on the full XNOR row (not word-by-word) so it can
-// exploit AVX-512 VPOPCNTDQ / AVX2 / NEON for bulk popcount.
+// Uses libpopcnt on the full XNOR row for bulk SIMD popcount
+// (AVX-512 VPOPCNTDQ / AVX2 / NEON / scalar fallback).
+//
+// Padding-bit correction: zero-padded tail bits in both operands
+// XNOR to 1, inflating the raw count by (Kp*pw - K) per row.
+// K_eff = 2*Kp*pw - K absorbs this: 2*acc - K_eff = 2*true_matches - K.
 // ──────────────────────────────────────────────────────────
 at::Tensor xnor_popcount_matmul(const at::Tensor& A, const at::Tensor& B, int64_t K, int64_t pw) {
     TORCH_CHECK(A.dim() == 2 && B.dim() == 2, "xnor_popcount_matmul: inputs must be 2-D");
@@ -151,19 +167,14 @@ at::Tensor xnor_popcount_matmul(const at::Tensor& A, const at::Tensor& B, int64_
     int32_t* c = C.data_ptr<int32_t>();
     auto Ac = A.contiguous(), Bc = B.contiguous();
 
-    // Number of bytes in one packed row — what libpopcnt operates on.
-    size_t row_bytes = static_cast<size_t>(Kp) * (pw / 8);
-
-    // Adjusted K: the Kp*pw − K zero-padded tail bits all XNOR to 1 (both
-    // sides are 0), inflating acc.  Subtracting K_eff instead of K removes
-    // their contribution: 2·acc − K_eff = 2·true_matches − K.
-    int32_t K_eff = (int32_t)(2LL * Kp * pw - K);
+    size_t   row_bytes = static_cast<size_t>(Kp) * (pw / 8);
+    int32_t  K_eff     = (int32_t)(2LL * Kp * pw - K);
 
     if (pw == 64) {
         const uint64_t* a = reinterpret_cast<const uint64_t*>(Ac.data_ptr<int64_t>());
         const uint64_t* b = reinterpret_cast<const uint64_t*>(Bc.data_ptr<int64_t>());
         at::parallel_for(0, M, 1, [&](int64_t ms, int64_t me) {
-            std::vector<uint64_t> xnor_buf(Kp);          // one allocation per thread
+            std::vector<uint64_t> xnor_buf(Kp);
             for (int64_t m = ms; m < me; m++)
                 for (int64_t n = 0; n < N; n++) {
                     for (int64_t k = 0; k < Kp; k++)
@@ -200,7 +211,7 @@ at::Tensor xnor_popcount_matmul(const at::Tensor& A, const at::Tensor& B, int64_
 }
 
 // ──────────────────────────────────────────────────────────
-// popcount — per-element popcount into int32
+// popcount — per-element popcount of each packed word into int32.
 // ──────────────────────────────────────────────────────────
 at::Tensor popcount(const at::Tensor& packed) {
     auto p   = packed.contiguous();
@@ -226,6 +237,19 @@ at::Tensor popcount(const at::Tensor& packed) {
     }
     }
     return out;
+}
+
+// ──────────────────────────────────────────────────────────
+// packed_popcount — total count of 1-bits in the entire buffer.
+// Uses libpopcnt on the full contiguous byte range (SIMD-optimal:
+// exploits AVX-512 VPOPCNTDQ / AVX2 / NEON depending on host CPU).
+// Padding bits in the packed buffer are 0 (set during pack_bits),
+// so they contribute 0 to the total — no correction needed.
+// ──────────────────────────────────────────────────────────
+at::Tensor packed_popcount(const at::Tensor& packed) {
+    auto p = packed.contiguous();
+    uint64_t total = popcnt(p.data_ptr(), static_cast<uint64_t>(p.nbytes()));
+    return at::scalar_tensor((int64_t)total, at::kLong);
 }
 
 at::Tensor hamming_distance(const at::Tensor& A, const at::Tensor& B) {

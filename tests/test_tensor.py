@@ -1,12 +1,14 @@
 """
-Comprehensive tests for brute.bit1 behaviour parity with torch.BoolTensor.
+Comprehensive test suite for brute tensor types.
 
 Design rules
 ────────────
 1. Every bit1 test has a matching bool-tensor reference computed with plain torch.
-2. The factory functions used *inside* tests (e.g. brute.tensor, brute.zeros) are
-   themselves tested in TestFactories — so they are safe to use elsewhere.
-3. Matmul tests verify the {−1,+1} convention against a manual float reference.
+2. bool (brute.bool / torch.bool) and bit1 (brute.bit1) are strictly separate types
+   and must never be accidentally coerced into one another.
+3. pack_dtype is a plain torch.dtype: brute.uint8 / brute.uint32 / brute.uint64.
+4. All matmul results are verified against a float {-1,+1} reference.
+5. Edge cases: K=0, K=1, K non-divisible by pw, very large K.
 """
 
 import copy
@@ -17,223 +19,496 @@ import torch
 import brute
 
 
-# ── helpers ───────────────────────────────────────────────────────────────────
+# ── Helpers ────────────────────────────────────────────────────────────────────
 
 def base(t) -> torch.Tensor:
     """Extract the underlying torch.Tensor (bool base for bit1, plain otherwise)."""
     return t.as_subclass(torch.Tensor)
 
 
-def ref_bool(*values) -> torch.Tensor:
-    return torch.tensor(values, dtype=torch.bool)
+def _ref_pm1(a_bool: torch.Tensor, b_bool: torch.Tensor) -> torch.Tensor:
+    """Float {-1,+1} reference matmul."""
+    return (a_bool.float() * 2 - 1) @ (b_bool.float() * 2 - 1).t()
 
 
-# ── TestFactories ─────────────────────────────────────────────────────────────
+# ── TestPackDtype ──────────────────────────────────────────────────────────────
+
+class TestPackDtype:
+    """pack_dtype is a plain torch.dtype — brute.uint8/uint32/uint64 == torch.uint8/uint32/uint64."""
+
+    def test_pack_dtypes_are_torch_dtypes(self):
+        assert brute.uint8  is torch.uint8
+        assert brute.uint32 is torch.uint32
+        assert brute.uint64 is torch.uint64
+
+    def test_tensor_pack_dtype_uint8(self):
+        t = brute.zeros(4, dtype=brute.bit1, pack_dtype=brute.uint8)
+        assert t.pack_dtype is torch.uint8
+
+    def test_tensor_pack_dtype_uint32(self):
+        t = brute.zeros(4, dtype=brute.bit1, pack_dtype=brute.uint32)
+        assert t.pack_dtype is torch.uint32
+
+    def test_tensor_pack_dtype_uint64(self):
+        t = brute.zeros(4, dtype=brute.bit1, pack_dtype=brute.uint64)
+        assert t.pack_dtype is torch.uint64
+
+    def test_default_pack_dtype_is_uint8(self):
+        t = brute.zeros(4, dtype=brute.bit1)
+        assert t.pack_dtype is torch.uint8
+
+    def test_pack_dtype_none_for_non_bit1(self):
+        assert brute.zeros(4).pack_dtype is None
+
+    def test_invalid_pack_dtype_raises(self):
+        with pytest.raises(TypeError):
+            brute.zeros(4, dtype=brute.bit1, pack_dtype=torch.float32)
+
+    def test_invalid_pack_dtype_int16_raises(self):
+        with pytest.raises(TypeError):
+            brute.zeros(4, dtype=brute.bit1, pack_dtype=torch.int16)
+
+
+# ── TestAllDtypes ──────────────────────────────────────────────────────────────
+
+class TestAllDtypes:
+    """brute re-exports all torch dtypes."""
+
+    @pytest.mark.parametrize("name,expected", [
+        ('float32',       torch.float32),
+        ('float64',       torch.float64),
+        ('float16',       torch.float16),
+        ('bfloat16',      torch.bfloat16),
+        ('int8',          torch.int8),
+        ('int16',         torch.int16),
+        ('int32',         torch.int32),
+        ('int64',         torch.int64),
+        ('uint8',         torch.uint8),
+        ('uint16',        torch.uint16),
+        ('uint32',        torch.uint32),
+        ('uint64',        torch.uint64),
+        ('bool',          torch.bool),
+        ('complex64',     torch.complex64),
+        ('complex128',    torch.complex128),
+        ('float8_e4m3fn', torch.float8_e4m3fn),
+        ('float8_e5m2',   torch.float8_e5m2),
+    ])
+    def test_dtype_exported(self, name, expected):
+        assert getattr(brute, name) is expected
+
+
+# ── TestDtypeSeparation ────────────────────────────────────────────────────────
+
+class TestDtypeSeparation:
+    """brute.bool and brute.bit1 are distinct; they must never fuse."""
+
+    def test_brute_bool_is_torch_bool(self):
+        assert brute.bool is torch.bool
+
+    def test_bit1_is_not_torch_bool(self):
+        assert brute.bit1 != torch.bool
+        assert torch.bool != brute.bit1
+
+    def test_bit1_equals_itself(self):
+        assert brute.bit1 == brute.bit1
+
+    def test_bit1_dtype_property(self):
+        t = brute.zeros(3, dtype=brute.bit1)
+        assert t.dtype == brute.bit1
+        assert t.dtype != torch.bool
+
+    def test_bool_tensor_dtype_is_torch_bool(self):
+        t = brute.tensor([True, False], dtype=torch.bool)
+        assert t.dtype == torch.bool
+        assert t.dtype != brute.bit1
+
+    def test_list_bool_defaults_to_torch_bool(self):
+        t = brute.tensor([True, False])
+        assert t.dtype == torch.bool
+        assert not getattr(t, '_is_bit1', False)
+
+    def test_is_bit1_flag(self):
+        b = brute.tensor([True, False], dtype=torch.bool)
+        q = brute.tensor([True, False], dtype=brute.bit1)
+        assert not b._is_bit1
+        assert q._is_bit1
+
+    def test_cat_bit1_and_bool_does_not_produce_bit1(self):
+        a = brute.tensor([True, False], dtype=brute.bit1)
+        b = brute.tensor([False, True], dtype=torch.bool)
+        r = torch.cat([a, b])
+        assert not getattr(r, '_is_bit1', False)
+        assert r.dtype == torch.bool
+
+    def test_and_bit1_and_plain_torch_bool_no_promotion(self):
+        a = brute.tensor([True, False, True], dtype=brute.bit1)
+        b = torch.tensor([True, True, False])
+        r = torch.logical_and(a, b)
+        assert not getattr(r, '_is_bit1', False)
+
+    def test_cat_two_bit1_preserves_bit1(self):
+        a = brute.tensor([True, False], dtype=brute.bit1)
+        b = brute.tensor([False, True], dtype=brute.bit1)
+        r = torch.cat([a, b])
+        assert getattr(r, '_is_bit1', False)
+        assert r.dtype == brute.bit1
+
+    def test_and_two_bit1_preserves_bit1(self):
+        a = brute.tensor([True, False, True], dtype=brute.bit1)
+        b = brute.tensor([True, True, False], dtype=brute.bit1)
+        r = a & b
+        assert r.dtype == brute.bit1
+
+    def test_bool_ops_on_plain_bool_stay_bool(self):
+        a = brute.tensor([True, False], dtype=torch.bool)
+        b = brute.tensor([False, True], dtype=torch.bool)
+        r = a & b
+        assert r.dtype == torch.bool and not getattr(r, '_is_bit1', False)
+
+
+# ── TestBoolMethod ─────────────────────────────────────────────────────────────
+
+class TestBoolMethod:
+    """.bool() must return a brute.Tensor with dtype=torch.bool."""
+
+    def test_bit1_bool_returns_brute_tensor(self):
+        t = brute.tensor([True, False, True], dtype=brute.bit1)
+        b = t.bool()
+        assert isinstance(b, brute.Tensor)
+        assert b.dtype == torch.bool and not b._is_bit1
+
+    def test_bit1_bool_values_correct(self):
+        t = brute.tensor([True, False, True], dtype=brute.bit1)
+        assert torch.equal(base(t.bool()), torch.tensor([True, False, True]))
+
+    def test_float_bool_returns_brute_tensor(self):
+        b = brute.tensor([1.5, -0.5, 0.1]).bool()
+        assert isinstance(b, brute.Tensor) and b.dtype == torch.bool
+
+    def test_bool_tensor_bool_is_noop(self):
+        t = brute.tensor([True, False], dtype=torch.bool)
+        b = t.bool()
+        assert isinstance(b, brute.Tensor) and b.dtype == torch.bool
+        assert torch.equal(base(b), torch.tensor([True, False]))
+
+    def test_bit1_bool_then_bit1_roundtrip(self):
+        t = brute.tensor([True, False, True], dtype=brute.bit1)
+        t2 = brute.as_tensor(t.bool(), dtype=brute.bit1)
+        assert t2.dtype == brute.bit1
+        assert torch.equal(base(t2), base(t))
+
+
+# ── TestElementSize ────────────────────────────────────────────────────────────
+
+class TestElementSize:
+    def test_bit1_raises(self):
+        with pytest.raises(TypeError, match="element_size"):
+            brute.zeros(4, dtype=brute.bit1).element_size()
+
+    def test_float_element_size(self):
+        assert brute.zeros(4, dtype=torch.float32).element_size() == 4
+
+    def test_bool_element_size(self):
+        assert brute.zeros(4, dtype=torch.bool).element_size() == 1
+
+    def test_packed_buf_nbytes_uint8(self):
+        # 8 logical bits → 1 packed uint8 → 1 byte
+        assert brute.zeros(8, dtype=brute.bit1, pack_dtype=brute.uint8)._packed_buf.nbytes == 1
+
+    def test_packed_buf_nbytes_uint32(self):
+        # 32 bits → 1 uint32 → 4 bytes
+        assert brute.zeros(32, dtype=brute.bit1, pack_dtype=brute.uint32)._packed_buf.nbytes == 4
+
+    def test_packed_buf_nbytes_non_multiple(self):
+        # 9 bits → 2 packed uint8 → 2 bytes
+        assert brute.zeros(9, dtype=brute.bit1, pack_dtype=brute.uint8)._packed_buf.nbytes == 2
+
+
+# ── TestPopcount ───────────────────────────────────────────────────────────────
+
+class TestPopcount:
+    """popcount() for bit1 uses libpopcnt; for bool uses sum."""
+
+    def test_bit1_all_true(self):
+        assert brute.ones(8, dtype=brute.bit1).popcount().item() == 8
+
+    def test_bit1_all_false(self):
+        assert brute.zeros(8, dtype=brute.bit1).popcount().item() == 0
+
+    def test_bit1_mixed(self):
+        assert brute.tensor([True, False, True, False], dtype=brute.bit1).popcount().item() == 2
+
+    def test_bit1_2d(self):
+        t = brute.tensor([[True, False], [False, True]], dtype=brute.bit1)
+        assert t.popcount().item() == 2
+
+    def test_bit1_returns_brute_tensor(self):
+        assert isinstance(brute.ones(4, dtype=brute.bit1).popcount(), brute.Tensor)
+
+    def test_bit1_returns_int64_scalar(self):
+        r = brute.ones(4, dtype=brute.bit1).popcount()
+        assert r.dtype == torch.int64 and r.dim() == 0
+
+    @pytest.mark.parametrize("pw", [brute.uint8, brute.uint32, brute.uint64])
+    def test_bit1_all_packs(self, pw):
+        data = [True, False, True, True, False, True, False, True]
+        t = brute.tensor(data, dtype=brute.bit1, pack_dtype=pw)
+        assert t.popcount().item() == sum(data)
+
+    def test_bit1_non_multiple_k(self):
+        # K=9 (not a multiple of 8); padding bits must not be counted
+        t = brute.tensor([True] * 9, dtype=brute.bit1, pack_dtype=brute.uint8)
+        assert t.popcount().item() == 9
+
+    def test_bit1_k65_no_padding_inflation(self):
+        # K=65 with uint64: 2 words, 63 padding bits all zero
+        t = brute.tensor([True] * 65, dtype=brute.bit1, pack_dtype=brute.uint64)
+        assert t.popcount().item() == 65
+
+    def test_bool_all_true(self):
+        assert brute.ones(6, dtype=torch.bool).popcount().item() == 6
+
+    def test_bool_all_false(self):
+        assert brute.zeros(6, dtype=torch.bool).popcount().item() == 0
+
+    def test_bool_mixed(self):
+        assert brute.tensor([True, False, True], dtype=torch.bool).popcount().item() == 2
+
+    def test_bool_returns_brute_tensor(self):
+        assert isinstance(brute.ones(4, dtype=torch.bool).popcount(), brute.Tensor)
+
+    def test_float_raises(self):
+        with pytest.raises(TypeError):
+            brute.zeros(4, dtype=torch.float32).popcount()
+
+    def test_popcount_matches_sum(self):
+        torch.manual_seed(42)
+        data = torch.randint(0, 2, (64,)).bool()
+        t = brute.tensor(data, dtype=brute.bit1)
+        assert t.popcount().item() == data.sum().item()
+
+    def test_empty_bit1_popcount_is_zero(self):
+        assert brute.zeros(0, dtype=brute.bit1).popcount().item() == 0
+
+
+# ── TestPaddingEdgeCases ───────────────────────────────────────────────────────
+
+class TestPaddingEdgeCases:
+    """K not divisible by pack width: ensure no phantom bits bleed in/out."""
+
+    @pytest.mark.parametrize("K,pw", [
+        (1, brute.uint8), (7, brute.uint8), (8, brute.uint8), (9, brute.uint8),
+        (31, brute.uint32), (32, brute.uint32), (33, brute.uint32),
+        (63, brute.uint64), (64, brute.uint64), (65, brute.uint64),
+    ])
+    def test_matmul_all_ones_correctness(self, K, pw):
+        a = brute.ones(2, K, dtype=brute.bit1, pack_dtype=pw)
+        b = brute.ones(3, K, dtype=brute.bit1, pack_dtype=pw)
+        assert (a @ b == K).all(), f"K={K}, pw={pw}: got {a @ b}"
+
+    @pytest.mark.parametrize("K,pw", [
+        (7, brute.uint8), (9, brute.uint8),
+        (31, brute.uint32), (33, brute.uint32),
+        (63, brute.uint64), (65, brute.uint64),
+    ])
+    def test_matmul_vs_float_reference(self, K, pw):
+        torch.manual_seed(K)
+        a_bool = torch.randint(0, 2, (3, K)).bool()
+        b_bool = torch.randint(0, 2, (4, K)).bool()
+        a = brute.tensor(a_bool, dtype=brute.bit1, pack_dtype=pw)
+        b = brute.tensor(b_bool, dtype=brute.bit1, pack_dtype=pw)
+        assert torch.equal((a @ b).float(), _ref_pm1(a_bool, b_bool))
+
+    @pytest.mark.parametrize("K,pw", [
+        (7, brute.uint8), (9, brute.uint8),
+        (31, brute.uint32), (33, brute.uint32),
+        (63, brute.uint64), (65, brute.uint64),
+    ])
+    def test_unpack_pm1_non_multiple_k(self, K, pw):
+        t = brute.ones(K, dtype=brute.bit1, pack_dtype=pw)
+        r = t.unpack_pm1()
+        assert r.shape == torch.Size([K]) and (r == 1.0).all()
+
+    @pytest.mark.parametrize("K,pw", [
+        (7, brute.uint8), (9, brute.uint8),
+        (31, brute.uint32), (33, brute.uint32),
+        (63, brute.uint64), (65, brute.uint64),
+    ])
+    def test_popcount_non_multiple_k_all_true(self, K, pw):
+        assert brute.ones(K, dtype=brute.bit1, pack_dtype=pw).popcount().item() == K
+
+    @pytest.mark.parametrize("K,pw", [
+        (7, brute.uint8), (9, brute.uint8), (65, brute.uint64),
+    ])
+    def test_popcount_non_multiple_k_all_false(self, K, pw):
+        assert brute.zeros(K, dtype=brute.bit1, pack_dtype=pw).popcount().item() == 0
+
+    def test_packed_buf_trailing_zeros(self):
+        # K=3, uint8: bits 0-2 = data, bits 3-7 = 0 → packed word = 0b00000111 = 7
+        t = brute.tensor([True, True, True], dtype=brute.bit1, pack_dtype=brute.uint8)
+        assert t._packed_buf[0].item() == 7
+
+    def test_packed_buf_all_false_trailing_zero(self):
+        t = brute.tensor([False, False, False], dtype=brute.bit1, pack_dtype=brute.uint8)
+        assert t._packed_buf[0].item() == 0
+
+
+# ── TestFactories ──────────────────────────────────────────────────────────────
 
 class TestFactories:
-    """Test that all brute factory functions produce correct bit1 / float tensors."""
-
-    # --- zeros ----------------------------------------------------------------
 
     def test_zeros_bit1_values(self):
         t   = brute.zeros(3, 4, dtype=brute.bit1)
         ref = torch.zeros(3, 4, dtype=torch.bool)
-        assert isinstance(t, brute.Tensor)
-        assert t.dtype == brute.bit1
+        assert isinstance(t, brute.Tensor) and t.dtype == brute.bit1
         assert t.shape == torch.Size([3, 4])
         assert torch.equal(base(t), ref)
 
     def test_zeros_bit1_tuple_size(self):
-        t = brute.zeros((2, 5), dtype=brute.bit1)
-        assert t.shape == torch.Size([2, 5])
+        assert brute.zeros((2, 5), dtype=brute.bit1).shape == torch.Size([2, 5])
 
     def test_zeros_float(self):
-        t   = brute.zeros(3, 4)
-        ref = torch.zeros(3, 4)
-        assert torch.equal(base(t), ref)
+        assert torch.equal(base(brute.zeros(3, 4)), torch.zeros(3, 4))
 
-    # --- ones -----------------------------------------------------------------
+    def test_zeros_bit1_pack_dtype(self):
+        t = brute.zeros(4, dtype=brute.bit1, pack_dtype=brute.uint32)
+        assert t.pack_dtype is torch.uint32
 
     def test_ones_bit1_values(self):
-        t   = brute.ones(3, 4, dtype=brute.bit1)
-        ref = torch.ones(3, 4, dtype=torch.bool)
-        assert torch.equal(base(t), ref)
+        assert torch.equal(base(brute.ones(3, 4, dtype=brute.bit1)),
+                           torch.ones(3, 4, dtype=torch.bool))
 
     def test_ones_float(self):
-        t   = brute.ones(3, 4)
-        ref = torch.ones(3, 4)
-        assert torch.equal(base(t), ref)
-
-    # --- full -----------------------------------------------------------------
+        assert torch.equal(base(brute.ones(3, 4)), torch.ones(3, 4))
 
     def test_full_bit1_true(self):
-        t   = brute.full((2, 3), True, dtype=brute.bit1)
-        ref = torch.full((2, 3), True, dtype=torch.bool)
-        assert torch.equal(base(t), ref)
+        assert torch.equal(base(brute.full((2, 3), True, dtype=brute.bit1)),
+                           torch.full((2, 3), True, dtype=torch.bool))
 
     def test_full_bit1_false(self):
-        t   = brute.full((2, 3), False, dtype=brute.bit1)
-        ref = torch.full((2, 3), False, dtype=torch.bool)
-        assert torch.equal(base(t), ref)
-
-    # --- tensor ---------------------------------------------------------------
+        assert torch.equal(base(brute.full((2, 3), False, dtype=brute.bit1)),
+                           torch.full((2, 3), False, dtype=torch.bool))
 
     def test_tensor_bit1(self):
         data = [True, False, True, True, False]
         t    = brute.tensor(data, dtype=brute.bit1)
-        ref  = torch.tensor(data, dtype=torch.bool)
         assert t.dtype == brute.bit1
-        assert torch.equal(base(t), ref)
+        assert torch.equal(base(t), torch.tensor(data, dtype=torch.bool))
 
     def test_tensor_float(self):
         data = [1.0, 2.0, 3.0]
-        t    = brute.tensor(data)
-        ref  = torch.tensor(data)
-        assert torch.equal(base(t), ref)
+        assert torch.equal(base(brute.tensor(data)), torch.tensor(data))
 
-    # --- as_tensor ------------------------------------------------------------
+    def test_tensor_bool_list_is_torch_bool(self):
+        t = brute.tensor([True, False])
+        assert t.dtype == torch.bool and not t._is_bit1
 
     def test_as_tensor_bool(self):
         raw = torch.tensor([True, False, True])
         t   = brute.as_tensor(raw, dtype=brute.bit1)
-        assert t.dtype == brute.bit1
-        assert torch.equal(base(t), raw)
+        assert t.dtype == brute.bit1 and torch.equal(base(t), raw)
 
     def test_as_tensor_list(self):
         t   = brute.as_tensor([True, False], dtype=brute.bit1)
-        ref = torch.tensor([True, False], dtype=torch.bool)
-        assert torch.equal(base(t), ref)
-
-    # --- rand / randn ---------------------------------------------------------
+        assert torch.equal(base(t), torch.tensor([True, False], dtype=torch.bool))
 
     def test_rand_bit1_shape(self):
         t = brute.rand(4, 5, dtype=brute.bit1)
-        assert t.shape == torch.Size([4, 5])
-        assert t.dtype == brute.bit1
-        assert base(t).dtype == torch.bool
+        assert t.shape == torch.Size([4, 5]) and t.dtype == brute.bit1
 
     def test_randn_bit1_shape(self):
-        t = brute.randn(4, 5, dtype=brute.bit1)
-        assert t.shape == torch.Size([4, 5])
-        assert t.dtype == brute.bit1
+        assert brute.randn(4, 5, dtype=brute.bit1).dtype == brute.bit1
 
     def test_rand_bit1_has_both_values(self):
-        # With 1000 bits, probability of all-True or all-False is astronomically low
         torch.manual_seed(0)
         t = brute.rand(1000, dtype=brute.bit1)
-        assert base(t).any().item()
-        assert (~base(t)).any().item()
+        assert base(t).any().item() and (~base(t)).any().item()
 
     def test_rand_float_range(self):
         t = brute.rand(100)
         assert (base(t) >= 0).all() and (base(t) <= 1).all()
 
     def test_randn_float(self):
-        t = brute.randn(50)
-        assert t.dtype == torch.float32
-
-    # --- randint --------------------------------------------------------------
+        assert brute.randn(50).dtype == torch.float32
 
     def test_randint_bit1(self):
         t = brute.randint(0, 2, size=(4, 5), dtype=brute.bit1)
-        assert t.shape == torch.Size([4, 5])
-        assert t.dtype == brute.bit1
-
-    # --- zeros_like / ones_like -----------------------------------------------
+        assert t.shape == torch.Size([4, 5]) and t.dtype == brute.bit1
 
     def test_zeros_like_bit1(self):
         src = brute.ones(3, 4, dtype=brute.bit1)
         t   = brute.zeros_like(src)
-        assert t.dtype == brute.bit1
-        assert not base(t).any()
+        assert t.dtype == brute.bit1 and not base(t).any()
 
     def test_ones_like_bit1(self):
         src = brute.zeros(3, 4, dtype=brute.bit1)
         t   = brute.ones_like(src)
-        assert t.dtype == brute.bit1
-        assert base(t).all()
+        assert t.dtype == brute.bit1 and base(t).all()
 
-    # --- arange / linspace / eye ----------------------------------------------
+    def test_zeros_like_preserves_pack_dtype(self):
+        src = brute.zeros(4, dtype=brute.bit1, pack_dtype=brute.uint32)
+        t   = brute.zeros_like(src)
+        assert t.pack_dtype is torch.uint32
 
     def test_arange(self):
-        t   = brute.arange(5)
-        ref = torch.arange(5)
-        assert torch.equal(base(t), ref)
+        assert torch.equal(base(brute.arange(5)), torch.arange(5))
 
     def test_linspace(self):
-        t   = brute.linspace(0.0, 1.0, 5)
-        ref = torch.linspace(0.0, 1.0, 5)
-        assert torch.allclose(base(t), ref)
+        assert torch.allclose(base(brute.linspace(0.0, 1.0, 5)), torch.linspace(0.0, 1.0, 5))
 
     def test_eye(self):
-        t   = brute.eye(4)
-        ref = torch.eye(4)
-        assert torch.equal(base(t), ref)
-
-    # --- from_numpy -----------------------------------------------------------
+        assert torch.equal(base(brute.eye(4)), torch.eye(4))
 
     def test_from_numpy(self):
         import numpy as np
         arr = np.array([1.0, 2.0, 3.0], dtype=np.float32)
-        t   = brute.from_numpy(arr)
-        ref = torch.from_numpy(arr)
-        assert torch.equal(base(t), ref)
+        assert torch.equal(base(brute.from_numpy(arr)), torch.from_numpy(arr))
 
 
-# ── TestProperties ────────────────────────────────────────────────────────────
+# ── TestProperties ─────────────────────────────────────────────────────────────
 
 class TestProperties:
-    def test_dtype_bit1_equals_brute_bit1(self):
-        t = brute.zeros(3, dtype=brute.bit1)
-        assert t.dtype == brute.bit1
+    def test_dtype_bit1(self):
+        assert brute.zeros(3, dtype=brute.bit1).dtype == brute.bit1
 
-    def test_dtype_bit1_equals_torch_bool(self):
-        # bit1 must compare equal to torch.bool for downstream compat
-        t = brute.zeros(3, dtype=brute.bit1)
-        assert t.dtype == torch.bool
+    def test_dtype_bit1_not_torch_bool(self):
+        assert brute.zeros(3, dtype=brute.bit1).dtype != torch.bool
 
     def test_dtype_float(self):
-        t = brute.zeros(3)
-        assert t.dtype == torch.float32
+        assert brute.zeros(3).dtype == torch.float32
+
+    def test_dtype_bool_tensor(self):
+        assert brute.tensor([True, False], dtype=torch.bool).dtype == torch.bool
 
     def test_shape(self):
-        t = brute.zeros(3, 4, 5, dtype=brute.bit1)
-        assert t.shape == torch.Size([3, 4, 5])
+        assert brute.zeros(3, 4, 5, dtype=brute.bit1).shape == torch.Size([3, 4, 5])
 
     def test_numel(self):
-        t = brute.zeros(3, 4, dtype=brute.bit1)
-        assert t.numel() == 12
+        assert brute.zeros(3, 4, dtype=brute.bit1).numel() == 12
 
     def test_ndim(self):
-        t = brute.zeros(2, 3, dtype=brute.bit1)
-        assert t.ndim == 2
+        assert brute.zeros(2, 3, dtype=brute.bit1).ndim == 2
 
     def test_device_cpu(self):
-        t = brute.zeros(3, dtype=brute.bit1)
-        assert t.device.type == 'cpu'
+        assert brute.zeros(3, dtype=brute.bit1).device.type == 'cpu'
 
     def test_isinstance_torch_tensor(self):
         t = brute.zeros(3, dtype=brute.bit1)
-        assert isinstance(t, torch.Tensor)
-        assert isinstance(t, brute.Tensor)
+        assert isinstance(t, torch.Tensor) and isinstance(t, brute.Tensor)
 
     def test_pack_dtype_attribute(self):
-        t = brute.zeros(3, dtype=brute.bit1, pack_dtype='uint8')
-        assert t.pack_dtype == 'uint8'
+        t = brute.zeros(3, dtype=brute.bit1, pack_dtype=brute.uint8)
+        assert t.pack_dtype is torch.uint8
 
     def test_no_grad_bit1(self):
-        # bool tensors cannot have gradients
-        t = brute.zeros(3, dtype=brute.bit1)
-        assert not t.requires_grad
+        assert not brute.zeros(3, dtype=brute.bit1).requires_grad
 
 
-# ── TestBoolOps ───────────────────────────────────────────────────────────────
+# ── TestBoolOps ────────────────────────────────────────────────────────────────
 
 class TestBoolOps:
-    """Boolean ops on bit1 should be identical to the same op on BoolTensor."""
-
-    A = [True,  False, True,  False]
-    B = [True,  True,  False, False]
+    A = [True, False, True,  False]
+    B = [True, True,  False, False]
 
     @pytest.fixture(autouse=True)
     def setup(self):
@@ -243,55 +518,44 @@ class TestBoolOps:
         self.ref_b = torch.tensor(self.B)
 
     def _chk(self, result, ref):
-        assert isinstance(result, brute.Tensor)
-        assert result.dtype == brute.bit1
+        assert isinstance(result, brute.Tensor) and result.dtype == brute.bit1
         assert torch.equal(base(result), ref)
 
-    def test_and(self):
-        self._chk(self.a & self.b, self.ref_a & self.ref_b)
-
-    def test_or(self):
-        self._chk(self.a | self.b, self.ref_a | self.ref_b)
-
-    def test_xor(self):
-        self._chk(self.a ^ self.b, self.ref_a ^ self.ref_b)
-
-    def test_not(self):
-        self._chk(~self.a, ~self.ref_a)
+    def test_and(self):  self._chk(self.a & self.b, self.ref_a & self.ref_b)
+    def test_or(self):   self._chk(self.a | self.b, self.ref_a | self.ref_b)
+    def test_xor(self):  self._chk(self.a ^ self.b, self.ref_a ^ self.ref_b)
+    def test_not(self):  self._chk(~self.a,          ~self.ref_a)
 
     def test_eq(self):
-        result = self.a == self.b
-        ref    = self.ref_a == self.ref_b
-        # equality returns bool; re-wrapping as bit1 is correct
-        assert torch.equal(base(result), ref)
+        assert torch.equal(base(self.a == self.b), self.ref_a == self.ref_b)
 
     def test_ne(self):
-        result = self.a != self.b
-        ref    = self.ref_a != self.ref_b
-        assert torch.equal(base(result), ref)
+        assert torch.equal(base(self.a != self.b), self.ref_a != self.ref_b)
 
     def test_torch_logical_and(self):
-        result = torch.logical_and(self.a, self.b)
-        ref    = torch.logical_and(self.ref_a, self.ref_b)
-        assert torch.equal(base(result), ref)
+        assert torch.equal(base(torch.logical_and(self.a, self.b)),
+                           torch.logical_and(self.ref_a, self.ref_b))
 
     def test_torch_logical_or(self):
-        result = torch.logical_or(self.a, self.b)
-        ref    = torch.logical_or(self.ref_a, self.ref_b)
-        assert torch.equal(base(result), ref)
+        assert torch.equal(base(torch.logical_or(self.a, self.b)),
+                           torch.logical_or(self.ref_a, self.ref_b))
 
     def test_torch_logical_not(self):
-        result = torch.logical_not(self.a)
-        ref    = torch.logical_not(self.ref_a)
-        assert torch.equal(base(result), ref)
+        assert torch.equal(base(torch.logical_not(self.a)),
+                           torch.logical_not(self.ref_a))
 
     def test_torch_logical_xor(self):
-        result = torch.logical_xor(self.a, self.b)
-        ref    = torch.logical_xor(self.ref_a, self.ref_b)
-        assert torch.equal(base(result), ref)
+        assert torch.equal(base(torch.logical_xor(self.a, self.b)),
+                           torch.logical_xor(self.ref_a, self.ref_b))
+
+    def test_bool_ops_on_bool_tensor_stay_bool(self):
+        a = brute.tensor(self.A, dtype=torch.bool)
+        b = brute.tensor(self.B, dtype=torch.bool)
+        r = a & b
+        assert r.dtype == torch.bool and not getattr(r, '_is_bit1', False)
 
 
-# ── TestReductions ────────────────────────────────────────────────────────────
+# ── TestReductions ─────────────────────────────────────────────────────────────
 
 class TestReductions:
     DATA = [[True, False, True], [False, False, True]]
@@ -308,41 +572,31 @@ class TestReductions:
         assert brute.any(self.t).item() == torch.any(self.ref).item()
 
     def test_all_dim0(self):
-        result = brute.all(self.t, dim=0)
-        ref    = torch.all(self.ref, dim=0)
-        assert torch.equal(base(result), ref)
+        assert torch.equal(base(brute.all(self.t, dim=0)), torch.all(self.ref, dim=0))
 
     def test_any_dim1(self):
-        result = brute.any(self.t, dim=1)
-        ref    = torch.any(self.ref, dim=1)
-        assert torch.equal(base(result), ref)
+        assert torch.equal(base(brute.any(self.t, dim=1)), torch.any(self.ref, dim=1))
 
     def test_sum(self):
         assert brute.sum(self.t).item() == torch.sum(self.ref).item()
 
     def test_count_nonzero(self):
-        r1 = torch.count_nonzero(self.t).item()
-        r2 = torch.count_nonzero(self.ref).item()
-        assert r1 == r2
+        assert torch.count_nonzero(self.t).item() == torch.count_nonzero(self.ref).item()
 
     def test_all_false_tensor(self):
-        t   = brute.zeros(4, dtype=brute.bit1)
-        assert not brute.all(t).item()
+        assert not brute.all(brute.zeros(4, dtype=brute.bit1)).item()
 
     def test_all_true_tensor(self):
-        t   = brute.ones(4, dtype=brute.bit1)
-        assert brute.all(t).item()
+        assert brute.all(brute.ones(4, dtype=brute.bit1)).item()
 
     def test_any_false_tensor(self):
-        t   = brute.zeros(4, dtype=brute.bit1)
-        assert not brute.any(t).item()
+        assert not brute.any(brute.zeros(4, dtype=brute.bit1)).item()
 
     def test_any_true_tensor(self):
-        t   = brute.ones(4, dtype=brute.bit1)
-        assert brute.any(t).item()
+        assert brute.any(brute.ones(4, dtype=brute.bit1)).item()
 
 
-# ── TestIndexing ──────────────────────────────────────────────────────────────
+# ── TestIndexing ───────────────────────────────────────────────────────────────
 
 class TestIndexing:
     DATA = [[True, False, True], [False, True, False]]
@@ -353,16 +607,12 @@ class TestIndexing:
         self.ref = torch.tensor(self.DATA)
 
     def test_row_index(self):
-        result = self.t[0]
-        ref    = self.ref[0]
-        assert isinstance(result, brute.Tensor)
-        assert result.dtype == brute.bit1
-        assert torch.equal(base(result), ref)
+        r = self.t[0]
+        assert isinstance(r, brute.Tensor) and r.dtype == brute.bit1
+        assert torch.equal(base(r), self.ref[0])
 
     def test_col_slice(self):
-        result = self.t[:, 1:]
-        ref    = self.ref[:, 1:]
-        assert torch.equal(base(result), ref)
+        assert torch.equal(base(self.t[:, 1:]), self.ref[:, 1:])
 
     def test_scalar_index_item(self):
         assert self.t[0, 0].item() == self.ref[0, 0].item()
@@ -371,16 +621,13 @@ class TestIndexing:
     def test_bool_mask(self):
         mask   = torch.tensor([True, False])
         result = self.t[mask]
-        ref    = self.ref[mask]
-        assert torch.equal(base(result).bool(), ref)
+        assert torch.equal(base(result).bool(), self.ref[mask])
 
     def test_advanced_index(self):
-        result = self.t[[0, 1], [2, 0]]
-        ref    = self.ref[[0, 1], [2, 0]]
-        assert torch.equal(base(result), ref)
+        assert torch.equal(base(self.t[[0, 1], [2, 0]]), self.ref[[0, 1], [2, 0]])
 
 
-# ── TestShape ─────────────────────────────────────────────────────────────────
+# ── TestShape ──────────────────────────────────────────────────────────────────
 
 class TestShape:
     DATA = [[True, False, True, False], [False, True, False, True]]
@@ -391,20 +638,13 @@ class TestShape:
         self.ref = torch.tensor(self.DATA)
 
     def test_view(self):
-        result = self.t.view(8)
-        ref    = self.ref.view(8)
-        assert result.shape == torch.Size([8])
-        assert torch.equal(base(result), ref)
+        assert torch.equal(base(self.t.view(8)), self.ref.view(8))
 
     def test_reshape(self):
-        result = self.t.reshape(4, 2)
-        ref    = self.ref.reshape(4, 2)
-        assert torch.equal(base(result), ref)
+        assert torch.equal(base(self.t.reshape(4, 2)), self.ref.reshape(4, 2))
 
     def test_t(self):
-        result = self.t.t()
-        ref    = self.ref.t()
-        assert torch.equal(base(result), ref)
+        assert torch.equal(base(self.t.t()), self.ref.t())
 
     def test_permute_3d(self):
         d   = [[[True, False], [True, True]], [[False, True], [False, False]]]
@@ -413,15 +653,11 @@ class TestShape:
         assert torch.equal(base(t.permute(2, 0, 1)), ref.permute(2, 0, 1))
 
     def test_flatten(self):
-        result = self.t.flatten()
-        ref    = self.ref.flatten()
-        assert torch.equal(base(result), ref)
+        assert torch.equal(base(self.t.flatten()), self.ref.flatten())
 
     def test_unsqueeze(self):
-        result = self.t.unsqueeze(0)
-        ref    = self.ref.unsqueeze(0)
-        assert result.shape == torch.Size([1, 2, 4])
-        assert torch.equal(base(result), ref)
+        r = self.t.unsqueeze(0)
+        assert r.shape == torch.Size([1, 2, 4]) and torch.equal(base(r), self.ref.unsqueeze(0))
 
     def test_squeeze(self):
         t   = brute.tensor([[[True, False]]], dtype=brute.bit1)
@@ -434,21 +670,18 @@ class TestShape:
         assert torch.equal(base(t.expand(2, 3)), ref.expand(2, 3))
 
     def test_contiguous(self):
-        result = self.t.t().contiguous()
-        ref    = self.ref.t().contiguous()
-        assert torch.equal(base(result), ref)
+        assert torch.equal(base(self.t.t().contiguous()), self.ref.t().contiguous())
 
 
-# ── TestCat ───────────────────────────────────────────────────────────────────
+# ── TestCat ────────────────────────────────────────────────────────────────────
 
 class TestCat:
     def test_cat_dim0(self):
-        a   = brute.tensor([True, False], dtype=brute.bit1)
-        b   = brute.tensor([False, True], dtype=brute.bit1)
-        r   = torch.cat([a, b])
+        a = brute.tensor([True, False], dtype=brute.bit1)
+        b = brute.tensor([False, True], dtype=brute.bit1)
+        r = torch.cat([a, b])
         ref = torch.cat([torch.tensor([True, False]), torch.tensor([False, True])])
-        assert isinstance(r, brute.Tensor)
-        assert r.dtype == brute.bit1
+        assert isinstance(r, brute.Tensor) and r.dtype == brute.bit1
         assert torch.equal(base(r), ref)
 
     def test_cat_dim1(self):
@@ -460,82 +693,96 @@ class TestCat:
         assert torch.equal(base(r), ref)
 
     def test_stack(self):
-        a   = brute.tensor([True, False], dtype=brute.bit1)
-        b   = brute.tensor([False, True], dtype=brute.bit1)
-        r   = torch.stack([a, b])
-        ref = torch.stack([torch.tensor([True, False]), torch.tensor([False, True])])
-        assert torch.equal(base(r), ref)
+        a = brute.tensor([True, False], dtype=brute.bit1)
+        b = brute.tensor([False, True], dtype=brute.bit1)
+        r = torch.stack([a, b])
+        assert torch.equal(base(r), torch.stack([torch.tensor([True, False]),
+                                                  torch.tensor([False, True])]))
 
     def test_brute_cat(self):
-        a = brute.ones(4, dtype=brute.bit1)
-        b = brute.zeros(4, dtype=brute.bit1)
-        r = brute.cat([a, b])
+        r = brute.cat([brute.ones(4, dtype=brute.bit1), brute.zeros(4, dtype=brute.bit1)])
         assert r.shape == torch.Size([8])
 
 
-# ── TestConversion ────────────────────────────────────────────────────────────
+# ── TestConversion ─────────────────────────────────────────────────────────────
 
 class TestConversion:
     @pytest.fixture(autouse=True)
     def setup(self):
         self.t = brute.tensor([True, False, True], dtype=brute.bit1)
 
-    def test_to_bool(self):
-        result = self.t.bool()
-        assert result.dtype == torch.bool
-        assert torch.equal(result, torch.tensor([True, False, True]))
+    def test_to_bool_returns_brute_tensor(self):
+        b = self.t.bool()
+        assert isinstance(b, brute.Tensor) and b.dtype == torch.bool and not b._is_bit1
+
+    def test_to_bool_values(self):
+        assert torch.equal(base(self.t.bool()), torch.tensor([True, False, True]))
 
     def test_to_float(self):
-        result = self.t.float()
-        assert result.dtype == torch.float32
-        assert torch.equal(result.as_subclass(torch.Tensor),
-                           torch.tensor([1.0, 0.0, 1.0]))
+        r = self.t.float()
+        assert r.dtype == torch.float32
+        assert torch.equal(r.as_subclass(torch.Tensor), torch.tensor([1.0, 0.0, 1.0]))
 
     def test_to_int(self):
-        result = self.t.int()
-        assert torch.equal(result.as_subclass(torch.Tensor),
+        assert torch.equal(self.t.int().as_subclass(torch.Tensor),
                            torch.tensor([1, 0, 1], dtype=torch.int32))
 
     def test_to_long(self):
-        result = self.t.long()
-        assert torch.equal(result.as_subclass(torch.Tensor),
+        assert torch.equal(self.t.long().as_subclass(torch.Tensor),
                            torch.tensor([1, 0, 1], dtype=torch.int64))
 
     def test_unpack_pm1(self):
-        # bit1 convention: True→+1, False→−1
-        result = self.t.unpack_pm1()
-        assert torch.equal(result, torch.tensor([1.0, -1.0, 1.0]))
+        assert torch.equal(self.t.unpack_pm1(), torch.tensor([1.0, -1.0, 1.0]))
 
     def test_float_to_bit1_via_to(self):
-        ft = brute.tensor([1.5, -0.5, 0.1], dtype=torch.float32)
-        t  = ft.to(brute.bit1)
+        t = brute.tensor([1.5, -0.5, 0.1], dtype=torch.float32).to(brute.bit1)
         assert t.dtype == brute.bit1
-        # sign convention: >0 → True (matches pack_bits kernel)
-        ref = torch.tensor([True, False, True])
-        assert torch.equal(base(t), ref)
+        assert torch.equal(base(t), torch.tensor([True, False, True]))
 
-    def test_bool_to_bit1_via_to(self):
-        bt  = brute.tensor([True, False, True], dtype=torch.float32).bool()
-        t   = brute.as_tensor(bt, dtype=brute.bit1)
-        ref = bt
-        assert torch.equal(base(t), ref)
+    def test_zero_float_to_bit1_is_false(self):
+        assert base(brute.tensor([0.0]).to(brute.bit1))[0].item() is False
+
+    def test_negative_float_to_bit1_is_false(self):
+        assert not base(brute.tensor([-1.0, -1e6, -0.001]).to(brute.bit1)).any()
+
+    def test_positive_float_to_bit1_is_true(self):
+        assert base(brute.tensor([0.001, 1.0, 1e6]).to(brute.bit1)).all()
+
+    def test_int_nonzero_to_bit1_is_true(self):
+        assert base(brute.tensor([1, 2, -1, 100], dtype=torch.int32).to(brute.bit1)).all()
+
+    def test_int_zero_to_bit1_is_false(self):
+        assert base(brute.tensor([0], dtype=torch.int32).to(brute.bit1))[0].item() is False
 
     def test_to_device_preserves_bit1(self):
         t2 = self.t.to('cpu')
-        assert t2.dtype == brute.bit1
-        assert torch.equal(base(t2), base(self.t))
+        assert t2.dtype == brute.bit1 and torch.equal(base(t2), base(self.t))
+
+    def test_to_pack_dtype_uint32(self):
+        t  = brute.tensor([True, False, True, False], dtype=brute.bit1, pack_dtype=brute.uint8)
+        t2 = t.to(brute.bit1, pack_dtype=brute.uint32)
+        assert t2.pack_dtype is torch.uint32
+        assert torch.equal(base(t2), base(t))
+
+    def test_float_round_trip(self):
+        t_bit  = brute.tensor([True, False, True], dtype=brute.bit1)
+        t_back = t_bit.float().to(brute.bit1)
+        assert torch.equal(base(t_back), base(t_bit))
 
 
-# ── TestDeepCopy ──────────────────────────────────────────────────────────────
+# ── TestDeepCopy ───────────────────────────────────────────────────────────────
 
 class TestDeepCopy:
     def test_deepcopy_bit1(self):
         t  = brute.tensor([True, False, True], dtype=brute.bit1)
         t2 = copy.deepcopy(t)
-        assert t2.dtype == brute.bit1
-        assert torch.equal(base(t2), base(t))
-        # Ensure it's a distinct copy
+        assert t2.dtype == brute.bit1 and torch.equal(base(t2), base(t))
         assert t2.data_ptr() != t.data_ptr()
+
+    def test_deepcopy_preserves_pack_dtype(self):
+        t  = brute.zeros(4, dtype=brute.bit1, pack_dtype=brute.uint64)
+        t2 = copy.deepcopy(t)
+        assert t2.pack_dtype is torch.uint64
 
     def test_deepcopy_float(self):
         t  = brute.randn(4)
@@ -543,19 +790,16 @@ class TestDeepCopy:
         assert torch.equal(base(t2), base(t))
 
 
-# ── TestMatmul ────────────────────────────────────────────────────────────────
+# ── TestMatmul ─────────────────────────────────────────────────────────────────
 
 class TestMatmul:
     def test_bit1_x_bit1_manual(self):
-        # a = [+1, +1, -1, +1], b0 = [+1, -1, -1, +1], b1 = [-1, +1, +1, -1]
-        # a·b0 = 1-1+1+1 = 2,  a·b1 = -1+1-1-1 = -2
         a = brute.tensor([[True, True, False, True]], dtype=brute.bit1)
         b = brute.tensor([[True, False, False, True],
-                          [False, True,  True,  False]], dtype=brute.bit1)
+                          [False, True, True, False]], dtype=brute.bit1)
         r = a @ b
         assert r.shape == torch.Size([1, 2])
-        assert r[0, 0].item() == 2
-        assert r[0, 1].item() == -2
+        assert r[0, 0].item() == 2 and r[0, 1].item() == -2
 
     def test_bit1_x_bit1_vs_float_reference(self):
         torch.manual_seed(0)
@@ -563,222 +807,98 @@ class TestMatmul:
         b_bool = torch.randint(0, 2, (12, 16)).bool()
         a = brute.tensor(a_bool, dtype=brute.bit1)
         b = brute.tensor(b_bool, dtype=brute.bit1)
-        result = (a @ b).float()
-
-        # Reference: full-precision {−1, +1} dot product
-        a_pm = a_bool.float() * 2 - 1
-        b_pm = b_bool.float() * 2 - 1
-        ref  = a_pm @ b_pm.t()
-        assert torch.equal(result, ref)
+        assert torch.equal((a @ b).float(), _ref_pm1(a_bool, b_bool))
 
     def test_torch_matmul_dispatches(self):
         a = brute.ones(4, 8, dtype=brute.bit1)
         b = brute.ones(6, 8, dtype=brute.bit1)
-        r = torch.matmul(a, b)
-        assert r.shape == torch.Size([4, 6])
+        assert torch.matmul(a, b).shape == torch.Size([4, 6])
 
     def test_float_x_float(self):
-        a = brute.randn(3, 4)
-        b = brute.randn(4, 5)
-        r = a @ b
-        assert r.shape == torch.Size([3, 5])
+        assert (brute.randn(3, 4) @ brute.randn(4, 5)).shape == torch.Size([3, 5])
 
     def test_all_true_x_all_true(self):
-        # a = all +1, b = all +1 → each dot product = K
-        K  = 8
-        a  = brute.ones(2, K, dtype=brute.bit1)
-        b  = brute.ones(3, K, dtype=brute.bit1)
-        r  = a @ b
-        assert (r == K).all()
+        K = 8
+        assert (brute.ones(2, K, dtype=brute.bit1) @ brute.ones(3, K, dtype=brute.bit1) == K).all()
 
     def test_all_false_x_all_false(self):
-        # a = all -1, b = all -1 → each dot product = K
-        K  = 8
-        a  = brute.zeros(2, K, dtype=brute.bit1)
-        b  = brute.zeros(2, K, dtype=brute.bit1)
-        r  = a @ b
-        assert (r == K).all()
+        K = 8
+        assert (brute.zeros(2, K, dtype=brute.bit1) @ brute.zeros(2, K, dtype=brute.bit1) == K).all()
 
     def test_all_true_x_all_false(self):
-        # a = all +1, b = all -1 → each dot product = -K
-        K  = 8
-        a  = brute.ones(2, K, dtype=brute.bit1)
-        b  = brute.zeros(3, K, dtype=brute.bit1)
-        r  = a @ b
-        assert (r == -K).all()
+        K = 8
+        assert (brute.ones(2, K, dtype=brute.bit1) @ brute.zeros(3, K, dtype=brute.bit1) == -K).all()
+
+    def test_matmul_result_is_not_bit1(self):
+        a = brute.ones(2, 4, dtype=brute.bit1)
+        b = brute.ones(3, 4, dtype=brute.bit1)
+        assert not getattr(a @ b, '_is_bit1', False)
 
 
-# ── TestUnpackPm1 ─────────────────────────────────────────────────────────────
+# ── TestUnpackPm1 ──────────────────────────────────────────────────────────────
 
 class TestUnpackPm1:
-    """unpack_pm1 is the bridge between bool semantics and {−1,+1} arithmetic."""
-
     def test_all_true(self):
-        t = brute.ones(4, dtype=brute.bit1)
-        r = t.unpack_pm1()
-        assert torch.equal(r, torch.ones(4))
+        assert torch.equal(brute.ones(4, dtype=brute.bit1).unpack_pm1(), torch.ones(4))
 
     def test_all_false(self):
-        t = brute.zeros(4, dtype=brute.bit1)
-        r = t.unpack_pm1()
-        assert torch.equal(r, -torch.ones(4))
+        assert torch.equal(brute.zeros(4, dtype=brute.bit1).unpack_pm1(), -torch.ones(4))
 
     def test_alternating(self):
         t = brute.tensor([True, False, True, False], dtype=brute.bit1)
-        r = t.unpack_pm1()
-        assert torch.equal(r, torch.tensor([1.0, -1.0, 1.0, -1.0]))
+        assert torch.equal(t.unpack_pm1(), torch.tensor([1.0, -1.0, 1.0, -1.0]))
 
     def test_shape_preserved(self):
         t = brute.rand(3, 4, dtype=brute.bit1)
         r = t.unpack_pm1()
-        assert r.shape == torch.Size([3, 4])
-        assert r.dtype == torch.float32
+        assert r.shape == torch.Size([3, 4]) and r.dtype == torch.float32
 
     def test_fails_on_non_bit1(self):
-        t = brute.zeros(4)
-        with pytest.raises(AssertionError):
-            t.unpack_pm1()
+        with pytest.raises(TypeError):
+            brute.zeros(4).unpack_pm1()
+
+    def test_unpack_2d(self):
+        t   = brute.tensor([[True, False], [False, True]], dtype=brute.bit1)
+        assert torch.equal(t.unpack_pm1(), torch.tensor([[1., -1.], [-1., 1.]]))
+
+    def test_unpack_3d(self):
+        t = brute.ones(2, 3, 4, dtype=brute.bit1)
+        r = t.unpack_pm1()
+        assert r.shape == torch.Size([2, 3, 4]) and (r == 1.0).all()
 
 
-# ── TestMiscTorchCompat ───────────────────────────────────────────────────────
-
-class TestMiscTorchCompat:
-    """Spot-checks that common torch ops work on bit1 tensors."""
-
-    def test_torch_where(self):
-        cond  = brute.tensor([True, False, True], dtype=brute.bit1)
-        x     = torch.tensor([1.0, 2.0, 3.0])
-        y     = torch.tensor([4.0, 5.0, 6.0])
-        ref   = torch.where(cond.bool(), x, y)
-        result = torch.where(cond.bool(), x, y)
-        assert torch.equal(result, ref)
-
-    def test_torch_clone(self):
-        t  = brute.tensor([True, False], dtype=brute.bit1)
-        t2 = t.clone()
-        assert t2.dtype == brute.bit1
-        assert torch.equal(base(t2), base(t))
-        assert t2.data_ptr() != t.data_ptr()
-
-    def test_repr_bit1(self):
-        t = brute.tensor([True, False], dtype=brute.bit1)
-        r = repr(t)
-        assert 'brute.Tensor' in r
-        assert 'bit1' in r
-
-    def test_repr_float(self):
-        t = brute.tensor([1.0, 2.0])
-        r = repr(t)
-        assert 'brute.Tensor' in r
-
-    def test_len(self):
-        t = brute.zeros(5, dtype=brute.bit1)
-        assert len(t) == 5
-
-    def test_iter(self):
-        data = [True, False, True]
-        t    = brute.tensor(data, dtype=brute.bit1)
-        vals = [elem.item() for elem in t]
-        assert vals == data
-
-
-# ── TestZeroDimScalars ────────────────────────────────────────────────────────
-
-class TestZeroDimScalars:
-    """0-dim results from reductions and scalar indexing must not crash."""
-
-    def test_scalar_index_true_value(self):
-        t = brute.tensor([[True, False], [False, True]], dtype=brute.bit1)
-        assert t[0, 0].item() is True
-
-    def test_scalar_index_false_value(self):
-        t = brute.tensor([[True, False], [False, True]], dtype=brute.bit1)
-        assert t[0, 1].item() is False
-
-    def test_scalar_index_not_bit1(self):
-        # A 0-dim result cannot be packed; it should be a plain bool brute.Tensor
-        t = brute.tensor([True, False], dtype=brute.bit1)
-        s = t[0]
-        # s is 0-dim; its dtype should be bool (not bit1) since packing requires >=1 dim
-        assert s.dim() == 0
-        assert s.item() is True
-
-    def test_global_all_all_true(self):
-        t = brute.ones(6, dtype=brute.bit1)
-        assert brute.all(t).item() is True
-
-    def test_global_all_not_all_true(self):
-        t = brute.tensor([True, False, True], dtype=brute.bit1)
-        assert brute.all(t).item() is False
-
-    def test_global_any_has_true(self):
-        t = brute.tensor([False, False, True], dtype=brute.bit1)
-        assert brute.any(t).item() is True
-
-    def test_global_any_all_false(self):
-        t = brute.zeros(5, dtype=brute.bit1)
-        assert brute.any(t).item() is False
-
-    def test_iter_elements_match(self):
-        data = [True, False, False, True]
-        t    = brute.tensor(data, dtype=brute.bit1)
-        vals = [elem.item() for elem in t]
-        assert vals == data
-
-    def test_tolist(self):
-        data = [True, False, True]
-        t    = brute.tensor(data, dtype=brute.bit1)
-        assert t.bool().tolist() == data
-
-    def test_min_global(self):
-        t = brute.tensor([True, False, True], dtype=brute.bit1)
-        assert brute.min(t).item() is False
-
-    def test_max_global(self):
-        t = brute.tensor([True, False, True], dtype=brute.bit1)
-        assert brute.max(t).item() is True
-
-
-# ── TestPackDtypes ────────────────────────────────────────────────────────────
+# ── TestPackDtypes ─────────────────────────────────────────────────────────────
 
 class TestPackDtypes:
-    """Verify uint8 / uint32 / uint64 packing round-trips and matmul correctness."""
+    """Verify all pack dtypes round-trip and compute matmul correctly."""
 
-    @pytest.mark.parametrize("pw", ['uint8', 'uint32', 'uint64'])
+    @pytest.mark.parametrize("pw", [brute.uint8, brute.uint32, brute.uint64])
     def test_pack_dtype_preserved(self, pw):
-        t = brute.zeros(8, dtype=brute.bit1, pack_dtype=pw)
-        assert t.pack_dtype == pw
+        assert brute.zeros(8, dtype=brute.bit1, pack_dtype=pw).pack_dtype is pw
 
-    @pytest.mark.parametrize("pw", ['uint8', 'uint32', 'uint64'])
+    @pytest.mark.parametrize("pw", [brute.uint8, brute.uint32, brute.uint64])
     def test_unpack_pm1_all_true(self, pw):
-        t = brute.ones(8, dtype=brute.bit1, pack_dtype=pw)
-        r = t.unpack_pm1()
-        assert torch.equal(r, torch.ones(8))
+        assert torch.equal(brute.ones(8, dtype=brute.bit1, pack_dtype=pw).unpack_pm1(), torch.ones(8))
 
-    @pytest.mark.parametrize("pw", ['uint8', 'uint32', 'uint64'])
+    @pytest.mark.parametrize("pw", [brute.uint8, brute.uint32, brute.uint64])
     def test_unpack_pm1_all_false(self, pw):
-        t = brute.zeros(8, dtype=brute.bit1, pack_dtype=pw)
-        r = t.unpack_pm1()
-        assert torch.equal(r, -torch.ones(8))
+        assert torch.equal(brute.zeros(8, dtype=brute.bit1, pack_dtype=pw).unpack_pm1(), -torch.ones(8))
 
-    @pytest.mark.parametrize("pw", ['uint8', 'uint32', 'uint64'])
+    @pytest.mark.parametrize("pw", [brute.uint8, brute.uint32, brute.uint64])
     def test_unpack_pm1_alternating(self, pw):
-        t = brute.tensor([True, False, True, False, True, False, True, False],
-                         dtype=brute.bit1, pack_dtype=pw)
-        r = t.unpack_pm1()
+        t   = brute.tensor([True, False, True, False, True, False, True, False],
+                           dtype=brute.bit1, pack_dtype=pw)
         ref = torch.tensor([1., -1., 1., -1., 1., -1., 1., -1.])
-        assert torch.equal(r, ref)
+        assert torch.equal(t.unpack_pm1(), ref)
 
-    @pytest.mark.parametrize("pw", ['uint8', 'uint32', 'uint64'])
-    def test_matmul_all_ones_correctness(self, pw):
+    @pytest.mark.parametrize("pw", [brute.uint8, brute.uint32, brute.uint64])
+    def test_matmul_all_ones(self, pw):
         K = 16
         a = brute.ones(2, K, dtype=brute.bit1, pack_dtype=pw)
         b = brute.ones(3, K, dtype=brute.bit1, pack_dtype=pw)
-        r = a @ b
-        assert r.shape == torch.Size([2, 3])
-        assert (r == K).all()
+        assert (a @ b == K).all()
 
-    @pytest.mark.parametrize("pw", ['uint8', 'uint32', 'uint64'])
+    @pytest.mark.parametrize("pw", [brute.uint8, brute.uint32, brute.uint64])
     def test_matmul_vs_float_reference(self, pw):
         torch.manual_seed(42)
         K = 16
@@ -786,51 +906,36 @@ class TestPackDtypes:
         b_bool = torch.randint(0, 2, (5, K)).bool()
         a = brute.tensor(a_bool, dtype=brute.bit1, pack_dtype=pw)
         b = brute.tensor(b_bool, dtype=brute.bit1, pack_dtype=pw)
-        result = (a @ b).float()
-        ref    = (a_bool.float() * 2 - 1) @ (b_bool.float() * 2 - 1).t()
-        assert torch.equal(result, ref)
+        assert torch.equal((a @ b).float(), _ref_pm1(a_bool, b_bool))
 
-    @pytest.mark.parametrize("pw", ['uint8', 'uint32', 'uint64'])
+    @pytest.mark.parametrize("pw", [brute.uint8, brute.uint32, brute.uint64])
     def test_bool_ops_preserve_pack_dtype(self, pw):
         a = brute.ones(8, dtype=brute.bit1, pack_dtype=pw)
         b = brute.zeros(8, dtype=brute.bit1, pack_dtype=pw)
         r = a & b
-        assert isinstance(r, brute.Tensor)
-        assert r.dtype == brute.bit1
+        assert isinstance(r, brute.Tensor) and r.dtype == brute.bit1
 
 
-# ── TestMatmulKBoundary ───────────────────────────────────────────────────────
-
-def _matmul_ref(a_bool: torch.Tensor, b_bool: torch.Tensor) -> torch.Tensor:
-    """Float-precision {-1,+1} reference matmul."""
-    return (a_bool.float() * 2 - 1) @ (b_bool.float() * 2 - 1).t()
-
+# ── TestMatmulKBoundary ────────────────────────────────────────────────────────
 
 class TestMatmulKBoundary:
-    """K at and around pack-width boundaries; the 65-bit case is key."""
-
-    # ── single bit ────────────────────────────────────────────────────────────
-
     def test_k1_all_true(self):
-        a = brute.ones(3, 1, dtype=brute.bit1, pack_dtype='uint8')
-        b = brute.ones(4, 1, dtype=brute.bit1, pack_dtype='uint8')
-        r = a @ b
-        assert (r == 1).all()
+        a = brute.ones(3, 1, dtype=brute.bit1, pack_dtype=brute.uint8)
+        b = brute.ones(4, 1, dtype=brute.bit1, pack_dtype=brute.uint8)
+        assert (a @ b == 1).all()
 
     def test_k1_vs_float(self):
         torch.manual_seed(1)
         a_bool = torch.randint(0, 2, (3, 1)).bool()
         b_bool = torch.randint(0, 2, (4, 1)).bool()
-        a = brute.tensor(a_bool, dtype=brute.bit1, pack_dtype='uint8')
-        b = brute.tensor(b_bool, dtype=brute.bit1, pack_dtype='uint8')
-        assert torch.equal((a @ b).float(), _matmul_ref(a_bool, b_bool))
-
-    # ── uint8 boundaries (7 / 8 / 9) ─────────────────────────────────────────
+        a = brute.tensor(a_bool, dtype=brute.bit1, pack_dtype=brute.uint8)
+        b = brute.tensor(b_bool, dtype=brute.bit1, pack_dtype=brute.uint8)
+        assert torch.equal((a @ b).float(), _ref_pm1(a_bool, b_bool))
 
     @pytest.mark.parametrize("K", [7, 8, 9])
     def test_uint8_all_ones(self, K):
-        a = brute.ones(2, K, dtype=brute.bit1, pack_dtype='uint8')
-        b = brute.ones(3, K, dtype=brute.bit1, pack_dtype='uint8')
+        a = brute.ones(2, K, dtype=brute.bit1, pack_dtype=brute.uint8)
+        b = brute.ones(3, K, dtype=brute.bit1, pack_dtype=brute.uint8)
         assert (a @ b == K).all()
 
     @pytest.mark.parametrize("K", [7, 8, 9])
@@ -838,16 +943,14 @@ class TestMatmulKBoundary:
         torch.manual_seed(K)
         a_bool = torch.randint(0, 2, (3, K)).bool()
         b_bool = torch.randint(0, 2, (4, K)).bool()
-        a = brute.tensor(a_bool, dtype=brute.bit1, pack_dtype='uint8')
-        b = brute.tensor(b_bool, dtype=brute.bit1, pack_dtype='uint8')
-        assert torch.equal((a @ b).float(), _matmul_ref(a_bool, b_bool))
-
-    # ── uint32 boundaries (31 / 32 / 33) ─────────────────────────────────────
+        a = brute.tensor(a_bool, dtype=brute.bit1, pack_dtype=brute.uint8)
+        b = brute.tensor(b_bool, dtype=brute.bit1, pack_dtype=brute.uint8)
+        assert torch.equal((a @ b).float(), _ref_pm1(a_bool, b_bool))
 
     @pytest.mark.parametrize("K", [31, 32, 33])
     def test_uint32_all_ones(self, K):
-        a = brute.ones(2, K, dtype=brute.bit1, pack_dtype='uint32')
-        b = brute.ones(3, K, dtype=brute.bit1, pack_dtype='uint32')
+        a = brute.ones(2, K, dtype=brute.bit1, pack_dtype=brute.uint32)
+        b = brute.ones(3, K, dtype=brute.bit1, pack_dtype=brute.uint32)
         assert (a @ b == K).all()
 
     @pytest.mark.parametrize("K", [31, 32, 33])
@@ -855,16 +958,14 @@ class TestMatmulKBoundary:
         torch.manual_seed(K)
         a_bool = torch.randint(0, 2, (3, K)).bool()
         b_bool = torch.randint(0, 2, (4, K)).bool()
-        a = brute.tensor(a_bool, dtype=brute.bit1, pack_dtype='uint32')
-        b = brute.tensor(b_bool, dtype=brute.bit1, pack_dtype='uint32')
-        assert torch.equal((a @ b).float(), _matmul_ref(a_bool, b_bool))
-
-    # ── uint64 boundaries (63 / 64 / 65) ─────────────────────────────────────
+        a = brute.tensor(a_bool, dtype=brute.bit1, pack_dtype=brute.uint32)
+        b = brute.tensor(b_bool, dtype=brute.bit1, pack_dtype=brute.uint32)
+        assert torch.equal((a @ b).float(), _ref_pm1(a_bool, b_bool))
 
     @pytest.mark.parametrize("K", [63, 64, 65])
     def test_uint64_all_ones(self, K):
-        a = brute.ones(2, K, dtype=brute.bit1, pack_dtype='uint64')
-        b = brute.ones(3, K, dtype=brute.bit1, pack_dtype='uint64')
+        a = brute.ones(2, K, dtype=brute.bit1, pack_dtype=brute.uint64)
+        b = brute.ones(3, K, dtype=brute.bit1, pack_dtype=brute.uint64)
         assert (a @ b == K).all()
 
     @pytest.mark.parametrize("K", [63, 64, 65])
@@ -872,493 +973,175 @@ class TestMatmulKBoundary:
         torch.manual_seed(K)
         a_bool = torch.randint(0, 2, (3, K)).bool()
         b_bool = torch.randint(0, 2, (4, K)).bool()
-        a = brute.tensor(a_bool, dtype=brute.bit1, pack_dtype='uint64')
-        b = brute.tensor(b_bool, dtype=brute.bit1, pack_dtype='uint64')
-        assert torch.equal((a @ b).float(), _matmul_ref(a_bool, b_bool))
+        a = brute.tensor(a_bool, dtype=brute.bit1, pack_dtype=brute.uint64)
+        b = brute.tensor(b_bool, dtype=brute.bit1, pack_dtype=brute.uint64)
+        assert torch.equal((a @ b).float(), _ref_pm1(a_bool, b_bool))
 
-    def test_k65_uint64_mixed_values(self):
-        """65-bit tensor: 2 uint64 words needed; padding must not corrupt result."""
+    def test_k65_mixed_values(self):
         torch.manual_seed(7)
         K = 65
         a_bool = torch.randint(0, 2, (5, K)).bool()
         b_bool = torch.randint(0, 2, (6, K)).bool()
-        a = brute.tensor(a_bool, dtype=brute.bit1, pack_dtype='uint64')
-        b = brute.tensor(b_bool, dtype=brute.bit1, pack_dtype='uint64')
-        assert torch.equal((a @ b).float(), _matmul_ref(a_bool, b_bool))
+        a = brute.tensor(a_bool, dtype=brute.bit1, pack_dtype=brute.uint64)
+        b = brute.tensor(b_bool, dtype=brute.bit1, pack_dtype=brute.uint64)
+        assert torch.equal((a @ b).float(), _ref_pm1(a_bool, b_bool))
 
-    def test_large_K_uint8(self):
+    def test_large_k_uint8(self):
         K = 256
-        a = brute.ones(2, K, dtype=brute.bit1, pack_dtype='uint8')
-        b = brute.ones(3, K, dtype=brute.bit1, pack_dtype='uint8')
+        a = brute.ones(2, K, dtype=brute.bit1, pack_dtype=brute.uint8)
+        b = brute.ones(3, K, dtype=brute.bit1, pack_dtype=brute.uint8)
         assert (a @ b == K).all()
 
-    def test_large_K_vs_float_random(self):
+    def test_large_k_vs_float(self):
         torch.manual_seed(99)
         K = 128
         a_bool = torch.randint(0, 2, (4, K)).bool()
         b_bool = torch.randint(0, 2, (5, K)).bool()
-        a = brute.tensor(a_bool, dtype=brute.bit1, pack_dtype='uint32')
-        b = brute.tensor(b_bool, dtype=brute.bit1, pack_dtype='uint32')
-        assert torch.equal((a @ b).float(), _matmul_ref(a_bool, b_bool))
+        a = brute.tensor(a_bool, dtype=brute.bit1, pack_dtype=brute.uint32)
+        b = brute.tensor(b_bool, dtype=brute.bit1, pack_dtype=brute.uint32)
+        assert torch.equal((a @ b).float(), _ref_pm1(a_bool, b_bool))
 
 
-# ── TestEmptyAndSingleton ─────────────────────────────────────────────────────
+# ── TestEmptyAndSingleton ──────────────────────────────────────────────────────
 
 class TestEmptyAndSingleton:
-    """Zero-element and single-element edge cases."""
-
     def test_empty_1d_shape(self):
         t = brute.zeros(0, dtype=brute.bit1)
-        assert t.shape == torch.Size([0])
-        assert t.dtype == brute.bit1
-        assert t.numel() == 0
+        assert t.shape == torch.Size([0]) and t.dtype == brute.bit1 and t.numel() == 0
 
     def test_empty_2d_shape(self):
-        t = brute.zeros(0, 4, dtype=brute.bit1)
-        assert t.shape == torch.Size([0, 4])
+        assert brute.zeros(0, 4, dtype=brute.bit1).shape == torch.Size([0, 4])
 
     def test_empty_sum(self):
-        t = brute.zeros(0, dtype=brute.bit1)
-        assert brute.sum(t).item() == 0
+        assert brute.sum(brute.zeros(0, dtype=brute.bit1)).item() == 0
 
     def test_empty_all_vacuous(self):
-        t = brute.zeros(0, dtype=brute.bit1)
-        assert brute.all(t).item() is True  # vacuous truth
+        assert brute.all(brute.zeros(0, dtype=brute.bit1)).item() is True
 
     def test_empty_any_false(self):
-        t = brute.zeros(0, dtype=brute.bit1)
-        assert brute.any(t).item() is False
+        assert brute.any(brute.zeros(0, dtype=brute.bit1)).item() is False
 
     def test_singleton_1d(self):
         t = brute.tensor([True], dtype=brute.bit1)
-        assert t.shape == torch.Size([1])
-        assert t[0].item() is True
-
-    def test_singleton_2d_1x1(self):
-        t = brute.tensor([[True]], dtype=brute.bit1)
-        assert t.shape == torch.Size([1, 1])
-        assert t[0, 0].item() is True
+        assert t.shape == torch.Size([1]) and t[0].item() is True
 
     def test_singleton_matmul(self):
-        # 1×1 @ 1×1 = 1×1; [True]@[True]=[+1]*[+1]=1
         a = brute.tensor([[True]], dtype=brute.bit1)
         b = brute.tensor([[True]], dtype=brute.bit1)
         assert (a @ b).item() == 1
 
     def test_singleton_matmul_false(self):
-        # [False]@[False]=[-1]*[-1]=1
         a = brute.zeros(1, 1, dtype=brute.bit1)
         b = brute.zeros(1, 1, dtype=brute.bit1)
         assert (a @ b).item() == 1
 
     def test_singleton_matmul_mixed(self):
-        # [True]@[False]=[+1]*[-1]=-1
         a = brute.ones(1, 1, dtype=brute.bit1)
         b = brute.zeros(1, 1, dtype=brute.bit1)
         assert (a @ b).item() == -1
 
     def test_cat_empty_and_nonempty(self):
-        empty  = brute.zeros(0, dtype=brute.bit1)
-        nonempty = brute.ones(3, dtype=brute.bit1)
-        r = torch.cat([empty, nonempty])
-        assert r.shape == torch.Size([3])
-        assert r.dtype == brute.bit1
+        r = torch.cat([brute.zeros(0, dtype=brute.bit1), brute.ones(3, dtype=brute.bit1)])
+        assert r.shape == torch.Size([3]) and r.dtype == brute.bit1
 
 
-# ── TestReprEdgeCases ─────────────────────────────────────────────────────────
+# ── TestZeroDimScalars ─────────────────────────────────────────────────────────
 
-class TestReprEdgeCases:
-    """repr must always show dtype=brute.bit1 regardless of tensor size."""
+class TestZeroDimScalars:
+    def test_scalar_index_true(self):
+        t = brute.tensor([[True, False], [False, True]], dtype=brute.bit1)
+        assert t[0, 0].item() is True
 
-    def test_small_bit1_has_bit1_dtype(self):
-        # PyTorch omits dtype for small bool tensors; we inject it
+    def test_scalar_index_false(self):
+        t = brute.tensor([[True, False], [False, True]], dtype=brute.bit1)
+        assert t[0, 1].item() is False
+
+    def test_scalar_0dim_is_not_bit1(self):
         t = brute.tensor([True, False], dtype=brute.bit1)
-        assert 'bit1' in repr(t)
+        s = t[0]
+        assert s.dim() == 0 and s.item() is True
 
-    def test_large_bit1_has_bit1_dtype(self):
-        t = brute.ones(200, dtype=brute.bit1)
-        assert 'bit1' in repr(t)
+    def test_global_all_all_true(self):
+        assert brute.all(brute.ones(6, dtype=brute.bit1)).item() is True
 
-    def test_2d_bit1_has_bit1_dtype(self):
-        t = brute.zeros(3, 4, dtype=brute.bit1)
-        assert 'bit1' in repr(t)
+    def test_global_all_not_all_true(self):
+        assert brute.all(brute.tensor([True, False, True], dtype=brute.bit1)).item() is False
+
+    def test_tolist(self):
+        data = [True, False, True]
+        assert brute.tensor(data, dtype=brute.bit1).bool().tolist() == data
+
+    def test_min_global(self):
+        assert brute.min(brute.tensor([True, False, True], dtype=brute.bit1)).item() is False
+
+    def test_max_global(self):
+        assert brute.max(brute.tensor([True, False, True], dtype=brute.bit1)).item() is True
+
+
+# ── TestRepr ───────────────────────────────────────────────────────────────────
+
+class TestRepr:
+    def test_small_bit1_has_dtype(self):
+        assert 'bit1' in repr(brute.tensor([True, False], dtype=brute.bit1))
+
+    def test_large_bit1_has_dtype(self):
+        assert 'bit1' in repr(brute.ones(200, dtype=brute.bit1))
 
     def test_repr_has_brute_tensor(self):
         t = brute.zeros(4, dtype=brute.bit1)
-        assert 'brute.Tensor' in repr(t)
-        assert 'tensor(' not in repr(t)
+        assert 'brute.Tensor' in repr(t) and 'tensor(' not in repr(t)
 
-    def test_float_repr_has_no_bit1(self):
-        t = brute.randn(4)
-        r = repr(t)
-        assert 'brute.Tensor' in r
-        assert 'bit1' not in r
+    def test_no_torch_bool_in_bit1_repr(self):
+        assert 'torch.bool' not in repr(brute.tensor([True, False, True], dtype=brute.bit1))
 
-    def test_bit1_repr_no_torch_bool(self):
-        # torch.bool should not appear raw; replaced with brute.bit1
-        t = brute.tensor([True, False, True], dtype=brute.bit1)
-        assert 'torch.bool' not in repr(t)
+    def test_float_repr_no_bit1(self):
+        r = repr(brute.randn(4))
+        assert 'brute.Tensor' in r and 'bit1' not in r
 
-    def test_singleton_bit1_repr(self):
-        t = brute.tensor([True], dtype=brute.bit1)
-        assert 'bit1' in repr(t)
+    def test_bool_tensor_repr_no_bit1(self):
+        assert 'bit1' not in repr(brute.tensor([True, False], dtype=torch.bool))
 
 
-# ── TestReduceExtended ────────────────────────────────────────────────────────
+# ── TestTorchCompat ────────────────────────────────────────────────────────────
 
-class TestReduceExtended:
-    """keepdim, dim on 3-D tensors, and additional reduction ops."""
+class TestTorchCompat:
+    def test_torch_where_with_bit1_cond(self):
+        cond   = brute.tensor([True, False, True], dtype=brute.bit1)
+        x      = torch.tensor([1.0, 2.0, 3.0])
+        y      = torch.tensor([4.0, 5.0, 6.0])
+        assert torch.equal(torch.where(cond.bool(), x, y), torch.tensor([1., 5., 3.]))
 
-    @pytest.fixture(autouse=True)
-    def setup(self):
-        data = [[[True, False, True], [False, True, False]],
-                [[True, True, False], [False, False, True]]]
-        self.t3   = brute.tensor(data, dtype=brute.bit1)
-        self.ref3 = torch.tensor(data)
-
-    def test_all_keepdim_dim0(self):
-        r   = brute.all(self.t3, dim=0, keepdim=True)
-        ref = torch.all(self.ref3, dim=0, keepdim=True)
-        assert r.shape == ref.shape
-        assert torch.equal(base(r), ref)
-
-    def test_any_keepdim_dim1(self):
-        r   = brute.any(self.t3, dim=1, keepdim=True)
-        ref = torch.any(self.ref3, dim=1, keepdim=True)
-        assert r.shape == ref.shape
-        assert torch.equal(base(r), ref)
-
-    def test_all_dim2(self):
-        r   = brute.all(self.t3, dim=2)
-        ref = torch.all(self.ref3, dim=2)
-        assert torch.equal(base(r), ref)
-
-    def test_any_dim0(self):
-        r   = brute.any(self.t3, dim=0)
-        ref = torch.any(self.ref3, dim=0)
-        assert torch.equal(base(r), ref)
-
-    def test_sum_dim(self):
-        r   = brute.sum(self.t3, dim=2)
-        ref = torch.sum(self.ref3, dim=2)
-        assert torch.equal(r.as_subclass(torch.Tensor), ref)
-
-    def test_sum_keepdim(self):
-        r   = brute.sum(self.t3, dim=1, keepdim=True)
-        ref = torch.sum(self.ref3, dim=1, keepdim=True)
-        assert r.shape == ref.shape
-
-    def test_count_nonzero_dim(self):
-        r   = torch.count_nonzero(self.t3, dim=2)
-        ref = torch.count_nonzero(self.ref3, dim=2)
-        assert torch.equal(r.as_subclass(torch.Tensor), ref)
-
-    def test_mean_global(self):
-        # mean() requires float; cast first
-        t   = brute.tensor([True, False, True, True], dtype=brute.bit1)
-        ref = torch.tensor([True, False, True, True]).float().mean()
-        assert abs(brute.mean(t.float()).item() - ref.item()) < 1e-6
-
-    def test_prod_all_true(self):
-        t = brute.ones(4, dtype=brute.bit1)
-        assert brute.prod(t).item() == 1
-
-
-# ── TestIndexingEdgeCases ─────────────────────────────────────────────────────
-
-class TestIndexingEdgeCases:
-    DATA = [[True, False, True, False], [False, True, False, True]]
-
-    @pytest.fixture(autouse=True)
-    def setup(self):
-        self.t   = brute.tensor(self.DATA, dtype=brute.bit1)
-        self.ref = torch.tensor(self.DATA)
-
-    def test_negative_row_index(self):
-        assert torch.equal(base(self.t[-1]), self.ref[-1])
-
-    def test_negative_col_index(self):
-        assert torch.equal(base(self.t[:, -1]), self.ref[:, -1])
-
-    def test_step_slice(self):
-        assert torch.equal(base(self.t[:, ::2]), self.ref[:, ::2])
-
-    def test_reverse_flip(self):
-        # PyTorch doesn't support ::-1 step slicing; use torch.flip
-        assert torch.equal(base(torch.flip(self.t, [1])), torch.flip(self.ref, [1]))
-
-    def test_ellipsis(self):
-        t3  = brute.tensor([[[True, False], [True, True]]], dtype=brute.bit1)
-        ref = torch.tensor([[[True, False], [True, True]]])
-        assert torch.equal(base(t3[..., 0]), ref[..., 0])
-
-    def test_3d_indexing(self):
-        data = [[[True, False], [False, True]], [[True, True], [False, False]]]
-        t    = brute.tensor(data, dtype=brute.bit1)
-        ref  = torch.tensor(data)
-        assert torch.equal(base(t[0, 1, :]), ref[0, 1, :])
-
-    def test_clone_after_slice_is_bit1(self):
-        row = self.t[0].clone()
-        assert row.dtype == brute.bit1
-        assert row.shape == torch.Size([4])
-
-    def test_advanced_index_1d(self):
-        idx    = torch.tensor([0, 2, 3])
-        result = self.t[0][idx]
-        ref    = self.ref[0][idx]
-        assert torch.equal(base(result), ref)
-
-
-# ── TestBoolOpsBroadcast ──────────────────────────────────────────────────────
-
-class TestBoolOpsBroadcast:
-    """Boolean ops with broadcast shapes."""
-
-    def test_and_broadcast_col_row(self):
-        col = brute.tensor([[True], [False]], dtype=brute.bit1)  # (2,1)
-        row = brute.tensor([[True, False, True]], dtype=brute.bit1)  # (1,3)
-        r   = col & row
-        ref = torch.tensor([[True], [False]]) & torch.tensor([[True, False, True]])
-        assert torch.equal(base(r), ref)
-
-    def test_or_broadcast_col_row(self):
-        col = brute.tensor([[True], [False]], dtype=brute.bit1)
-        row = brute.tensor([[False, True, False]], dtype=brute.bit1)
-        r   = col | row
-        ref = torch.tensor([[True], [False]]) | torch.tensor([[False, True, False]])
-        assert torch.equal(base(r), ref)
-
-    def test_xor_same_tensor(self):
-        t = brute.tensor([True, False, True], dtype=brute.bit1)
-        r = t ^ t
-        assert not base(r).any()
-
-    def test_not_then_and(self):
-        t   = brute.tensor([True, False, True, False], dtype=brute.bit1)
-        ref = torch.tensor([True, False, True, False])
-        r   = (~t) & t
-        assert not base(r).any()
-
-
-# ── TestConversionEdgeCases ───────────────────────────────────────────────────
-
-class TestConversionEdgeCases:
-    """Extreme numeric values, various source dtypes, and 2-D/3-D unpack."""
-
-    def test_zero_float_to_bit1_is_false(self):
-        t = brute.tensor([0.0], dtype=torch.float32)
-        b = t.to(brute.bit1)
-        assert base(b)[0].item() is False
-
-    def test_negative_float_to_bit1_is_false(self):
-        t = brute.tensor([-1.0, -1e6, -0.001], dtype=torch.float32)
-        b = t.to(brute.bit1)
-        assert not base(b).any()
-
-    def test_positive_float_to_bit1_is_true(self):
-        t = brute.tensor([0.001, 1.0, 1e6], dtype=torch.float32)
-        b = t.to(brute.bit1)
-        assert base(b).all()
-
-    def test_int_nonzero_to_bit1_is_true(self):
-        t = brute.tensor([1, 2, -1, 100], dtype=torch.int32)
-        b = t.to(brute.bit1)
-        assert base(b).all()
-
-    def test_int_zero_to_bit1_is_false(self):
-        t = brute.tensor([0], dtype=torch.int32)
-        b = t.to(brute.bit1)
-        assert base(b)[0].item() is False
-
-    def test_to_pack_dtype_uint32(self):
-        t = brute.tensor([True, False, True, False], dtype=brute.bit1, pack_dtype='uint8')
-        t2 = t.to(brute.bit1, pack_dtype='uint32')
-        assert t2.pack_dtype == 'uint32'
-        assert torch.equal(base(t2), base(t))
-
-    def test_unpack_pm1_2d(self):
-        t   = brute.tensor([[True, False], [False, True]], dtype=brute.bit1)
-        r   = t.unpack_pm1()
-        ref = torch.tensor([[1., -1.], [-1., 1.]])
-        assert torch.equal(r, ref)
-
-    def test_unpack_pm1_3d(self):
-        t   = brute.ones(2, 3, 4, dtype=brute.bit1)
-        r   = t.unpack_pm1()
-        assert r.shape == torch.Size([2, 3, 4])
-        assert (r == 1.0).all()
-
-    def test_to_device_cpu_noop(self):
+    def test_torch_clone(self):
         t  = brute.tensor([True, False], dtype=brute.bit1)
-        t2 = t.to('cpu')
-        assert t2.dtype == brute.bit1
-        assert torch.equal(base(t), base(t2))
+        t2 = t.clone()
+        assert t2.dtype == brute.bit1 and torch.equal(base(t2), base(t))
+        assert t2.data_ptr() != t.data_ptr()
 
-    def test_float_round_trip(self):
-        t_bit = brute.tensor([True, False, True], dtype=brute.bit1)
-        t_flt = t_bit.float()
-        t_back = t_flt.to(brute.bit1)
-        assert torch.equal(base(t_back), base(t_bit))
+    def test_len(self):
+        assert len(brute.zeros(5, dtype=brute.bit1)) == 5
 
+    def test_iter(self):
+        data = [True, False, True]
+        assert [elem.item() for elem in brute.tensor(data, dtype=brute.bit1)] == data
 
-# ── TestFunctionalOps ─────────────────────────────────────────────────────────
+    def test_plain_torch_tensor_float_matmul(self):
+        assert (brute.randn(3, 4) @ torch.randn(4, 5)).shape == torch.Size([3, 5])
 
-class TestFunctionalOps:
-    """brute.where, brute.stack, brute.cat, and other functional ops."""
-
-    def test_where_bit1_condition(self):
-        cond = brute.tensor([True, False, True], dtype=brute.bit1)
-        x    = torch.tensor([1., 2., 3.])
-        y    = torch.tensor([4., 5., 6.])
-        r    = torch.where(cond.bool(), x, y)
-        ref  = torch.tensor([1., 5., 3.])
-        assert torch.equal(r, ref)
-
-    def test_cat_preserves_dtype(self):
-        a = brute.tensor([True, False], dtype=brute.bit1)
-        b = brute.tensor([False, True], dtype=brute.bit1)
-        r = brute.cat([a, b])
-        assert r.dtype == brute.bit1
-        assert r.shape == torch.Size([4])
-
-    def test_stack_bit1(self):
-        a = brute.tensor([True, False], dtype=brute.bit1)
-        b = brute.tensor([False, True], dtype=brute.bit1)
-        r = brute.stack([a, b], dim=0)
-        assert r.dtype == brute.bit1
-        assert r.shape == torch.Size([2, 2])
-
-    def test_stack_vs_ref(self):
-        a_data = [True, False, True]
-        b_data = [False, True, False]
-        a = brute.tensor(a_data, dtype=brute.bit1)
-        b = brute.tensor(b_data, dtype=brute.bit1)
-        r   = brute.stack([a, b])
-        ref = torch.stack([torch.tensor(a_data), torch.tensor(b_data)])
-        assert torch.equal(base(r), ref)
-
-    def test_cat_3_tensors(self):
-        a = brute.ones(2, dtype=brute.bit1)
-        b = brute.zeros(3, dtype=brute.bit1)
-        c = brute.ones(1, dtype=brute.bit1)
-        r = brute.cat([a, b, c])
-        assert r.shape == torch.Size([6])
-        assert base(r).sum().item() == 3
+    def test_plain_bool_and_bit1_no_promotion(self):
+        a = brute.tensor([True, False, True], dtype=brute.bit1)
+        b = torch.tensor([True, True, False])
+        r = torch.logical_and(a, b)
+        assert not getattr(r, '_is_bit1', False)
+        assert torch.equal(base(r), torch.logical_and(torch.tensor([True, False, True]), b))
 
     def test_nonzero_bit1(self):
         t   = brute.tensor([False, True, False, True], dtype=brute.bit1)
         idx = torch.nonzero(t)
         assert idx.shape == torch.Size([2, 1])
-        assert idx[0].item() == 1
-        assert idx[1].item() == 3
-
-    def test_sum_returns_int(self):
-        t = brute.ones(5, dtype=brute.bit1)
-        s = brute.sum(t)
-        assert s.item() == 5
-
-    def test_mean_range(self):
-        # mean() requires float; bit1 tensors must be cast first
-        t = brute.ones(4, dtype=brute.bit1)
-        m = brute.mean(t.float())
-        assert abs(m.item() - 1.0) < 1e-6
+        assert idx[0].item() == 1 and idx[1].item() == 3
 
 
-# ── TestFactoriesExtended ─────────────────────────────────────────────────────
-
-class TestFactoriesExtended:
-    """factory edge cases: empty, pack_dtype variants, rand_like, randn_like."""
-
-    def test_empty_bit1_shape(self):
-        t = brute.empty(3, 4, dtype=brute.bit1)
-        assert t.shape == torch.Size([3, 4])
-        assert t.dtype == brute.bit1
-
-    def test_rand_like_bit1(self):
-        src = brute.zeros(4, 5, dtype=brute.bit1)
-        t   = brute.rand_like(src)
-        assert t.dtype == brute.bit1
-        assert t.shape == src.shape
-
-    def test_randn_like_bit1(self):
-        src = brute.zeros(4, 5, dtype=brute.bit1)
-        t   = brute.randn_like(src)
-        assert t.dtype == brute.bit1
-        assert t.shape == src.shape
-
-    def test_rand_like_float(self):
-        src = brute.zeros(4, 5)
-        t   = brute.rand_like(src)
-        assert t.dtype == torch.float32
-        assert (base(t) >= 0).all() and (base(t) <= 1).all()
-
-    def test_zeros_uint32(self):
-        t = brute.zeros(4, dtype=brute.bit1, pack_dtype='uint32')
-        assert t.pack_dtype == 'uint32'
-        assert not base(t).any()
-
-    def test_ones_uint64(self):
-        t = brute.ones(4, dtype=brute.bit1, pack_dtype='uint64')
-        assert t.pack_dtype == 'uint64'
-        assert base(t).all()
-
-    def test_full_large_false(self):
-        t = brute.full((100,), False, dtype=brute.bit1)
-        assert t.numel() == 100
-        assert not base(t).any()
-
-    def test_randint_only_0_1(self):
-        t = brute.randint(0, 2, size=(100,))
-        assert (base(t) >= 0).all() and (base(t) <= 1).all()
-
-    def test_zeros_like_float(self):
-        src = brute.randn(3, 4)
-        t   = brute.zeros_like(src)
-        assert t.dtype == torch.float32
-        assert not base(t).any()
-
-    def test_ones_like_float(self):
-        src = brute.randn(3, 4)
-        t   = brute.ones_like(src)
-        assert (base(t) == 1).all()
-
-    def test_tensor_from_nested_list(self):
-        data = [[True, False], [False, True], [True, True]]
-        t    = brute.tensor(data, dtype=brute.bit1)
-        assert t.shape == torch.Size([3, 2])
-        assert t[1, 1].item() is True
-
-    def test_as_tensor_from_torch_bool(self):
-        raw = torch.tensor([[True, False], [True, True]])
-        t   = brute.as_tensor(raw, dtype=brute.bit1)
-        assert t.dtype == brute.bit1
-        assert torch.equal(base(t), raw)
-
-    def test_eye_is_brute_tensor(self):
-        t = brute.eye(3)
-        assert isinstance(t, brute.Tensor)
-        assert t.shape == torch.Size([3, 3])
-
-    def test_linspace_brute_tensor(self):
-        t = brute.linspace(0., 1., 11)
-        assert isinstance(t, brute.Tensor)
-        assert t.shape == torch.Size([11])
-
-    def test_arange_brute_tensor(self):
-        t = brute.arange(0, 10)
-        assert isinstance(t, brute.Tensor)
-        assert t.shape == torch.Size([10])
-
-    def test_from_numpy_float32(self):
-        import numpy as np
-        a = np.ones((3, 3), dtype=np.float32)
-        t = brute.from_numpy(a)
-        assert t.shape == torch.Size([3, 3])
-        assert isinstance(t, brute.Tensor)
-
-
-# ── TestMultiDevice ───────────────────────────────────────────────────────────
+# ── TestMultiDevice ────────────────────────────────────────────────────────────
 
 _mps = pytest.mark.skipif(
     not torch.backends.mps.is_available(), reason="MPS not available"
@@ -1366,35 +1149,29 @@ _mps = pytest.mark.skipif(
 
 
 class TestMultiDevice:
-    """CPU ↔ MPS transfers and on-device operations."""
-
     @_mps
     def test_mps_zeros_bit1_shape(self):
         t = brute.zeros(3, 4, dtype=brute.bit1, device='mps')
-        assert t.device.type == 'mps'
-        assert t.shape == torch.Size([3, 4])
+        assert t.device.type == 'mps' and t.shape == torch.Size([3, 4])
         assert t.dtype == brute.bit1
 
     @_mps
     def test_mps_ones_bit1_values(self):
         t = brute.ones(4, dtype=brute.bit1, device='mps')
-        assert t.device.type == 'mps'
-        assert base(t).all()
+        assert t.device.type == 'mps' and base(t).all()
 
     @_mps
     def test_cpu_to_mps_preserves_bit1(self):
         t_cpu = brute.tensor([True, False, True], dtype=brute.bit1)
         t_mps = t_cpu.to('mps')
-        assert t_mps.dtype == brute.bit1
-        assert t_mps.device.type == 'mps'
+        assert t_mps.dtype == brute.bit1 and t_mps.device.type == 'mps'
         assert torch.equal(base(t_mps).cpu(), base(t_cpu))
 
     @_mps
     def test_mps_to_cpu_round_trip(self):
-        t = brute.tensor([True, False, True, False], dtype=brute.bit1)
+        t  = brute.tensor([True, False, True, False], dtype=brute.bit1)
         t2 = t.to('mps').to('cpu')
-        assert t2.dtype == brute.bit1
-        assert torch.equal(base(t2), base(t))
+        assert t2.dtype == brute.bit1 and torch.equal(base(t2), base(t))
 
     @_mps
     def test_mps_bool_and(self):
@@ -1402,16 +1179,7 @@ class TestMultiDevice:
         b = brute.tensor([True, True, False], dtype=brute.bit1, device='mps')
         r = a & b
         assert r.dtype == brute.bit1
-        ref = torch.tensor([True, False, False])
-        assert torch.equal(base(r).cpu(), ref)
-
-    @_mps
-    def test_mps_bool_or(self):
-        a = brute.tensor([True, False, True], dtype=brute.bit1, device='mps')
-        b = brute.tensor([False, False, False], dtype=brute.bit1, device='mps')
-        r = a | b
-        ref = torch.tensor([True, False, True])
-        assert torch.equal(base(r).cpu(), ref)
+        assert torch.equal(base(r).cpu(), torch.tensor([True, False, False]))
 
     @_mps
     def test_mps_matmul_all_ones(self):
@@ -1419,10 +1187,12 @@ class TestMultiDevice:
         a  = brute.ones(3, K, dtype=brute.bit1, device='mps')
         b  = brute.ones(4, K, dtype=brute.bit1, device='mps')
         r  = a @ b
-        assert r.shape == torch.Size([3, 4])
-        assert (r == K).all()
+        assert r.shape == torch.Size([3, 4]) and (r == K).all()
 
     @_mps
     def test_mps_packed_buf_on_mps(self):
-        t = brute.ones(4, 8, dtype=brute.bit1, device='mps')
-        assert t._packed_buf.device.type == 'mps'
+        assert brute.ones(4, 8, dtype=brute.bit1, device='mps')._packed_buf.device.type == 'mps'
+
+    @_mps
+    def test_mps_popcount(self):
+        assert brute.ones(8, dtype=brute.bit1, device='mps').popcount().item() == 8

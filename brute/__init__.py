@@ -1,12 +1,19 @@
 import brute._C  # triggers TORCH_LIBRARY static-init registration
 
-# ── Core tensor type & dtypes ─────────────────────────────────────────────────
-from brute.tensor import (
-    Tensor,
-    bit1,
-    float32, float16, bfloat16,
-    int8, int32, int64,
+# ── Core tensor type & bit1 dtype ─────────────────────────────────────────────
+from brute.tensor import Tensor, bit1
+
+# ── All torch dtypes, re-exported for convenience ─────────────────────────────
+# Scalar / float
+from brute.dtypes import (
+    float32, float64, float16, bfloat16,
+    complex64, complex128,
+    float8_e4m3fn, float8_e5m2,
+    int8, int16, int32, int64,
+    uint8, uint16, uint32, uint64,
 )
+import torch as _torch
+bool = _torch.bool   # brute.bool is torch.bool (regular bool tensor dtype)
 
 # ── Factory and utility functions ─────────────────────────────────────────────
 from brute.functional import (

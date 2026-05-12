@@ -51,9 +51,9 @@ if(HAVE_MPS)
     PROPERTIES COMPILE_FLAGS "-x objective-c++")
 endif()
 
-python_add_library(_C MODULE ${BRUTE_SOURCES} WITH_SOABI)
+python_add_library(_cbrute MODULE ${BRUTE_SOURCES} WITH_SOABI)
 
-target_include_directories(_C PRIVATE
+target_include_directories(_cbrute PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/cbrute/include"
   "${CMAKE_CURRENT_SOURCE_DIR}/cbrute/backend/cpu"
   "${CMAKE_CURRENT_SOURCE_DIR}/cbrute/backend/metal"
@@ -61,27 +61,27 @@ target_include_directories(_C PRIVATE
   ${TORCH_INCLUDE_DIRS}
 )
 
-target_link_libraries(_C PRIVATE ${TORCH_LIBRARIES} libpopcnt)
+target_link_libraries(_cbrute PRIVATE ${TORCH_LIBRARIES} libpopcnt)
 
 if(HAVE_MPS)
-  target_link_libraries(_C PRIVATE
+  target_link_libraries(_cbrute PRIVATE
     "-framework Metal"
     "-framework MetalPerformanceShaders"
     "-framework MetalPerformanceShadersGraph"
     "-framework Foundation")
 endif()
 
-target_compile_definitions(_C PRIVATE
+target_compile_definitions(_cbrute PRIVATE
   $<$<BOOL:${HAVE_CUDA}>:HAVE_CUDA>
   $<$<BOOL:${HAVE_MPS}>:HAVE_MPS>
 )
 
-set_property(TARGET _C PROPERTY CXX_STANDARD 17)
+set_property(TARGET _cbrute PROPERTY CXX_STANDARD 17)
 if(HAVE_CUDA)
-  set_property(TARGET _C PROPERTY CUDA_STANDARD 17)
+  set_property(TARGET _cbrute PROPERTY CUDA_STANDARD 17)
 endif()
 
-install(TARGETS _C LIBRARY DESTINATION ${SKBUILD_PROJECT_NAME})
+install(TARGETS _cbrute LIBRARY DESTINATION ${SKBUILD_PROJECT_NAME})
 
 # ── CTest integration ─────────────────────────────────────────────────────────
 # Tests are NOT run during `pip install` (that would block installation when

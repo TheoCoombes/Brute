@@ -1,4 +1,5 @@
 #ifdef HAVE_MPS
+#include <libpopcnt.h>
 #import <Metal/Metal.h>
 #import <MetalPerformanceShadersGraph/MetalPerformanceShadersGraph.h>
 #include <torch/torch.h>
@@ -391,9 +392,16 @@ at::Tensor bitwise_not(const at::Tensor& A) {
 }
 
 at::Tensor& randomize_bits(at::Tensor& out) {
-    // MPS tensors: use torch's built-in random fill.
     out.random_();
     return out;
+}
+
+// packed_popcount — total 1-bit count using libpopcnt via CPU round-trip.
+// Not on the matmul hot path; the CPU→MPS transfer is acceptable here.
+at::Tensor packed_popcount(const at::Tensor& packed) {
+    auto p_cpu = packed.cpu().contiguous();
+    uint64_t total = popcnt(p_cpu.data_ptr(), static_cast<uint64_t>(p_cpu.nbytes()));
+    return at::scalar_tensor((int64_t)total, at::kLong);
 }
 
 }} // cbrute::mps
