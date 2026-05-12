@@ -33,7 +33,7 @@ kernel void pack_u8(
     uint8_t w = 0;
     for (int b = 0; b < 8; b++) {
         int k = j * 8 + b;
-        if (k < ld && input[i * ld + k] >= 0.f) w |= (uint8_t)(1u << b);
+        if (k < ld && input[i * ld + k] > 0.f) w |= (uint8_t)(1u << b);
     }
     output[i * pd + j] = w;
 }
@@ -48,7 +48,7 @@ kernel void pack_u32(
     uint w = 0;
     for (int b = 0; b < 32; b++) {
         int k = j * 32 + b;
-        if (k < ld && input[i * ld + k] >= 0.f) w |= (1u << b);
+        if (k < ld && input[i * ld + k] > 0.f) w |= (1u << b);
     }
     output[i * pd + j] = w;
 }
@@ -63,7 +63,7 @@ kernel void pack_u64(
     ulong w = 0;
     for (int b = 0; b < 64; b++) {
         int k = j * 64 + b;
-        if (k < ld && input[i * ld + k] >= 0.f) w |= (1ul << b);
+        if (k < ld && input[i * ld + k] > 0.f) w |= (1ul << b);
     }
     output[i * pd + j] = w;
 }
@@ -350,9 +350,10 @@ at::Tensor xnor_popcount_matmul(const at::Tensor& A, const at::Tensor& B, int64_
     TORCH_CHECK(Kp == B.size(1));
     auto Ac = A.contiguous(), Bc = B.contiguous();
     auto C  = at::zeros({M, N}, A.options().dtype(at::kInt));
+    int32_t K_eff = (int32_t)(2LL * Kp * pw - K);
     dispatch2d(std::string("xnor") + pw_suffix(pw),
                {{mtl_buf(Ac), 0}, {mtl_buf(Bc), 0}, {mtl_buf(C), 0}},
-               {(int32_t)N, (int32_t)Kp, (int32_t)K},
+               {(int32_t)N, (int32_t)Kp, K_eff},
                N, M);
     return C;
 }

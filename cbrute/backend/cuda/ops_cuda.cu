@@ -13,7 +13,7 @@ __global__ void k_pack_u8(const float* in, uint8_t* out,
     uint8_t w = 0;
     for (int b = 0; b < 8; b++) {
         int64_t k = j * 8 + b;
-        if (k < ld && in[i * ld + k] >= 0.f) w |= (uint8_t)(1u << b);
+        if (k < ld && in[i * ld + k] > 0.f) w |= (uint8_t)(1u << b);
     }
     out[i * pd + j] = w;
 }
@@ -26,7 +26,7 @@ __global__ void k_pack_u32(const float* in, int32_t* out,
     uint32_t w = 0;
     for (int b = 0; b < 32; b++) {
         int64_t k = j * 32 + b;
-        if (k < ld && in[i * ld + k] >= 0.f) w |= (1u << b);
+        if (k < ld && in[i * ld + k] > 0.f) w |= (1u << b);
     }
     out[i * pd + j] = (int32_t)w;
 }
@@ -39,7 +39,7 @@ __global__ void k_pack_u64(const float* in, int64_t* out,
     uint64_t w = 0;
     for (int b = 0; b < 64; b++) {
         int64_t k = j * 64 + b;
-        if (k < ld && in[i * ld + k] >= 0.f) w |= (1ull << b);
+        if (k < ld && in[i * ld + k] > 0.f) w |= (1ull << b);
     }
     out[i * pd + j] = (int64_t)w;
 }
@@ -126,7 +126,7 @@ __global__ void k_xnor_u64(const int64_t* A, const int64_t* B, int32_t* C,
     int32_t acc = 0;
     for (int64_t k = 0; k < Kp; k++)
         acc += __popcll(~((uint64_t)A[m*Kp+k] ^ (uint64_t)B[n*Kp+k]));
-    C[m*N+n] = 2*acc - (int32_t)K;
+    C[m*N+n] = 2*acc - (int32_t)(2LL*Kp*64 - K);
 }
 
 __global__ void k_xnor_u32(const int32_t* A, const int32_t* B, int32_t* C,
@@ -137,7 +137,7 @@ __global__ void k_xnor_u32(const int32_t* A, const int32_t* B, int32_t* C,
     int32_t acc = 0;
     for (int64_t k = 0; k < Kp; k++)
         acc += __popc(~((uint32_t)A[m*Kp+k] ^ (uint32_t)B[n*Kp+k]));
-    C[m*N+n] = 2*acc - (int32_t)K;
+    C[m*N+n] = 2*acc - (int32_t)(2LL*Kp*32 - K);
 }
 
 __global__ void k_xnor_u8(const uint8_t* A, const uint8_t* B, int32_t* C,
@@ -148,7 +148,7 @@ __global__ void k_xnor_u8(const uint8_t* A, const uint8_t* B, int32_t* C,
     int32_t acc = 0;
     for (int64_t k = 0; k < Kp; k++)
         acc += __popc((uint32_t)(uint8_t)(~(A[m*Kp+k] ^ B[n*Kp+k])));
-    C[m*N+n] = 2*acc - (int32_t)K;
+    C[m*N+n] = 2*acc - (int32_t)(2LL*Kp*8 - K);
 }
 
 at::Tensor xnor_popcount_matmul(const at::Tensor& A, const at::Tensor& B, int64_t K, int64_t pw) {

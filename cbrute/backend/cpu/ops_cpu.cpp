@@ -43,7 +43,7 @@ at::Tensor pack_bits(const at::Tensor& input, int64_t pw) {
                     uint8_t w = 0;
                     for (int b = 0; b < 8; b++) {
                         int64_t k = j * 8 + b;
-                        if (k < ld && in_ptr[i * ld + k] >= 0.f) w |= (uint8_t)(1u << b);
+                        if (k < ld && in_ptr[i * ld + k] > 0.f) w |= (uint8_t)(1u << b);
                     }
                     out[i * pd + j] = w;
                 }
@@ -56,7 +56,7 @@ at::Tensor pack_bits(const at::Tensor& input, int64_t pw) {
                     uint32_t w = 0;
                     for (int b = 0; b < 32; b++) {
                         int64_t k = j * 32 + b;
-                        if (k < ld && in_ptr[i * ld + k] >= 0.f) w |= (1u << b);
+                        if (k < ld && in_ptr[i * ld + k] > 0.f) w |= (1u << b);
                     }
                     out[i * pd + j] = (int32_t)w;
                 }
@@ -69,7 +69,7 @@ at::Tensor pack_bits(const at::Tensor& input, int64_t pw) {
                     uint64_t w = 0;
                     for (int b = 0; b < 64; b++) {
                         int64_t k = j * 64 + b;
-                        if (k < ld && in_ptr[i * ld + k] >= 0.f) w |= (1ull << b);
+                        if (k < ld && in_ptr[i * ld + k] > 0.f) w |= (1ull << b);
                     }
                     out[i * pd + j] = (int64_t)w;
                 }
@@ -137,6 +137,9 @@ at::Tensor unpack_bits(const at::Tensor& packed, at::IntArrayRef logical_shape, 
 // xnor_popcount_matmul
 // A: (M, Kp), B: (N, Kp) — both packed. K = logical dim.
 // C(m,n) = 2 * popcount(~(A[m] ^ B[n])) - K  ∈ [-K, K]
+//
+// Uses libpopcnt on the full XNOR row (not word-by-word) so it can
+// exploit AVX-512 VPOPCNTDQ / AVX2 / NEON for bulk popcount.
 // ──────────────────────────────────────────────────────────
 at::Tensor xnor_popcount_matmul(const at::Tensor& A, const at::Tensor& B, int64_t K, int64_t pw) {
     TORCH_CHECK(A.dim() == 2 && B.dim() == 2, "xnor_popcount_matmul: inputs must be 2-D");
@@ -148,40 +151,48 @@ at::Tensor xnor_popcount_matmul(const at::Tensor& A, const at::Tensor& B, int64_
     int32_t* c = C.data_ptr<int32_t>();
     auto Ac = A.contiguous(), Bc = B.contiguous();
 
+    // Number of bytes in one packed row — what libpopcnt operates on.
+    size_t row_bytes = static_cast<size_t>(Kp) * (pw / 8);
+
+    // Adjusted K: the Kp*pw − K zero-padded tail bits all XNOR to 1 (both
+    // sides are 0), inflating acc.  Subtracting K_eff instead of K removes
+    // their contribution: 2·acc − K_eff = 2·true_matches − K.
+    int32_t K_eff = (int32_t)(2LL * Kp * pw - K);
+
     if (pw == 64) {
-        const int64_t* a = Ac.data_ptr<int64_t>();
-        const int64_t* b = Bc.data_ptr<int64_t>();
+        const uint64_t* a = reinterpret_cast<const uint64_t*>(Ac.data_ptr<int64_t>());
+        const uint64_t* b = reinterpret_cast<const uint64_t*>(Bc.data_ptr<int64_t>());
         at::parallel_for(0, M, 1, [&](int64_t ms, int64_t me) {
+            std::vector<uint64_t> xnor_buf(Kp);          // one allocation per thread
             for (int64_t m = ms; m < me; m++)
                 for (int64_t n = 0; n < N; n++) {
-                    int32_t acc = 0;
                     for (int64_t k = 0; k < Kp; k++)
-                        acc += __builtin_popcountll(~((uint64_t)a[m*Kp+k] ^ (uint64_t)b[n*Kp+k]));
-                    c[m*N+n] = 2*acc - (int32_t)K;
+                        xnor_buf[k] = ~(a[m*Kp+k] ^ b[n*Kp+k]);
+                    c[m*N+n] = 2*(int32_t)popcnt(xnor_buf.data(), row_bytes) - K_eff;
                 }
         });
     } else if (pw == 32) {
-        const int32_t* a = Ac.data_ptr<int32_t>();
-        const int32_t* b = Bc.data_ptr<int32_t>();
+        const uint32_t* a = reinterpret_cast<const uint32_t*>(Ac.data_ptr<int32_t>());
+        const uint32_t* b = reinterpret_cast<const uint32_t*>(Bc.data_ptr<int32_t>());
         at::parallel_for(0, M, 1, [&](int64_t ms, int64_t me) {
+            std::vector<uint32_t> xnor_buf(Kp);
             for (int64_t m = ms; m < me; m++)
                 for (int64_t n = 0; n < N; n++) {
-                    int32_t acc = 0;
                     for (int64_t k = 0; k < Kp; k++)
-                        acc += __builtin_popcount(~((uint32_t)a[m*Kp+k] ^ (uint32_t)b[n*Kp+k]));
-                    c[m*N+n] = 2*acc - (int32_t)K;
+                        xnor_buf[k] = ~(a[m*Kp+k] ^ b[n*Kp+k]);
+                    c[m*N+n] = 2*(int32_t)popcnt(xnor_buf.data(), row_bytes) - K_eff;
                 }
         });
     } else { // pw == 8
         const uint8_t* a = Ac.data_ptr<uint8_t>();
         const uint8_t* b = Bc.data_ptr<uint8_t>();
         at::parallel_for(0, M, 1, [&](int64_t ms, int64_t me) {
+            std::vector<uint8_t> xnor_buf(Kp);
             for (int64_t m = ms; m < me; m++)
                 for (int64_t n = 0; n < N; n++) {
-                    int32_t acc = 0;
                     for (int64_t k = 0; k < Kp; k++)
-                        acc += __builtin_popcount((uint8_t)(~(a[m*Kp+k] ^ b[n*Kp+k])));
-                    c[m*N+n] = 2*acc - (int32_t)K;
+                        xnor_buf[k] = ~(a[m*Kp+k] ^ b[n*Kp+k]);
+                    c[m*N+n] = 2*(int32_t)popcnt(xnor_buf.data(), row_bytes) - K_eff;
                 }
         });
     }

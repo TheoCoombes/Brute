@@ -82,3 +82,19 @@ if(HAVE_CUDA)
 endif()
 
 install(TARGETS _C LIBRARY DESTINATION ${SKBUILD_PROJECT_NAME})
+
+# ── CTest integration ─────────────────────────────────────────────────────────
+# Tests are NOT run during `pip install` (that would block installation when
+# hardware like MPS/CUDA is unavailable and adds unacceptable install time).
+# After building, run:   ctest --test-dir <build-dir> -V
+#                    or: pytest tests/
+include(CTest)
+add_test(
+  NAME brute_pytest
+  COMMAND "${Python_EXECUTABLE}" -m pytest "${CMAKE_SOURCE_DIR}/tests" -v --tb=short
+  WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+)
+set_tests_properties(brute_pytest PROPERTIES
+  LABELS "python"
+  TIMEOUT 300
+)

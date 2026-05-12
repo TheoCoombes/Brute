@@ -29,3 +29,7 @@ x.popcount()
 ```bash
 pip install --no-build-isolation -ve .
 ```
+
+## Acknowledgements
+
+Claude was used to write test scripts for this library.

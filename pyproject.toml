@@ -16,3 +16,9 @@ wheel.packages = ["brute"]
 
 # Install with: pip install --no-build-isolation -ve .
 # (--no-build-isolation so the build can find the already-installed torch)
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["tests"]
+addopts = "-v --tb=short"
+filterwarnings = ["ignore::UserWarning"]
