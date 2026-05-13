@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from math import prod as _prod
 from typing import Optional
 import torch
 
@@ -46,6 +47,17 @@ _BITWISE_NOT_FAST = frozenset([
     torch.Tensor.bitwise_not, torch.Tensor.logical_not,
 ])
 
+# Movement/shape ops that change only metadata (no bit-pattern change). We can
+# rebuild the packed buffer with a single `reshape`/`transpose` view instead of
+# unpacking → bool op → re-packing.
+_RESHAPE_FUNCS  = frozenset([torch.Tensor.view, torch.Tensor.reshape, torch.reshape])
+_FLATTEN_FUNCS  = frozenset([torch.Tensor.flatten, torch.flatten])
+_TRANSPOSE_FUNCS = frozenset([torch.Tensor.transpose, torch.transpose])
+_CONTIG_FUNCS   = frozenset([torch.Tensor.contiguous])
+_CLONE_FUNCS    = frozenset([torch.Tensor.clone, torch.clone])
+_FILL_FUNCS     = frozenset([torch.Tensor.fill_])
+_ZERO_FUNCS     = frozenset([torch.Tensor.zero_])
+
 # Functions that only read tensor METADATA (shape/dim/dtype/device/etc.) and
 # never the bool storage. We can skip `_ensure_bool_valid` for these — saving
 # a full unpack on every metadata access for lazy-bool tensors.
@@ -73,7 +85,26 @@ _BOOL_FREE_FUNCS = frozenset(
 )
 
 
-# Internal helpers 
+# Internal helpers
+
+def _mask_pad_bits(packed: torch.Tensor, shape: list | tuple, pack_dtype: torch.dtype) -> torch.Tensor:
+    """Mask off pad bits in the last word of a packed buffer.
+
+    After NOT and other bitwise operations, pad bits may be set incorrectly.
+    This ensures they stay 0 for correct unpacking.
+    """
+    if not isinstance(shape, (list, tuple)) or len(shape) == 0:
+        return packed
+    pw = _PACK_BITS[pack_dtype]
+    last_dim = int(shape[-1]) if len(shape) >= 1 else 0
+    last_word_valid_bits = last_dim % pw
+    if last_word_valid_bits != 0:
+        valid_mask = (1 << last_word_valid_bits) - 1
+        # Create a mask tensor: all 1s except pad bits are 0
+        mask_t = torch.full_like(packed, (1 << pw) - 1)
+        mask_t[..., -1] = valid_mask
+        return torch.bitwise_and(packed, mask_t)
+    return packed
 
 def _to_bool(t: torch.Tensor) -> torch.Tensor:
     """Cast any tensor to bool (>0 for floats, standard .bool() otherwise)."""
@@ -587,15 +618,24 @@ class Tensor(torch.Tensor):
         if isinstance(idx, slice):
             # Reject negative step; need contiguous packed slice.
             return (idx.step is None or idx.step == 1)
+        # Integer-tensor / long-list gather along axis 0.
+        if isinstance(idx, torch.Tensor) and idx.dim() == 1 \
+                and idx.dtype in (torch.int64, torch.int32, torch.long):
+            return True
         return False
 
     def __getitem__(self, idx):
         if self._leading_axis_fast(idx):
             packed = self._packed_buf
-            sub = packed[idx]
-            # `x[int]` drops the leading axis; `x[slice]` keeps it.
-            new_shape = list(self.shape[1:]) if isinstance(idx, int) else \
-                        [sub.shape[0]] + list(self.shape[1:])
+            if isinstance(idx, torch.Tensor):
+                # Row gather: packed.index_select(0, idx) preserves last dim.
+                sub = packed.index_select(0, idx)
+                new_shape = [int(idx.numel())] + list(self.shape[1:])
+            else:
+                sub = packed[idx]
+                # `x[int]` drops the leading axis; `x[slice]` keeps it.
+                new_shape = list(self.shape[1:]) if isinstance(idx, int) else \
+                            [sub.shape[0]] + list(self.shape[1:])
             if not isinstance(sub, torch.Tensor) or sub.numel() == 0:
                 # Empty or unexpected — fall through to safe path.
                 return super().__getitem__(idx)
@@ -889,6 +929,9 @@ class Tensor(torch.Tensor):
                 if (a.shape == b.shape
                         and a._pack_dtype == b._pack_dtype
                         and a.dim() >= 1):
+                    # Ensure both operands have valid bool storage before operating on packed.
+                    a._ensure_bool_valid()
+                    b._ensure_bool_valid()
                     op_name = _BITWISE_BIN_FAST[func]
                     op_fn = getattr(torch.ops.brute, op_name)
                     return Tensor._make_bit1_from_packed(
@@ -902,11 +945,15 @@ class Tensor(torch.Tensor):
             if func in _BITWISE_NOT_FAST and len(bit1_ins) == 1 \
                     and bit1_ins[0].dim() >= 1:
                 a = bit1_ins[0]
+                # Ensure bool is valid before operating on packed to avoid unpacking junk
+                a._ensure_bool_valid()
+                result = torch.ops.brute.bit1_not_packed(
+                    a._packed_buf, a.numel(), _PACK_BITS[a._pack_dtype]
+                )
+                # Mask pad bits after NOT operation
+                result = _mask_pad_bits(result, list(a.shape), a._pack_dtype)
                 return Tensor._make_bit1_from_packed(
-                    torch.ops.brute.bit1_not_packed(
-                        a._packed_buf, a.numel(), _PACK_BITS[a._pack_dtype]
-                    ),
-                    list(a.shape), a._pack_dtype,
+                    result, list(a.shape), a._pack_dtype,
                 )
 
             # torch.eq(a, b) / a == b — bit1-bit1 same shape. Equivalent to
@@ -917,10 +964,15 @@ class Tensor(torch.Tensor):
                 if (a.shape == b.shape
                         and a._pack_dtype == b._pack_dtype
                         and a.dim() >= 1):
+                    # Ensure both operands have valid bool storage before operating on packed.
+                    a._ensure_bool_valid()
+                    b._ensure_bool_valid()
                     xored = torch.ops.brute.bitwise_xor(a._packed_buf, b._packed_buf)
                     inverted = torch.ops.brute.bit1_not_packed(
                         xored, a.numel(), _PACK_BITS[a._pack_dtype],
                     )
+                    # Mask pad bits in result after NOT operation
+                    inverted = _mask_pad_bits(inverted, list(a.shape), a._pack_dtype)
                     return Tensor._make_bit1_from_packed(
                         inverted, list(a.shape), a._pack_dtype,
                     )
@@ -932,10 +984,169 @@ class Tensor(torch.Tensor):
                 if (a.shape == b.shape
                         and a._pack_dtype == b._pack_dtype
                         and a.dim() >= 1):
+                    # Ensure both operands have valid bool storage before operating on packed.
+                    a._ensure_bool_valid()
+                    b._ensure_bool_valid()
                     return Tensor._make_bit1_from_packed(
                         torch.ops.brute.bitwise_xor(a._packed_buf, b._packed_buf),
                         list(a.shape), a._pack_dtype,
                     )
+
+            # ── Movement / shape ops ────────────────────────────────────────
+            # These preserve bit ordering in row-major storage, so we can just
+            # reshape the packed buffer instead of unpacking → bool op → pack.
+
+            # contiguous(): no-op only when the tensor is already contiguous.
+            # After a transpose / strided slice the bool view is non-contiguous,
+            # and we must actually materialise a contiguous copy — fall through.
+            if func in _CONTIG_FUNCS and len(bit1_ins) == 1:
+                a = bit1_ins[0]
+                if a.as_subclass(torch.Tensor).is_contiguous():
+                    return a
+
+            # view / reshape — rearrange packed if last-dim alignment matches.
+            if func in _RESHAPE_FUNCS and len(bit1_ins) == 1:
+                a = bit1_ins[0]
+                # Extract new shape from args/kwargs.
+                if 'shape' in kwargs:
+                    raw = kwargs['shape']
+                    new_shape = list(raw) if isinstance(raw, (list, tuple)) else [raw]
+                elif len(args) == 2 and isinstance(args[1], (list, tuple, torch.Size)):
+                    new_shape = list(args[1])
+                else:
+                    new_shape = list(args[1:])
+                # Resolve -1.
+                total = a.numel()
+                if -1 in new_shape and new_shape.count(-1) == 1:
+                    known = _prod([d for d in new_shape if d != -1]) or 1
+                    if total % known == 0:
+                        new_shape = [(total // known) if d == -1 else d for d in new_shape]
+                if new_shape and all(d >= 0 for d in new_shape) \
+                        and _prod(new_shape) == total:
+                    pw = _PACK_BITS[a._pack_dtype]
+                    old_last = int(a.shape[-1]) if a.dim() >= 1 else 0
+                    new_last = new_shape[-1]
+                    packed = a._packed_buf
+                    new_packed = None
+                    if old_last == new_last and a.dim() >= 1:
+                        # Just rearrange leading dims of packed.
+                        new_packed_shape = new_shape[:-1] + [packed.shape[-1]]
+                        new_packed = packed.reshape(new_packed_shape)
+                    elif old_last % pw == 0 and new_last % pw == 0:
+                        new_packed_shape = new_shape[:-1] + [new_last // pw]
+                        new_packed = packed.reshape(new_packed_shape)
+                    if new_packed is not None:
+                        return Tensor._make_bit1_from_packed(
+                            new_packed, new_shape, a._pack_dtype,
+                        )
+
+            # flatten() — equivalent to reshape((-1,)) for the common case.
+            if func in _FLATTEN_FUNCS and len(bit1_ins) == 1:
+                a = bit1_ins[0]
+                start = args[1] if len(args) > 1 else kwargs.get('start_dim', 0)
+                end   = args[2] if len(args) > 2 else kwargs.get('end_dim', -1)
+                if start == 0 and end in (-1, a.dim() - 1) and a.dim() >= 1:
+                    pw = _PACK_BITS[a._pack_dtype]
+                    last = int(a.shape[-1])
+                    if last % pw == 0 and last > 0:
+                        new_packed = a._packed_buf.reshape(-1)
+                        return Tensor._make_bit1_from_packed(
+                            new_packed, [a.numel()], a._pack_dtype,
+                        )
+
+            # transpose(d0, d1) — only fast when neither dim is the packed axis.
+            # Otherwise return a lazy bit1 with packed=None (rebuilt on demand).
+            if func in _TRANSPOSE_FUNCS and len(bit1_ins) == 1:
+                a = bit1_ins[0]
+                if a.dim() >= 2:
+                    d0 = args[1] if len(args) > 1 else kwargs.get('dim0', 0)
+                    d1 = args[2] if len(args) > 2 else kwargs.get('dim1', 1)
+                    ndim = a.dim()
+                    last_axis = ndim - 1
+                    d0p = d0 if d0 >= 0 else ndim + d0
+                    d1p = d1 if d1 >= 0 else ndim + d1
+                    if d0p == d1p:
+                        return a
+                    if d0p != last_axis and d1p != last_axis:
+                        # Both leading — rearrange packed too.
+                        new_packed = a._packed_buf.transpose(d0p, d1p).contiguous()
+                        new_shape = list(a.shape)
+                        new_shape[d0p], new_shape[d1p] = new_shape[d1p], new_shape[d0p]
+                        return Tensor._make_bit1_from_packed(
+                            new_packed, new_shape, a._pack_dtype,
+                        )
+                    # Involves the packed axis — bool view + lazy packed rebuild.
+                    if a.__dict__.get('_bool_dirty', False):
+                        a._ensure_bool_valid()
+                    new_bool = a.as_subclass(torch.Tensor).transpose(d0p, d1p)
+                    inst = new_bool.as_subclass(type(a))
+                    inst._is_bit1    = True
+                    inst._pack_dtype = a._pack_dtype
+                    inst._packed_buf = None
+                    if ndim == 2:
+                        inst.__dict__['_t_source'] = a
+                    return inst
+
+            # clone() — copy packed buffer, allocate empty bool, mark dirty.
+            if func in _CLONE_FUNCS and len(bit1_ins) == 1:
+                a = bit1_ins[0]
+                if a.dim() >= 1:
+                    return Tensor._make_bit1_from_packed(
+                        a._packed_buf.clone(), list(a.shape), a._pack_dtype,
+                    )
+
+            # torch.index_select(x, dim, idx) on axis 0 — gather rows of packed.
+            if func in (torch.index_select, torch.Tensor.index_select) \
+                    and len(bit1_ins) == 1:
+                a = bit1_ins[0]
+                # Args: (input, dim, index)
+                dim = args[1] if len(args) > 1 else kwargs.get('dim')
+                idx = args[2] if len(args) > 2 else kwargs.get('index')
+                if (a.dim() >= 2 and dim in (0,) and isinstance(idx, torch.Tensor)
+                        and idx.dim() == 1):
+                    new_packed = a._packed_buf.index_select(0, idx)
+                    new_shape = [int(idx.numel())] + list(a.shape[1:])
+                    return Tensor._make_bit1_from_packed(
+                        new_packed.contiguous(), new_shape, a._pack_dtype,
+                    )
+
+            # fill_(value) / zero_() — write bool storage AND packed pattern,
+            # skipping the read-back pack from bool. Bool must stay in sync
+            # because callers may hold view aliases that observe the bool storage.
+            if (func in _FILL_FUNCS or func in _ZERO_FUNCS) and len(bit1_ins) == 1:
+                a = bit1_ins[0]
+                if func in _ZERO_FUNCS:
+                    value = False
+                else:
+                    value = args[1] if len(args) > 1 else kwargs.get('value')
+                # Only use fast path for contiguous tensors (not views).
+                if isinstance(value, (bool, int)) and a.dim() >= 1 \
+                        and a.as_subclass(torch.Tensor).is_contiguous():
+                    # Mutate bool storage first (cheap memset; propagates to any
+                    # aliasing views and bumps the storage version counter).
+                    a.as_subclass(torch.Tensor).fill_(bool(value))
+                    # Write the packed pattern directly — skips the pack_bool
+                    # kernel that would otherwise read the entire bool buffer.
+                    pw = _PACK_BITS[a._pack_dtype]
+                    K = int(a.shape[-1])
+                    pb = a.__dict__.get('_packed_buf_cache')
+                    if pb is None:
+                        packed_shape = list(a.shape[:-1]) + [(K + pw - 1) // pw]
+                        pb = torch.empty(packed_shape, dtype=a._pack_dtype,
+                                         device=a.device)
+                    if bool(value):
+                        pb.zero_()
+                        pb.bitwise_not_()
+                        if K > 0 and K % pw != 0:
+                            valid_bits = K % pw
+                            mask = (1 << valid_bits) - 1
+                            pb[..., -1] = mask
+                    else:
+                        pb.zero_()
+                    a.__dict__['_packed_buf_cache'] = pb
+                    a.__dict__['_bool_dirty'] = False
+                    a.__dict__['_packed_ver'] = a._version
+                    return a
 
         # No fast path matched — we are about to expose the bit1 inputs as
         # torch.Tensor bool views to the generic fallback. Any input that was

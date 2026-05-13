@@ -10,9 +10,10 @@ from __future__ import annotations
 import torch
 
 from brute.tensor import Tensor, _Bit1DType, resolve_pack_dtype, bit1
+from brute.dtype import _PACK_BITS
 
 
-# Internal normaliser 
+# Internal normaliser
 
 def _norm_size(size) -> tuple:
     """Accept zeros(2,3), zeros((2,3)), or zeros([2,3])."""
@@ -21,29 +22,55 @@ def _norm_size(size) -> tuple:
     return size
 
 
-# Creators: bit1-aware 
+def _packed_shape(size: tuple, pack_dtype: torch.dtype) -> tuple:
+    """Compute the packed buffer shape for a given logical shape."""
+    pw = _PACK_BITS[pack_dtype]
+    if len(size) == 0:
+        return (1,)
+    last = int(size[-1])
+    n_words = (last + pw - 1) // pw if last > 0 else 0
+    return tuple(size[:-1]) + (n_words,)
+
+
+def _make_bit1_eager(packed: torch.Tensor, size: tuple, pack_dtype: torch.dtype,
+                     device) -> Tensor:
+    """Wrap a freshly-allocated packed buffer as a bit1 tensor with empty
+    (uninitialised) bool storage. The bool view is left dirty — it is unpacked
+    lazily on first access.
+    """
+    bool_t = torch.empty(size, dtype=torch.bool, device=device)
+    instance = bool_t.as_subclass(Tensor)
+    instance._is_bit1    = True
+    instance._pack_dtype = pack_dtype
+    instance.__dict__['_packed_buf_cache'] = packed
+    instance.__dict__['_packed_ver']       = instance._version
+    instance.__dict__['_bool_dirty']       = True
+    return instance
+
+
+# Creators: bit1-aware
 
 def zeros(*size, dtype=None, device=None, pack_dtype: torch.dtype = torch.uint8, **kwargs) -> Tensor:
     size = _norm_size(size)
     if isinstance(dtype, _Bit1DType):
-        return Tensor._make_bit1(torch.zeros(size, dtype=torch.bool, device=device),
-                                 resolve_pack_dtype(pack_dtype))
+        bool_t = torch.zeros(size, dtype=torch.bool, device=device)
+        return Tensor._make_bit1(bool_t, resolve_pack_dtype(pack_dtype))
     return Tensor._make_plain(torch.zeros(size, dtype=dtype, device=device, **kwargs))
 
 
 def ones(*size, dtype=None, device=None, pack_dtype: torch.dtype = torch.uint8, **kwargs) -> Tensor:
     size = _norm_size(size)
     if isinstance(dtype, _Bit1DType):
-        return Tensor._make_bit1(torch.ones(size, dtype=torch.bool, device=device),
-                                 resolve_pack_dtype(pack_dtype))
+        bool_t = torch.ones(size, dtype=torch.bool, device=device)
+        return Tensor._make_bit1(bool_t, resolve_pack_dtype(pack_dtype))
     return Tensor._make_plain(torch.ones(size, dtype=dtype, device=device, **kwargs))
 
 
 def empty(*size, dtype=None, device=None, pack_dtype: torch.dtype = torch.uint8, **kwargs) -> Tensor:
     size = _norm_size(size)
     if isinstance(dtype, _Bit1DType):
-        return Tensor._make_bit1(torch.empty(size, dtype=torch.bool, device=device),
-                                 resolve_pack_dtype(pack_dtype))
+        bool_t = torch.empty(size, dtype=torch.bool, device=device)
+        return Tensor._make_bit1(bool_t, resolve_pack_dtype(pack_dtype))
     return Tensor._make_plain(torch.empty(size, dtype=dtype, device=device, **kwargs))
 
 
@@ -51,10 +78,10 @@ def full(size, fill_value, *, dtype=None, device=None, pack_dtype: torch.dtype =
     if isinstance(size, int):
         size = (size,)
     if isinstance(dtype, _Bit1DType):
-        return Tensor._make_bit1(
-            torch.full(size, bool(fill_value), dtype=torch.bool, device=device),
-            resolve_pack_dtype(pack_dtype),
-        )
+        # Delegate to zeros/ones — both already skip the bool init.
+        return ones(*size, dtype=dtype, device=device, pack_dtype=pack_dtype) \
+            if bool(fill_value) else \
+            zeros(*size, dtype=dtype, device=device, pack_dtype=pack_dtype)
     return Tensor._make_plain(torch.full(size, fill_value, dtype=dtype, device=device, **kwargs))
 
 
