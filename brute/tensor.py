@@ -153,6 +153,26 @@ class Tensor(torch.Tensor):
         instance._packed_buf = None
         return instance
 
+    @classmethod
+    def _make_bit1_from_packed(cls, packed: torch.Tensor, logical_shape: list,
+                               pack_dtype: torch.dtype) -> 'Tensor':
+        """Create a bit1 tensor from a pre-computed packed buffer.
+
+        Unpacks once to get valid bool backing storage, then pre-warms the
+        packed cache so the first _packed_buf access doesn't re-pack.
+        Saves one pack_bool call vs _make_bit1 when the packed data already exists.
+        """
+        bool_t = torch.ops.brute.unpack_bool(packed, logical_shape, _PACK_BITS[pack_dtype])
+        instance = bool_t.as_subclass(cls)
+        instance._is_bit1    = True
+        instance._pack_dtype = pack_dtype
+        instance.__dict__['_packed_buf_cache'] = packed
+        try:
+            instance.__dict__['_packed_ver'] = instance._version
+        except Exception:
+            instance.__dict__['_packed_ver'] = None
+        return instance
+
     # ── Properties ──────────────────────────────────────────────────────────────
 
     @property
@@ -357,6 +377,104 @@ class Tensor(torch.Tensor):
             raise TypeError("unpack_pm1() is only valid for bit1 tensors")
         return _unpack_pm1(self._packed_buf, list(self.shape), self._pack_dtype)
 
+    # ── Binary ops on packed buffers ─────────────────────────────────────────────
+    # For same-shape bit1 tensors we operate directly on the packed integer
+    # buffers — XOR/AND/OR of two identically-packed buffers gives the correct
+    # packed result because the pad bits are 0 in both operands:
+    #   0 XOR 0 = 0,  0 AND 0 = 0,  0 OR 0 = 0  ✓
+    # Falls back to bool-level ops for broadcasting / mixed types.
+
+    def __and__(self, other):
+        if (getattr(self, '_is_bit1', False)
+                and isinstance(other, Tensor)
+                and getattr(other, '_is_bit1', False)
+                and self.shape == other.shape
+                and self._pack_dtype == other._pack_dtype
+                and self.dim() >= 1):
+            return Tensor._make_bit1_from_packed(
+                torch.ops.brute.bitwise_and(self._packed_buf, other._packed_buf),
+                list(self.shape), self._pack_dtype,
+            )
+        return super().__and__(other)
+
+    def __or__(self, other):
+        if (getattr(self, '_is_bit1', False)
+                and isinstance(other, Tensor)
+                and getattr(other, '_is_bit1', False)
+                and self.shape == other.shape
+                and self._pack_dtype == other._pack_dtype
+                and self.dim() >= 1):
+            return Tensor._make_bit1_from_packed(
+                torch.ops.brute.bitwise_or(self._packed_buf, other._packed_buf),
+                list(self.shape), self._pack_dtype,
+            )
+        return super().__or__(other)
+
+    def __xor__(self, other):
+        if (getattr(self, '_is_bit1', False)
+                and isinstance(other, Tensor)
+                and getattr(other, '_is_bit1', False)
+                and self.shape == other.shape
+                and self._pack_dtype == other._pack_dtype
+                and self.dim() >= 1):
+            return Tensor._make_bit1_from_packed(
+                torch.ops.brute.bitwise_xor(self._packed_buf, other._packed_buf),
+                list(self.shape), self._pack_dtype,
+            )
+        return super().__xor__(other)
+
+    def __invert__(self):
+        # Invert on packed buffer would flip pad bits (0→1), corrupting popcount.
+        # Use bool NOT on the underlying storage and repack — one pass, correct.
+        if getattr(self, '_is_bit1', False):
+            return Tensor._make_bit1(~self.as_subclass(torch.Tensor), self._pack_dtype)
+        return super().__invert__()
+
+    def __iand__(self, other):
+        if (getattr(self, '_is_bit1', False)
+                and isinstance(other, Tensor)
+                and getattr(other, '_is_bit1', False)
+                and self.shape == other.shape
+                and self._pack_dtype == other._pack_dtype
+                and self.dim() >= 1):
+            new_packed = torch.ops.brute.bitwise_and(self._packed_buf, other._packed_buf)
+            new_bool = torch.ops.brute.unpack_bool(
+                new_packed, list(self.shape), _PACK_BITS[self._pack_dtype])
+            self.as_subclass(torch.Tensor).copy_(new_bool)
+            self._packed_buf = new_packed
+            return self
+        return super().__iand__(other)
+
+    def __ior__(self, other):
+        if (getattr(self, '_is_bit1', False)
+                and isinstance(other, Tensor)
+                and getattr(other, '_is_bit1', False)
+                and self.shape == other.shape
+                and self._pack_dtype == other._pack_dtype
+                and self.dim() >= 1):
+            new_packed = torch.ops.brute.bitwise_or(self._packed_buf, other._packed_buf)
+            new_bool = torch.ops.brute.unpack_bool(
+                new_packed, list(self.shape), _PACK_BITS[self._pack_dtype])
+            self.as_subclass(torch.Tensor).copy_(new_bool)
+            self._packed_buf = new_packed
+            return self
+        return super().__ior__(other)
+
+    def __ixor__(self, other):
+        if (getattr(self, '_is_bit1', False)
+                and isinstance(other, Tensor)
+                and getattr(other, '_is_bit1', False)
+                and self.shape == other.shape
+                and self._pack_dtype == other._pack_dtype
+                and self.dim() >= 1):
+            new_packed = torch.ops.brute.bitwise_xor(self._packed_buf, other._packed_buf)
+            new_bool = torch.ops.brute.unpack_bool(
+                new_packed, list(self.shape), _PACK_BITS[self._pack_dtype])
+            self.as_subclass(torch.Tensor).copy_(new_bool)
+            self._packed_buf = new_packed
+            return self
+        return super().__ixor__(other)
+
     def popcount(self) -> Tensor:
         """
         Count the number of 1-bits (True values) in this tensor.
@@ -376,18 +494,110 @@ class Tensor(torch.Tensor):
             f"popcount() is only defined for bit1 and bool tensors; got dtype={self.dtype}"
         )
 
+    def hamming(self, other: 'Tensor') -> 'Tensor':
+        """Total Hamming distance — number of bit positions where self and other differ.
+
+        Uses the fused XOR+popcount kernel with no intermediate allocation.
+        Both tensors must be bit1 with identical shape and pack_dtype.
+        Returns a 0-dim int64 brute.Tensor scalar.
+        """
+        if not (getattr(self, '_is_bit1', False)
+                and isinstance(other, Tensor)
+                and getattr(other, '_is_bit1', False)):
+            raise TypeError("hamming() is only defined for bit1 tensors")
+        if self.shape != other.shape:
+            raise ValueError(
+                f"hamming() requires matching shapes; got {tuple(self.shape)} vs {tuple(other.shape)}"
+            )
+        if self._pack_dtype != other._pack_dtype:
+            raise ValueError(
+                f"hamming() requires matching pack_dtype; got {self._pack_dtype} vs {other._pack_dtype}"
+            )
+        return Tensor._make_plain(
+            torch.ops.brute.bit1_hamming_total(self._packed_buf, other._packed_buf)
+        )
+
+    def word_popcount(self) -> 'Tensor':
+        """Per-packed-word popcount of the bit1 storage buffer.
+
+        Returns an int32 tensor with the same shape as the packed buffer, where
+        each element is the popcount of the corresponding packed integer word.
+        Useful for density analysis and debugging.
+        """
+        if not getattr(self, '_is_bit1', False):
+            raise TypeError("word_popcount() is only defined for bit1 tensors")
+        return Tensor._make_plain(torch.ops.brute.popcount(self._packed_buf))
+
+    def randomize_(self) -> 'Tensor':
+        """Fill this bit1 tensor with uniformly random bits, in place.
+
+        Uses the backend's fast randomize_bits kernel on the packed buffer, then
+        syncs back to the bool backing storage.
+        """
+        if not getattr(self, '_is_bit1', False):
+            raise TypeError("randomize_() is only defined for bit1 tensors")
+        pb = self._packed_buf.clone()
+        torch.ops.brute.randomize_bits(pb)
+        new_bool = torch.ops.brute.unpack_bool(pb, list(self.shape), _PACK_BITS[self._pack_dtype])
+        self.as_subclass(torch.Tensor).copy_(new_bool)
+        self._packed_buf = pb
+        return self
+
+    # ── Transpose (preserves _t_source for fast A @ B.t() matmul) ───────────────
+
+    def t(self) -> 'Tensor':
+        """2-D transpose preserving bit1 dtype and enabling the A @ B.t() fast path.
+
+        The returned tensor keeps a _t_source back-reference to self so that
+        __matmul__ can read self's packed buffer (N×K form) instead of repacking
+        the transposed K×N tensor, which would break the xnor_popcount_matmul layout.
+        """
+        base   = self.as_subclass(torch.Tensor)
+        result = base.t()
+        if not getattr(self, '_is_bit1', False):
+            return Tensor._make_plain(result)
+        t_inst = result.as_subclass(type(self))
+        t_inst._is_bit1    = True
+        t_inst._pack_dtype = self._pack_dtype
+        t_inst._packed_buf = None
+        if self.dim() == 2:
+            t_inst.__dict__['_t_source'] = self
+        return t_inst
+
     # ── Matmul ──────────────────────────────────────────────────────────────────
 
     def __matmul__(self, other):
         if (getattr(self, '_is_bit1', False)
                 and isinstance(other, Tensor)
                 and getattr(other, '_is_bit1', False)
-                and self.dim() == 2 and other.dim() == 2
-                and self._packed_buf.shape[-1] == other._packed_buf.shape[-1]):
-            return torch.ops.brute.xnor_popcount_matmul(
-                self._packed_buf, other._packed_buf,
-                self.shape[-1], _PACK_BITS[self._pack_dtype],
-            )
+                and self.dim() == 2 and other.dim() == 2):
+            K = self.shape[-1]
+
+            # A (M×K) @ B (N×K) — bit1 convention: rows of B are output features.
+            # Guard on logical K equality, not just packed-word count, to avoid
+            # false positives when two tensors share the same ceil(K/pw) by accident.
+            if (other.shape[-1] == K
+                    and self._packed_buf.shape[-1] == other._packed_buf.shape[-1]):
+                return torch.ops.brute.xnor_popcount_matmul(
+                    self._packed_buf, other._packed_buf,
+                    K, _PACK_BITS[self._pack_dtype],
+                )
+
+            # A (M×K) @ B.t() (K×N) — standard matmul shape.
+            # B.t() carries _t_source = B (N×K), so we use B's packed buffer
+            # directly instead of repacking the transposed K×N form.
+            t_src = other.__dict__.get('_t_source')
+            if (t_src is not None
+                    and isinstance(t_src, Tensor)
+                    and getattr(t_src, '_is_bit1', False)
+                    and t_src.shape[-1] == K
+                    and t_src._pack_dtype == self._pack_dtype
+                    and self._packed_buf.shape[-1] == t_src._packed_buf.shape[-1]):
+                return torch.ops.brute.xnor_popcount_matmul(
+                    self._packed_buf, t_src._packed_buf,
+                    K, _PACK_BITS[self._pack_dtype],
+                )
+
         return super().__matmul__(other)
 
     # ── __torch_function__ ──────────────────────────────────────────────────────
@@ -422,12 +632,27 @@ class Tensor(torch.Tensor):
         # Fast path: XNOR-popcount for 2-D bit1 × bit1 matmul.
         if func in _MATMUL_FUNCS and len(bit1_ins) >= 2:
             a, b = bit1_ins[0], bit1_ins[1]
-            if (a.dim() == 2 and b.dim() == 2
-                    and a._packed_buf.shape[-1] == b._packed_buf.shape[-1]):
-                return torch.ops.brute.xnor_popcount_matmul(
-                    a._packed_buf, b._packed_buf,
-                    a.shape[-1], _PACK_BITS[a._pack_dtype],
-                )
+            if a.dim() == 2 and b.dim() == 2:
+                K = a.shape[-1]
+                # A (M×K) @ B (N×K)
+                if (b.shape[-1] == K
+                        and a._packed_buf.shape[-1] == b._packed_buf.shape[-1]):
+                    return torch.ops.brute.xnor_popcount_matmul(
+                        a._packed_buf, b._packed_buf,
+                        K, _PACK_BITS[a._pack_dtype],
+                    )
+                # A (M×K) @ B.t() (K×N) via _t_source
+                b_src = b.__dict__.get('_t_source')
+                if (b_src is not None
+                        and isinstance(b_src, Tensor)
+                        and getattr(b_src, '_is_bit1', False)
+                        and b_src.shape[-1] == K
+                        and b_src._pack_dtype == a._pack_dtype
+                        and a._packed_buf.shape[-1] == b_src._packed_buf.shape[-1]):
+                    return torch.ops.brute.xnor_popcount_matmul(
+                        a._packed_buf, b_src._packed_buf,
+                        K, _PACK_BITS[a._pack_dtype],
+                    )
 
         # Fast path: full-tensor reductions on bit1 driven by packed_popcount.
         # Pad bits in the packed buffer are zero, so the total popcount equals

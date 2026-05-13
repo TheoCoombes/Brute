@@ -203,29 +203,51 @@ at::Tensor xnor_popcount_matmul(const at::Tensor& A, const at::Tensor& B,
 
     const int32_t K_eff = (int32_t)(2LL * Kp * pw - K);
 
+    // N-tiling: process B in N_TILE-column chunks so the active B-tile
+    // (N_TILE × Kp words) fits in L1/L2 and is reused across all A rows
+    // handled by the same parallel worker, rather than streaming the full
+    // B matrix once per A row.  N_TILE=64 keeps a 64×Kp tile in L1 for
+    // small Kp and comfortably in L2 for larger ones.
+    constexpr int64_t N_TILE = 64;
+
     // Dispatch by pack width to instantiate the right unsigned word type.
     if (pw == 64) {
         const auto* a = reinterpret_cast<const uint64_t*>(Ac.data_ptr<int64_t>());
         const auto* b = reinterpret_cast<const uint64_t*>(Bc.data_ptr<int64_t>());
         at::parallel_for(0, M, ROW_GRAIN, [&](int64_t ms, int64_t me) {
-            for (int64_t m = ms; m < me; ++m) {
-                hnk::XnorPopcountRow<uint64_t>(a + m * Kp, b, Kp, N, K_eff, c + m * N);
+            for (int64_t n_start = 0; n_start < N; n_start += N_TILE) {
+                const int64_t n_cnt = std::min(N_TILE, N - n_start);
+                for (int64_t m = ms; m < me; ++m) {
+                    hnk::XnorPopcountRow<uint64_t>(
+                        a + m * Kp, b + n_start * Kp, Kp, n_cnt, K_eff,
+                        c + m * N + n_start);
+                }
             }
         });
     } else if (pw == 32) {
         const auto* a = reinterpret_cast<const uint32_t*>(Ac.data_ptr<int32_t>());
         const auto* b = reinterpret_cast<const uint32_t*>(Bc.data_ptr<int32_t>());
         at::parallel_for(0, M, ROW_GRAIN, [&](int64_t ms, int64_t me) {
-            for (int64_t m = ms; m < me; ++m) {
-                hnk::XnorPopcountRow<uint32_t>(a + m * Kp, b, Kp, N, K_eff, c + m * N);
+            for (int64_t n_start = 0; n_start < N; n_start += N_TILE) {
+                const int64_t n_cnt = std::min(N_TILE, N - n_start);
+                for (int64_t m = ms; m < me; ++m) {
+                    hnk::XnorPopcountRow<uint32_t>(
+                        a + m * Kp, b + n_start * Kp, Kp, n_cnt, K_eff,
+                        c + m * N + n_start);
+                }
             }
         });
     } else { // pw == 8
         const auto* a = Ac.data_ptr<uint8_t>();
         const auto* b = Bc.data_ptr<uint8_t>();
         at::parallel_for(0, M, ROW_GRAIN, [&](int64_t ms, int64_t me) {
-            for (int64_t m = ms; m < me; ++m) {
-                hnk::XnorPopcountRow<uint8_t>(a + m * Kp, b, Kp, N, K_eff, c + m * N);
+            for (int64_t n_start = 0; n_start < N; n_start += N_TILE) {
+                const int64_t n_cnt = std::min(N_TILE, N - n_start);
+                for (int64_t m = ms; m < me; ++m) {
+                    hnk::XnorPopcountRow<uint8_t>(
+                        a + m * Kp, b + n_start * Kp, Kp, n_cnt, K_eff,
+                        c + m * N + n_start);
+                }
             }
         });
     }

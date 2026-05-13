@@ -30,24 +30,56 @@ HWY_BEFORE_NAMESPACE();
 namespace cbrute { namespace cpu { namespace HWY_NAMESPACE {
 namespace hn = hwy::HWY_NAMESPACE;
 
+// XnorPopcountPair: XNOR-popcount inner product of two packed rows.
+//
+// Why uint64_t reinterpretation:
+//   If T=uint8_t we would accumulate into ScalableTag<uint8_t>, whose
+//   ReduceSum returns uint8_t.  On NEON (LANES=16) that wraps at 256, so
+//   K ≥ 512 (Kp ≥ 64) produces wrong results.  Reinterpreting as uint64_t
+//   words makes the accumulator ScalableTag<uint64_t> which returns uint64_t
+//   — no overflow for any practical K.  XOR/XNOR is bitwise and commutes
+//   with any re-chunking of the byte stream, so the bit count is identical.
 template <typename T>
 HWY_ATTR inline int32_t XnorPopcountPair(const T* HWY_RESTRICT a_row,
                                          const T* HWY_RESTRICT b_row,
                                          int64_t Kp, int32_t K_eff) {
-    const hn::ScalableTag<T> d;
+    const size_t n_bytes = (size_t)Kp * sizeof(T);
+    const uint64_t* a64  = reinterpret_cast<const uint64_t*>(a_row);
+    const uint64_t* b64  = reinterpret_cast<const uint64_t*>(b_row);
+    const size_t n_words = n_bytes / sizeof(uint64_t);
+
+    const hn::ScalableTag<uint64_t> d;
     const size_t LANES = hn::Lanes(d);
+
+    size_t i = 0;
     auto acc = hn::Zero(d);
-    int64_t k = 0;
-    for (; k + (int64_t)LANES <= Kp; k += (int64_t)LANES) {
-        auto va = hn::LoadU(d, a_row + k);
-        auto vb = hn::LoadU(d, b_row + k);
-        auto x  = hn::Not(hn::Xor(va, vb));
-        acc = hn::Add(acc, hn::PopulationCount(x));
+    for (; i + LANES <= n_words; i += LANES) {
+        auto va = hn::LoadU(d, a64 + i);
+        auto vb = hn::LoadU(d, b64 + i);
+        acc = hn::Add(acc, hn::PopulationCount(hn::Not(hn::Xor(va, vb))));
     }
-    uint64_t sum = (uint64_t)hn::ReduceSum(d, acc);
-    for (; k < Kp; ++k) {
-        const T x = (T)~(a_row[k] ^ b_row[k]);
-        sum += (uint64_t)_brute_popcountll((uint64_t)x);
+    uint64_t sum = hn::ReduceSum(d, acc);
+    for (; i < n_words; ++i) {
+        sum += (uint64_t)_brute_popcountll(~(a64[i] ^ b64[i]));
+    }
+
+    // Tail: up to 7 bytes not covered by uint64 words above.  Assemble into a
+    // uint64, mask off the bits that don't exist in the byte stream, then
+    // popcnt.  K_eff accounts for the pad bits within the last T-word, so we
+    // must count those pad bits here too — i.e. no extra masking for pad bits,
+    // only for the high bytes beyond tail that are absent from the stream.
+    const size_t tail = n_bytes - n_words * sizeof(uint64_t);
+    if (tail) {
+        const uint8_t* ap = reinterpret_cast<const uint8_t*>(a_row) + n_words * 8;
+        const uint8_t* bp = reinterpret_cast<const uint8_t*>(b_row) + n_words * 8;
+        uint64_t la = 0, lb = 0;
+        for (size_t k = 0; k < tail; ++k) {
+            la |= ((uint64_t)ap[k]) << (k * 8);
+            lb |= ((uint64_t)bp[k]) << (k * 8);
+        }
+        const uint64_t mask = (tail < 8) ? ((uint64_t(1) << (tail * 8)) - 1)
+                                         : ~uint64_t(0);
+        sum += (uint64_t)_brute_popcountll(~(la ^ lb) & mask);
     }
     return 2 * (int32_t)sum - K_eff;
 }

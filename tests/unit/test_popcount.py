@@ -63,18 +63,17 @@ def test_popcount_pack_dtype_invariant(pack_dtype, device):
 
 
 def test_packed_popcount_op(device):
-    """torch.ops.brute.packed_popcount returns scalar total popcount."""
+    """popcount() returns the scalar total number of set bits."""
     src = torch.tensor([True, False, True, True, False, True], device=device)
     bit = bit1(src)
-    total = torch.ops.brute.packed_popcount(bit._packed_buf)
-    assert int(total.item()) == 4
+    assert int(bit.popcount().item()) == 4
 
 
 def test_per_element_popcount_op(device):
-    """torch.ops.brute.popcount returns per-word popcount."""
+    """word_popcount() returns per-packed-word popcount."""
     src = torch.tensor([True, False, True, True, False, True, True, False], device=device)
     bit = bit1(src, pack_dtype=torch.uint8)
-    out = torch.ops.brute.popcount(bit._packed_buf)
+    out = bit.word_popcount()
     # One uint8 word with 5 set bits: 1+0+1+1+0+1+1+0 = 5
     assert int(out.flatten()[0].item()) == 5
 
@@ -82,6 +81,6 @@ def test_per_element_popcount_op(device):
 def test_python_reference_matches_kernel(device):
     src = torch.randint(0, 2, (128,), dtype=torch.bool, device=device)
     bit = bit1(src)
-    fast = torch.ops.brute.packed_popcount(bit._packed_buf).cpu()
+    fast = bit.popcount().cpu()
     slow = ref_packed_popcount(bit._packed_buf.cpu())
     assert int(fast.item()) == int(slow.item())

@@ -41,14 +41,63 @@ __global__ void k_xnor_popcount_matmul(const T* __restrict__ A,
 
     uint64_t acc = 0;
     int64_t k = 0;
-    // 4-way unrolled main loop for ILP — the popc instructions don't depend
-    // on each other so the scheduler can overlap them.
-    for (; k + 3 < Kp; k += 4) {
-        acc += bit_popcnt<T>((T)~(a_row[k]   ^ b_row[k]));
-        acc += bit_popcnt<T>((T)~(a_row[k+1] ^ b_row[k+1]));
-        acc += bit_popcnt<T>((T)~(a_row[k+2] ^ b_row[k+2]));
-        acc += bit_popcnt<T>((T)~(a_row[k+3] ^ b_row[k+3]));
+
+    // 128-bit vectorized loads: each load fetches 4×uint32 or 2×uint64 in a
+    // single instruction, halving/quartering the number of global load ops.
+    // Alignment is guaranteed when Kp × sizeof(T) is a multiple of 16 bytes
+    // (i.e., Kp%4==0 for uint32, Kp%2==0 for uint64); PyTorch allocates
+    // 64-byte aligned, so row-start alignment follows from that condition.
+    // When the condition is not met, fall through to the 4-way scalar path.
+    if constexpr (sizeof(T) == 4) {
+        if (Kp % 4 == 0) {
+            const uint4* a4 = reinterpret_cast<const uint4*>(a_row);
+            const uint4* b4 = reinterpret_cast<const uint4*>(b_row);
+            const int64_t Kp4 = Kp / 4;
+            for (int64_t w = 0; w < Kp4; ++w) {
+                const uint4 va = a4[w], vb = b4[w];
+                acc += (uint64_t)__popc(~(va.x ^ vb.x))
+                     + (uint64_t)__popc(~(va.y ^ vb.y))
+                     + (uint64_t)__popc(~(va.z ^ vb.z))
+                     + (uint64_t)__popc(~(va.w ^ vb.w));
+            }
+            k = Kp;
+        } else {
+            for (; k + 3 < Kp; k += 4) {
+                acc += __popc(~(a_row[k]   ^ b_row[k]))
+                     + __popc(~(a_row[k+1] ^ b_row[k+1]))
+                     + __popc(~(a_row[k+2] ^ b_row[k+2]))
+                     + __popc(~(a_row[k+3] ^ b_row[k+3]));
+            }
+        }
+    } else if constexpr (sizeof(T) == 8) {
+        if (Kp % 2 == 0) {
+            const ulonglong2* a2 = reinterpret_cast<const ulonglong2*>(a_row);
+            const ulonglong2* b2 = reinterpret_cast<const ulonglong2*>(b_row);
+            const int64_t Kp2 = Kp / 2;
+            for (int64_t w = 0; w < Kp2; ++w) {
+                const ulonglong2 va = a2[w], vb = b2[w];
+                acc += (uint64_t)__popcll(~(va.x ^ vb.x))
+                     + (uint64_t)__popcll(~(va.y ^ vb.y));
+            }
+            k = Kp;
+        } else {
+            for (; k + 3 < Kp; k += 4) {
+                acc += bit_popcnt<T>((T)~(a_row[k]   ^ b_row[k]));
+                acc += bit_popcnt<T>((T)~(a_row[k+1] ^ b_row[k+1]));
+                acc += bit_popcnt<T>((T)~(a_row[k+2] ^ b_row[k+2]));
+                acc += bit_popcnt<T>((T)~(a_row[k+3] ^ b_row[k+3]));
+            }
+        }
+    } else {
+        // uint8_t: 4-way scalar unroll
+        for (; k + 3 < Kp; k += 4) {
+            acc += bit_popcnt<T>((T)~(a_row[k]   ^ b_row[k]));
+            acc += bit_popcnt<T>((T)~(a_row[k+1] ^ b_row[k+1]));
+            acc += bit_popcnt<T>((T)~(a_row[k+2] ^ b_row[k+2]));
+            acc += bit_popcnt<T>((T)~(a_row[k+3] ^ b_row[k+3]));
+        }
     }
+
     for (; k < Kp; ++k) {
         acc += bit_popcnt<T>((T)~(a_row[k] ^ b_row[k]));
     }

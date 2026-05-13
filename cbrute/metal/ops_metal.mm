@@ -254,13 +254,22 @@ at::Tensor unpack_bool(const at::Tensor& packed, at::IntArrayRef logical_shape, 
 }
 
 // ── Matmul ───────────────────────────────────────────────────────────────────
-// simdgroup-per-output-cell. TG = (32, 1, 1) = exactly one simdgroup. Grid =
-// (N * 32, M, 1) so threadgroup_position_in_grid yields (n, m) directly.
+// Three tiers of kernels, selected at runtime:
 //
-// TODO: a threadgroup-tiled variant (shared A/B tiles) would help when both M
-// and N are large (≳512). The simd-per-cell version is correct everywhere and
-// already 32× faster than the legacy per-thread kernel; tiling is a perf
-// optimization for follow-up.
+//  1. xnor_u32_tiled / xnor_u32_wide / xnor_u64_wide — fast paths.
+//  2. Existing per-cell kernels (xnor_u8/u32/u64) — universal fallback.
+//
+// Tiled  (pw==32, M≥4, N≥8):
+//   TG = (128, 2, 1) = 8 simdgroups, each handling one (m, n) within a
+//   (TM=2, TN=4) output tile. A-tile and B-tile loaded once into threadgroup
+//   memory per K-tile, amortising bandwidth across all 8 simdgroups.
+//
+// Wide u32 (pw==32, Kp%4==0, not tiled):
+//   Same per-cell dispatch as the base kernel, but the shader processes 4
+//   uint32 words per simdgroup-lane per K-iteration via uint4 loads.
+//
+// Wide u64 (pw==64, Kp%2==0):
+//   Same per-cell dispatch; shader processes 2 ulong words per lane via ulong2.
 at::Tensor xnor_popcount_matmul(const at::Tensor& A, const at::Tensor& B,
                                 int64_t K, int64_t pw) {
     TORCH_CHECK(A.is_mps() && B.is_mps());
@@ -272,9 +281,55 @@ at::Tensor xnor_popcount_matmul(const at::Tensor& A, const at::Tensor& B,
     auto C  = at::zeros({M, N}, A.options().dtype(at::kInt));
     const int32_t K_eff = (int32_t)(2LL * Kp * pw - K);
 
+    // ── Tier 1a: threadgroup-tiled u32 (large M × N) ─────────────────────
+    // TM=2, TN=4; TG = (TN*32, TM, 1) = (128, 2, 1).
+    // Grid = (ceil(N/TN), ceil(M/TM), 1) in threadgroup coords, but we use
+    // dispatchThreads which takes total threads so:
+    //   grid_x = ceil(N/4) * 4 * 32,  grid_y = ceil(M/2) * 2.
+    constexpr int64_t TM = 2, TN = 4;
+    if (pw == 32 && M >= TM * 2 && N >= TN * 2) {
+        const int64_t grid_x = ((N + TN - 1) / TN) * TN * 32;
+        const int64_t grid_y = ((M + TM - 1) / TM) * TM;
+        MTLSize grid = MTLSizeMake((NSUInteger)grid_x, (NSUInteger)grid_y, 1);
+        MTLSize tg   = MTLSizeMake((NSUInteger)(TN * 32), (NSUInteger)TM, 1);
+        dispatch_kernel("xnor_u32_tiled",
+            {{mtl_buf(Ac), byte_offset(Ac)},
+             {mtl_buf(Bc), byte_offset(Bc)},
+             {mtl_buf(C),  byte_offset(C)}},
+            {(int32_t)N, (int32_t)Kp, K_eff, (int32_t)M},
+            grid, tg);
+        return C;
+    }
+
+    // ── Tier 1b: wide-vector per-cell kernels ─────────────────────────────
+    // xnor_u32_wide: Kp4 = Kp/4 wide words; xnor_u64_wide: Kp2 = Kp/2.
+    // Grid/TG identical to the base per-cell kernels: (N*32, M) / (32, 1).
+    if (pw == 32 && Kp % 4 == 0) {
+        MTLSize grid = MTLSizeMake((NSUInteger)N * 32, (NSUInteger)M, 1);
+        MTLSize tg   = MTLSizeMake(32, 1, 1);
+        dispatch_kernel("xnor_u32_wide",
+            {{mtl_buf(Ac), byte_offset(Ac)},
+             {mtl_buf(Bc), byte_offset(Bc)},
+             {mtl_buf(C),  byte_offset(C)}},
+            {(int32_t)N, (int32_t)(Kp / 4), K_eff},
+            grid, tg);
+        return C;
+    }
+    if (pw == 64 && Kp % 2 == 0) {
+        MTLSize grid = MTLSizeMake((NSUInteger)N * 32, (NSUInteger)M, 1);
+        MTLSize tg   = MTLSizeMake(32, 1, 1);
+        dispatch_kernel("xnor_u64_wide",
+            {{mtl_buf(Ac), byte_offset(Ac)},
+             {mtl_buf(Bc), byte_offset(Bc)},
+             {mtl_buf(C),  byte_offset(C)}},
+            {(int32_t)N, (int32_t)(Kp / 2), K_eff},
+            grid, tg);
+        return C;
+    }
+
+    // ── Tier 2: base per-cell kernel (universal fallback) ─────────────────
     MTLSize grid = MTLSizeMake((NSUInteger)N * 32, (NSUInteger)M, 1);
     MTLSize tg   = MTLSizeMake(32, 1, 1);
-
     dispatch_kernel(std::string("xnor") + pw_suffix(pw),
         {{mtl_buf(Ac), byte_offset(Ac)},
          {mtl_buf(Bc), byte_offset(Bc)},
