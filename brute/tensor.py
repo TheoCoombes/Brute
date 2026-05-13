@@ -85,26 +85,7 @@ _BOOL_FREE_FUNCS = frozenset(
 )
 
 
-# Internal helpers
-
-def _mask_pad_bits(packed: torch.Tensor, shape: list | tuple, pack_dtype: torch.dtype) -> torch.Tensor:
-    """Mask off pad bits in the last word of a packed buffer.
-
-    After NOT and other bitwise operations, pad bits may be set incorrectly.
-    This ensures they stay 0 for correct unpacking.
-    """
-    if not isinstance(shape, (list, tuple)) or len(shape) == 0:
-        return packed
-    pw = _PACK_BITS[pack_dtype]
-    last_dim = int(shape[-1]) if len(shape) >= 1 else 0
-    last_word_valid_bits = last_dim % pw
-    if last_word_valid_bits != 0:
-        valid_mask = (1 << last_word_valid_bits) - 1
-        # Create a mask tensor: all 1s except pad bits are 0
-        mask_t = torch.full_like(packed, (1 << pw) - 1)
-        mask_t[..., -1] = valid_mask
-        return torch.bitwise_and(packed, mask_t)
-    return packed
+# Internal helpers 
 
 def _to_bool(t: torch.Tensor) -> torch.Tensor:
     """Cast any tensor to bool (>0 for floats, standard .bool() otherwise)."""
@@ -929,9 +910,6 @@ class Tensor(torch.Tensor):
                 if (a.shape == b.shape
                         and a._pack_dtype == b._pack_dtype
                         and a.dim() >= 1):
-                    # Ensure both operands have valid bool storage before operating on packed.
-                    a._ensure_bool_valid()
-                    b._ensure_bool_valid()
                     op_name = _BITWISE_BIN_FAST[func]
                     op_fn = getattr(torch.ops.brute, op_name)
                     return Tensor._make_bit1_from_packed(
@@ -945,15 +923,11 @@ class Tensor(torch.Tensor):
             if func in _BITWISE_NOT_FAST and len(bit1_ins) == 1 \
                     and bit1_ins[0].dim() >= 1:
                 a = bit1_ins[0]
-                # Ensure bool is valid before operating on packed to avoid unpacking junk
-                a._ensure_bool_valid()
-                result = torch.ops.brute.bit1_not_packed(
-                    a._packed_buf, a.numel(), _PACK_BITS[a._pack_dtype]
-                )
-                # Mask pad bits after NOT operation
-                result = _mask_pad_bits(result, list(a.shape), a._pack_dtype)
                 return Tensor._make_bit1_from_packed(
-                    result, list(a.shape), a._pack_dtype,
+                    torch.ops.brute.bit1_not_packed(
+                        a._packed_buf, a.numel(), _PACK_BITS[a._pack_dtype]
+                    ),
+                    list(a.shape), a._pack_dtype,
                 )
 
             # torch.eq(a, b) / a == b — bit1-bit1 same shape. Equivalent to
@@ -964,15 +938,10 @@ class Tensor(torch.Tensor):
                 if (a.shape == b.shape
                         and a._pack_dtype == b._pack_dtype
                         and a.dim() >= 1):
-                    # Ensure both operands have valid bool storage before operating on packed.
-                    a._ensure_bool_valid()
-                    b._ensure_bool_valid()
                     xored = torch.ops.brute.bitwise_xor(a._packed_buf, b._packed_buf)
                     inverted = torch.ops.brute.bit1_not_packed(
                         xored, a.numel(), _PACK_BITS[a._pack_dtype],
                     )
-                    # Mask pad bits in result after NOT operation
-                    inverted = _mask_pad_bits(inverted, list(a.shape), a._pack_dtype)
                     return Tensor._make_bit1_from_packed(
                         inverted, list(a.shape), a._pack_dtype,
                     )
@@ -984,9 +953,6 @@ class Tensor(torch.Tensor):
                 if (a.shape == b.shape
                         and a._pack_dtype == b._pack_dtype
                         and a.dim() >= 1):
-                    # Ensure both operands have valid bool storage before operating on packed.
-                    a._ensure_bool_valid()
-                    b._ensure_bool_valid()
                     return Tensor._make_bit1_from_packed(
                         torch.ops.brute.bitwise_xor(a._packed_buf, b._packed_buf),
                         list(a.shape), a._pack_dtype,
@@ -1119,9 +1085,7 @@ class Tensor(torch.Tensor):
                     value = False
                 else:
                     value = args[1] if len(args) > 1 else kwargs.get('value')
-                # Only use fast path for contiguous tensors (not views).
-                if isinstance(value, (bool, int)) and a.dim() >= 1 \
-                        and a.as_subclass(torch.Tensor).is_contiguous():
+                if isinstance(value, (bool, int)) and a.dim() >= 1:
                     # Mutate bool storage first (cheap memset; propagates to any
                     # aliasing views and bumps the storage version counter).
                     a.as_subclass(torch.Tensor).fill_(bool(value))

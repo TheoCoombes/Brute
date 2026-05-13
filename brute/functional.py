@@ -53,24 +53,43 @@ def _make_bit1_eager(packed: torch.Tensor, size: tuple, pack_dtype: torch.dtype,
 def zeros(*size, dtype=None, device=None, pack_dtype: torch.dtype = torch.uint8, **kwargs) -> Tensor:
     size = _norm_size(size)
     if isinstance(dtype, _Bit1DType):
-        bool_t = torch.zeros(size, dtype=torch.bool, device=device)
-        return Tensor._make_bit1(bool_t, resolve_pack_dtype(pack_dtype))
+        pd = resolve_pack_dtype(pack_dtype)
+        # Allocate only the packed buffer (zeros) + empty bool. Skips the
+        # 8/32/64× memory tax of materialising and re-reading a full bool zero.
+        packed = torch.zeros(_packed_shape(size, pd), dtype=pd, device=device)
+        return _make_bit1_eager(packed, size, pd, device)
     return Tensor._make_plain(torch.zeros(size, dtype=dtype, device=device, **kwargs))
 
 
 def ones(*size, dtype=None, device=None, pack_dtype: torch.dtype = torch.uint8, **kwargs) -> Tensor:
     size = _norm_size(size)
     if isinstance(dtype, _Bit1DType):
-        bool_t = torch.ones(size, dtype=torch.bool, device=device)
-        return Tensor._make_bit1(bool_t, resolve_pack_dtype(pack_dtype))
+        pd = resolve_pack_dtype(pack_dtype)
+        pw = _PACK_BITS[pd]
+        ps = _packed_shape(size, pd)
+        packed = torch.zeros(ps, dtype=pd, device=device)
+        packed.bitwise_not_()                    # all-ones in the packed dtype
+        if size and size[-1] > 0 and size[-1] % pw != 0 and packed.numel() > 0:
+            # Mask pad bits in the tail word so popcount/sum stay correct.
+            valid_bits = size[-1] % pw
+            mask = (1 << valid_bits) - 1
+            packed[..., -1] = mask
+        return _make_bit1_eager(packed, size, pd, device)
     return Tensor._make_plain(torch.ones(size, dtype=dtype, device=device, **kwargs))
 
 
 def empty(*size, dtype=None, device=None, pack_dtype: torch.dtype = torch.uint8, **kwargs) -> Tensor:
     size = _norm_size(size)
     if isinstance(dtype, _Bit1DType):
-        bool_t = torch.empty(size, dtype=torch.bool, device=device)
-        return Tensor._make_bit1(bool_t, resolve_pack_dtype(pack_dtype))
+        pd = resolve_pack_dtype(pack_dtype)
+        pw = _PACK_BITS[pd]
+        ps = _packed_shape(size, pd)
+        packed = torch.empty(ps, dtype=pd, device=device)
+        # Zero the tail word so pad bits are 0 — `torch.empty` for bit1 leaves
+        # live bits undefined but preserves the popcount invariant.
+        if size and size[-1] > 0 and size[-1] % pw != 0 and packed.numel() > 0:
+            packed[..., -1] = 0
+        return _make_bit1_eager(packed, size, pd, device)
     return Tensor._make_plain(torch.empty(size, dtype=dtype, device=device, **kwargs))
 
 
