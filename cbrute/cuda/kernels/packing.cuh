@@ -18,12 +18,12 @@
 
 namespace cbrute { namespace cuda { namespace kernels {
 
-// ──────────────────────────────────────────────────────────────────────────────
+// 
 // pack: one warp per 32-bit chunk per row. Grid: (chunks_per_row, batch).
 // out_bytes is zero-initialized by the caller, so trailing pad bytes
 // (chunk_idx*4 + 4 > row_bytes) and trailing pad bits within the last chunk
 // stay zero.
-// ──────────────────────────────────────────────────────────────────────────────
+// 
 
 __global__ inline void k_pack_bool_warp(const uint8_t* __restrict__ in_bool,
                                         uint8_t* __restrict__ out_bytes,
@@ -75,10 +75,10 @@ __global__ inline void k_pack_float_warp(const float* __restrict__ in_f,
     }
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
+// 
 // unpack: one warp reads one 32-bit chunk, broadcasts to all lanes, each lane
 // writes its own bit-expanded element. Grid: (chunks_per_row, batch).
-// ──────────────────────────────────────────────────────────────────────────────
+// 
 
 __global__ inline void k_unpack_bool_warp(const uint8_t* __restrict__ in_bytes,
                                           uint8_t* __restrict__ out_bool,

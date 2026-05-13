@@ -18,10 +18,8 @@ from tests.helpers import bit1
 from tests.benchmarks._helpers import VECTOR_SCALES, with_sync, set_throughput
 
 
-# ──────────────────────────────────────────────────────────────────────────────
 # Full-tensor popcount: bit1 (packed) vs bool (.long().sum()) — the canonical
 # "is bit packing actually faster" comparison.
-# ──────────────────────────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("n_bits", VECTOR_SCALES)
 def test_bit1_popcount(benchmark, device, n_bits):
@@ -40,9 +38,7 @@ def test_bool_sum(benchmark, device, n_bits):
     benchmark(with_sync(lambda: src.long().sum(), device))
 
 
-# ──────────────────────────────────────────────────────────────────────────────
 # Per-element popcount on the packed buffer (one popcount per uint64 word).
-# ──────────────────────────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("n_bits", VECTOR_SCALES)
 def test_per_element_popcount(benchmark, device, n_bits):
@@ -54,11 +50,9 @@ def test_per_element_popcount(benchmark, device, n_bits):
     benchmark(with_sync(lambda: torch.ops.brute.popcount(pb), device))
 
 
-# ──────────────────────────────────────────────────────────────────────────────
 # Fast-path reductions wired through __torch_function__.
 # These should match the bit1.popcount() throughput exactly — they share the
 # same underlying packed_popcount kernel.
-# ──────────────────────────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("n_bits", VECTOR_SCALES)
 def test_bit1_torch_sum(benchmark, device, n_bits):

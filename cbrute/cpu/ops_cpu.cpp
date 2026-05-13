@@ -51,11 +51,11 @@ constexpr int64_t ROW_GRAIN      = 1;       // per-row workloads (matmul, pack)
 
 } // anon
 
-// ─────────────────────────────────────────────────────────────────────────────
+// 
 // pack_bits — float input, threshold (> 0.f) → packed bits.
 // Legacy path used by `unpack_pm1`-style round-trips and any caller that
 // already has float storage.
-// ─────────────────────────────────────────────────────────────────────────────
+// 
 at::Tensor pack_bits(const at::Tensor& input, int64_t pw) {
     TORCH_CHECK(input.dim() >= 1, "pack_bits: input must have >= 1 dim");
     TORCH_CHECK(pw == 8 || pw == 32 || pw == 64,
@@ -88,10 +88,10 @@ at::Tensor pack_bits(const at::Tensor& input, int64_t pw) {
     return output;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// 
 // pack_bool — bool input → packed bits. Skips the float intermediate that
 // _pack_bool used to materialize in Python.
-// ─────────────────────────────────────────────────────────────────────────────
+// 
 at::Tensor pack_bool(const at::Tensor& input, int64_t pw) {
     TORCH_CHECK(input.dim() >= 1, "pack_bool: input must have >= 1 dim");
     TORCH_CHECK(pw == 8 || pw == 32 || pw == 64,
@@ -125,9 +125,9 @@ at::Tensor pack_bool(const at::Tensor& input, int64_t pw) {
     return output;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// 
 // unpack_bits — packed → float32 ±1.0
-// ─────────────────────────────────────────────────────────────────────────────
+// 
 at::Tensor unpack_bits(const at::Tensor& packed, at::IntArrayRef logical_shape, int64_t pw) {
     TORCH_CHECK(pw == 8 || pw == 32 || pw == 64,
                 "unpack_bits: pack_width must be 8, 32, or 64");
@@ -154,9 +154,9 @@ at::Tensor unpack_bits(const at::Tensor& packed, at::IntArrayRef logical_shape, 
     return output;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// 
 // unpack_bool — packed → bool (1 byte per logical bit, value 0/1)
-// ─────────────────────────────────────────────────────────────────────────────
+// 
 at::Tensor unpack_bool(const at::Tensor& packed, at::IntArrayRef logical_shape, int64_t pw) {
     TORCH_CHECK(pw == 8 || pw == 32 || pw == 64,
                 "unpack_bool: pack_width must be 8, 32, or 64");
@@ -183,10 +183,10 @@ at::Tensor unpack_bool(const at::Tensor& packed, at::IntArrayRef logical_shape, 
     return output;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// 
 // xnor_popcount_matmul — in-register XNOR + PopulationCount + ReduceSum
 // fused inner loop. No scratch buffer; pure register pipeline.
-// ─────────────────────────────────────────────────────────────────────────────
+// 
 at::Tensor xnor_popcount_matmul(const at::Tensor& A, const at::Tensor& B,
                                 int64_t K, int64_t pw) {
     TORCH_CHECK(A.dim() == 2 && B.dim() == 2,
@@ -254,10 +254,10 @@ at::Tensor xnor_popcount_matmul(const at::Tensor& A, const at::Tensor& B,
     return C;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// 
 // popcount — per-element, output is int32 with same shape as input.
 // Supports any integer dtype (incl. bool).
-// ─────────────────────────────────────────────────────────────────────────────
+// 
 at::Tensor popcount(const at::Tensor& x) {
     const auto p = x.contiguous();
     auto out = at::empty(p.sizes(), at::kInt);
@@ -274,30 +274,30 @@ at::Tensor popcount(const at::Tensor& x) {
     return out;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// 
 // packed_popcount — total 1-bit count across the whole buffer as int64 scalar.
 // Treats the buffer as a flat byte stream (dtype-agnostic).
 // Valid for bit1 because pad bits are 0 by construction.
-// ─────────────────────────────────────────────────────────────────────────────
+// 
 at::Tensor packed_popcount(const at::Tensor& x) {
     const auto p = x.contiguous();
     const uint64_t total = hnk::TotalPopcountBytes(p.data_ptr(), (size_t)p.nbytes());
     return at::scalar_tensor((int64_t)total, at::kLong);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// 
 // hamming_distance — per-element popcount(A ^ B). Output int32, broadcasted
 // via torch's TensorIterator (handles shape broadcasting & strides for us).
-// ─────────────────────────────────────────────────────────────────────────────
+// 
 at::Tensor hamming_distance(const at::Tensor& A, const at::Tensor& B) {
     return popcount(at::bitwise_xor(A, B));
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// 
 // bit1_hamming_total — fused total Hamming distance over two identically-
 // shaped & typed packed buffers. No XOR temporary; in-register fusion.
 // Used by torch.equal / != short-circuits in the Python wrapper.
-// ─────────────────────────────────────────────────────────────────────────────
+// 
 at::Tensor bit1_hamming_total(const at::Tensor& A, const at::Tensor& B) {
     TORCH_CHECK(A.sizes()       == B.sizes(),       "bit1_hamming_total: shape mismatch");
     TORCH_CHECK(A.scalar_type() == B.scalar_type(), "bit1_hamming_total: dtype mismatch");
@@ -308,10 +308,10 @@ at::Tensor bit1_hamming_total(const at::Tensor& A, const at::Tensor& B) {
     return at::scalar_tensor((int64_t)total, at::kLong);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// 
 // Bitwise pass-throughs. at:: implementations already SIMD-vectorize on the
 // packed integer buffer, and they handle broadcasting + strides correctly.
-// ─────────────────────────────────────────────────────────────────────────────
+// 
 at::Tensor bitwise_and(const at::Tensor& A, const at::Tensor& B) { return at::bitwise_and(A, B); }
 at::Tensor bitwise_or (const at::Tensor& A, const at::Tensor& B) { return at::bitwise_or (A, B); }
 at::Tensor bitwise_xor(const at::Tensor& A, const at::Tensor& B) { return at::bitwise_xor(A, B); }

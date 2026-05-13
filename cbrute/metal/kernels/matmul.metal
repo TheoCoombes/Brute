@@ -91,7 +91,7 @@ kernel void xnor_u64(
     }
 }
 
-// ── Wide-vector variants ──────────────────────────────────────────────────────
+//  Wide-vector variants 
 // Each simdgroup lane processes 4 (uint32) or 2 (ulong) words per K-iteration,
 // reducing loop-overhead and maximising arithmetic per load instruction.
 // Caller passes Kp4 = Kp/4 (u32) or Kp2 = Kp/2 (u64); Kp must be divisible.
@@ -146,7 +146,7 @@ kernel void xnor_u64_wide(
     }
 }
 
-// ── Threadgroup-tiled matmul ──────────────────────────────────────────────────
+//  Threadgroup-tiled matmul 
 // Each threadgroup computes a (TM × TN) tile of output cells. A-tile and
 // B-tile are loaded collaboratively into threadgroup memory, amortising
 // global-memory bandwidth across TN and TM simdgroups respectively.
@@ -193,7 +193,7 @@ kernel void xnor_u32_tiled(
     for (int k_start = 0; k_start < Kp; k_start += KT) {
         const int k_cnt = min(KT, Kp - k_start);
 
-        // ── Collaborative load ─────────────────────────────────────────────
+        //  Collaborative load 
         // All TM*TN*32 = 256 threads load A_tile (TM*KT ≤ 512 words) and
         // B_tile (TN*KT ≤ 1024 words) in strided loops.
         const int total_threads = TM * TN * 32;
@@ -212,7 +212,7 @@ kernel void xnor_u32_tiled(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // ── Compute from threadgroup memory ───────────────────────────────
+        //  Compute from threadgroup memory 
         // acc is always accumulated so that simd_sum is called uniformly by
         // all 32 threads in the simdgroup — out-of-bounds threads just add 0.
         uint acc = 0u;

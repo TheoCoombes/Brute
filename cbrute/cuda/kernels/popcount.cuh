@@ -20,7 +20,7 @@ namespace cbrute { namespace cuda { namespace kernels {
 
 namespace cg = cooperative_groups;
 
-// ── Per-element popcount ─────────────────────────────────────────────────────
+//  Per-element popcount 
 
 __global__ inline void k_popcnt_u8 (const uint8_t* __restrict__ in,
                                     int32_t* __restrict__ out, int64_t n) {
@@ -43,7 +43,7 @@ __global__ inline void k_popcnt_u64(const uint64_t* __restrict__ in,
     if (i < n) out[i] = __popcll(in[i]);
 }
 
-// ── Block-level reduction helpers (warp shuffle ladder) ──────────────────────
+//  Block-level reduction helpers (warp shuffle ladder) 
 
 __device__ inline uint64_t warp_reduce_sum_u64(uint64_t v) {
     #pragma unroll
@@ -68,10 +68,10 @@ __device__ inline uint64_t block_reduce_sum_u64(uint64_t v) {
     return v;     // valid only on thread 0
 }
 
-// ── Total popcount over a flat byte stream ───────────────────────────────────
+//  Total popcount over a flat byte stream 
 // Each thread processes one uint64 word; blocks reduce locally; one atomicAdd
 // per block. Output is a single uint64 (cast to int64 by caller).
-// ──────────────────────────────────────────────────────────────────────────────
+// 
 
 __global__ inline void k_packed_popcount_total(const uint64_t* __restrict__ in,
                                                int64_t n_words,
@@ -88,7 +88,7 @@ __global__ inline void k_packed_popcount_total(const uint64_t* __restrict__ in,
     }
 }
 
-// ── Total Hamming distance: fused popc(A XOR B) over the buffer ──────────────
+//  Total Hamming distance: fused popc(A XOR B) over the buffer 
 __global__ inline void k_hamming_total(const uint64_t* __restrict__ a,
                                        const uint64_t* __restrict__ b,
                                        int64_t n_words,

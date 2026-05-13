@@ -12,7 +12,7 @@ PYBIND11_MODULE(_cbrute, m) {
     m.doc() = "brute C++ backend — 1-bit tensors on a PyTorch foundation";
 }
 
-// ── Device-agnostic fallbacks ─────────────────────────────────────────────────
+//  Device-agnostic fallbacks 
 //
 // The new ops `pack_bool`, `unpack_bool`, `bit1_hamming_total` ship with native
 // CPU + CUDA kernels but no Metal implementation. Rather than refusing on MPS
@@ -62,9 +62,29 @@ at::Tensor bit1_hamming_total_composite(const at::Tensor& A, const at::Tensor& B
     return popcnt.call(xored).to(at::kLong).sum();
 }
 
+// Pad-safe inversion of a packed bit1 buffer. `~A` over the whole buffer
+// flips the (zero) padding bits in the last word to ones, which would
+// corrupt every popcount/sum/all/any path that trusts pad bits to be 0.
+// We mask the tail word back to the live-bit window before returning.
+at::Tensor bit1_not_packed_composite(const at::Tensor& A,
+                                     int64_t logical_numel, int64_t pack_width) {
+    auto out = at::bitwise_not(A);
+    if (out.numel() == 0 || logical_numel == 0) return out;
+    int64_t valid_bits = logical_numel % pack_width;
+    if (valid_bits == 0) return out;
+    // Mask the final word: keep low `valid_bits` bits, zero the rest.
+    const uint64_t mask = (valid_bits == 64)
+        ? ~uint64_t(0)
+        : ((uint64_t(1) << valid_bits) - 1);
+    auto flat = out.flatten();
+    auto tail = flat.narrow(0, flat.numel() - 1, 1);
+    tail.bitwise_and_(at::scalar_tensor((int64_t)mask, tail.options()));
+    return out;
+}
+
 } // anon
 
-// ── Schema ────────────────────────────────────────────────
+//  Schema 
 TORCH_LIBRARY(brute, m) {
     // packing / unpacking
     m.def("pack_bits(Tensor input, int pack_width) -> Tensor");
@@ -86,18 +106,22 @@ TORCH_LIBRARY(brute, m) {
     m.def("bitwise_or(Tensor A, Tensor B) -> Tensor");
     m.def("bitwise_xor(Tensor A, Tensor B) -> Tensor");
     m.def("bitwise_not(Tensor A) -> Tensor");
+    // pad-safe NOT on the packed buffer of a bit1 tensor: ~A then zero the
+    // padding bits in the final word so packed_popcount / sum remain correct.
+    m.def("bit1_not_packed(Tensor A, int logical_numel, int pack_width) -> Tensor");
 
     m.def("randomize_bits(Tensor(a!) out) -> Tensor(a!)");
 }
 
-// ── Composite (any-backend) fallbacks ─────────────────────
+//  Composite (any-backend) fallbacks 
 TORCH_LIBRARY_IMPL(brute, CompositeExplicitAutograd, m) {
     m.impl("pack_bool",          pack_bool_composite);
     m.impl("unpack_bool",        unpack_bool_composite);
     m.impl("bit1_hamming_total", bit1_hamming_total_composite);
+    m.impl("bit1_not_packed",    bit1_not_packed_composite);
 }
 
-// ── CPU ───────────────────────────────────────────────────
+//  CPU 
 TORCH_LIBRARY_IMPL(brute, CPU, m) {
     m.impl("pack_bits",            cbrute::cpu::pack_bits);
     m.impl("pack_bool",            cbrute::cpu::pack_bool);
@@ -115,7 +139,7 @@ TORCH_LIBRARY_IMPL(brute, CPU, m) {
     m.impl("randomize_bits",       cbrute::cpu::randomize_bits);
 }
 
-// ── Metal/MPS native impls — full op coverage with simdgroup kernels. ─────
+//  Metal/MPS native impls — full op coverage with simdgroup kernels. 
 // The 3 ops previously falling through to CompositeExplicitAutograd
 // (pack_bool, unpack_bool, bit1_hamming_total) now have native MSL kernels.
 #ifdef HAVE_MPS
@@ -137,7 +161,7 @@ TORCH_LIBRARY_IMPL(brute, MPS, m) {
 }
 #endif
 
-// ── CUDA ──────────────────────────────────────────────────
+//  CUDA 
 #ifdef HAVE_CUDA
 TORCH_LIBRARY_IMPL(brute, CUDA, m) {
     m.impl("pack_bits",            cbrute::cuda::pack_bits);

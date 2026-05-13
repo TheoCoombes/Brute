@@ -1,31 +1,24 @@
 # Brute
 
-An ultra-fast, lightweight binary deep learning framework with full PyTorch compatibility.
+An ultra-fast, lightweight binary deep learning framework extension for PyTorch.
 
 ### Features
 
-- Native 1-bit tensors, with an optimised CPU implementation and custom kernels for CUDA/Metal.
-- Built using LibTorch, hence has full PyTorch compatibility and pre-existing hardware optimisations for other dtypes.
-- ...
-
-### Example
-```py
-import brute
-
-x = brute.Tensor([1, 0, 1], dtype=brute.bit1, device='cuda:0')
-y = brute.Tensor([0, 0, 1], dtype=brute.bit1, device='cuda:0')
-
-# XNOR-popcount matmul
-x @ y
->>> brute.Tensor([1, 0, 1], dtype=brute.bit1, device='cuda:0')
-
-# Native popcount
-x.popcount()
->>> 2
-```
+- Native 1-bit tensors, with optimised CPU / CUDA / Apple Silicon kernels.
+- Complete Torch backwards compatibility, `brute.Tensor` inherits from `torch.Tensor` and keeps all existing data types / hardware optimisations.
+- Native binary support for `autograd`.
+- Implementations of some recent BNN papers, including BOLD.
 
 ## Installation
 
 ```bash
+pip install brute
+```
+
+### From Source
+
+```bash
+git clone https://github.com/TheoCoombes/Brute.git
+cd Brute
 pip install --no-build-isolation -ve .
 ```

@@ -14,7 +14,7 @@ import torch
 import pytest
 
 
-# ── Scales for 1-D vector / flat-buffer benchmarks ───────────────────────────
+# Scales for 1-D vector / flat-buffer benchmarks 
 # Counted in logical bits. Ranges chosen to span:
 #   tiny   – kernel-launch / dispatch overhead dominates
 #   small  – L2 resident
@@ -30,7 +30,7 @@ VECTOR_SCALES = [
 ]
 
 
-# ── Scales for 2-D matrices (rows × cols), bool/bit1 elementwise ─────────────
+# Scales for 2-D matrices (rows × cols), bool/bit1 elementwise 
 MATRIX_SCALES = [
     pytest.param((128,  128),  id="01_tiny"),
     pytest.param((512,  512),  id="02_small"),
@@ -40,7 +40,7 @@ MATRIX_SCALES = [
 ]
 
 
-# ── Scales for matmul: (M, K, N) — K stresses the inner dim ─────────────────
+# Scales for matmul: (M, K, N) — K stresses the inner dim 
 MATMUL_SCALES = [
     pytest.param((128,  128,  128),   id="01_tiny"),
     pytest.param((256,  512,  256),   id="02_small"),
@@ -50,7 +50,7 @@ MATMUL_SCALES = [
 ]
 
 
-# ── Device sync helpers ───────────────────────────────────────────────────────
+# Device sync helpers 
 
 def sync(device: str) -> None:
     """Block on the current device. Required to actually time GPU kernels."""
@@ -71,14 +71,14 @@ def with_sync(fn, device: str):
     return _run
 
 
-# ── Throughput helper ─────────────────────────────────────────────────────────
+# Throughput helper 
 
 def set_throughput(benchmark, n_elems: int, label: str = "elems/s") -> None:
     """Attach a throughput metric to the benchmark for easier comparison."""
     benchmark.extra_info[label] = n_elems
 
 
-# ── Scale guards ─────────────────────────────────────────────────────────────
+# Scale guards 
 
 def skip_if_mps_composite(device: str) -> None:  # noqa: ARG001
     """Historical guard for the pre-overhaul MPS path. After the Apple

@@ -23,8 +23,57 @@ _ALL_FUNCS   = frozenset([torch.all, torch.Tensor.all])
 _ANY_FUNCS   = frozenset([torch.any, torch.Tensor.any])
 _EQUAL_FUNCS = frozenset([torch.equal])
 
+# Functional/method forms of binary bitwise & logical ops — `__and__`/etc. dunders
+# are dispatched directly to our `Tensor.__and__` override, but the functional
+# forms (`torch.bitwise_and`, `torch.logical_and`, `tensor.bitwise_and(...)`)
+# come through `__torch_function__` and need their own packed fast path.
+_BITWISE_BIN_FAST = {
+    torch.bitwise_and:        'bitwise_and',
+    torch.bitwise_or:         'bitwise_or',
+    torch.bitwise_xor:        'bitwise_xor',
+    torch.logical_and:        'bitwise_and',
+    torch.logical_or:         'bitwise_or',
+    torch.logical_xor:        'bitwise_xor',
+    torch.Tensor.bitwise_and: 'bitwise_and',
+    torch.Tensor.bitwise_or:  'bitwise_or',
+    torch.Tensor.bitwise_xor: 'bitwise_xor',
+    torch.Tensor.logical_and: 'bitwise_and',
+    torch.Tensor.logical_or:  'bitwise_or',
+    torch.Tensor.logical_xor: 'bitwise_xor',
+}
+_BITWISE_NOT_FAST = frozenset([
+    torch.bitwise_not, torch.logical_not,
+    torch.Tensor.bitwise_not, torch.Tensor.logical_not,
+])
 
-# ── Internal helpers ───────────────────────────────────────────────────────────
+# Functions that only read tensor METADATA (shape/dim/dtype/device/etc.) and
+# never the bool storage. We can skip `_ensure_bool_valid` for these — saving
+# a full unpack on every metadata access for lazy-bool tensors.
+#
+# Property getters appear as the descriptor's `__get__` method-wrapper, so we
+# unwrap them with `getattr(prop, '__get__', prop)`.
+def _metadata_get(name: str):
+    prop = getattr(torch.Tensor, name, None)
+    return getattr(prop, '__get__', prop) if prop is not None else None
+
+_BOOL_FREE_FUNCS = frozenset(
+    f for f in [
+        _metadata_get('shape'),    _metadata_get('ndim'),
+        _metadata_get('dtype'),    _metadata_get('device'),
+        _metadata_get('layout'),   _metadata_get('requires_grad'),
+        _metadata_get('_version'),
+        _metadata_get('is_cuda'),  _metadata_get('is_mps'),
+        _metadata_get('is_cpu'),   _metadata_get('is_leaf'),
+        torch.Tensor.dim, torch.Tensor.numel, torch.Tensor.size,
+        torch.Tensor.stride, torch.Tensor.storage_offset,
+        torch.Tensor.is_contiguous,
+        torch.Tensor.__len__,
+        torch.numel,
+    ] if f is not None
+)
+
+
+# Internal helpers 
 
 def _to_bool(t: torch.Tensor) -> torch.Tensor:
     """Cast any tensor to bool (>0 for floats, standard .bool() otherwise)."""
@@ -67,7 +116,7 @@ def _rebuild_brute_tensor(plain_tensor: torch.Tensor, is_bit1: bool = False, pac
 if hasattr(torch.serialization, "add_safe_globals"):
     torch.serialization.add_safe_globals([_rebuild_brute_tensor])
 
-# ── Tensor ─────────────────────────────────────────────────────────────────────
+# Tensor 
 
 class Tensor(torch.Tensor):
     """
@@ -86,7 +135,7 @@ class Tensor(torch.Tensor):
     For all other dtypes: transparent thin wrapper; every result stays in brute.
     """
 
-    # ── Construction ────────────────────────────────────────────────────────────
+    # Construction 
 
     @staticmethod
     def __new__(
@@ -156,13 +205,14 @@ class Tensor(torch.Tensor):
     @classmethod
     def _make_bit1_from_packed(cls, packed: torch.Tensor, logical_shape: list,
                                pack_dtype: torch.dtype) -> 'Tensor':
-        """Create a bit1 tensor from a pre-computed packed buffer.
+        """Create a bit1 tensor from a pre-computed packed buffer (lazy bool).
 
-        Unpacks once to get valid bool backing storage, then pre-warms the
-        packed cache so the first _packed_buf access doesn't re-pack.
-        Saves one pack_bool call vs _make_bit1 when the packed data already exists.
+        The bool backing storage is allocated uninitialised — it is *not* a
+        valid view of the bit1 contents. The packed buffer is the source of
+        truth until `_ensure_bool_valid()` is called (lazily, from
+        `__torch_function__` and any explicit bool-view accessor).
         """
-        bool_t = torch.ops.brute.unpack_bool(packed, logical_shape, _PACK_BITS[pack_dtype])
+        bool_t = torch.empty(logical_shape, dtype=torch.bool, device=packed.device)
         instance = bool_t.as_subclass(cls)
         instance._is_bit1    = True
         instance._pack_dtype = pack_dtype
@@ -171,9 +221,38 @@ class Tensor(torch.Tensor):
             instance.__dict__['_packed_ver'] = instance._version
         except Exception:
             instance.__dict__['_packed_ver'] = None
+        instance.__dict__['_bool_dirty'] = True
         return instance
 
-    # ── Properties ──────────────────────────────────────────────────────────────
+    def _ensure_bool_valid(self) -> None:
+        """Materialise the bool backing storage from the packed buffer.
+
+        No-op if `_bool_dirty` is False (the common case after construction
+        via `_make_bit1`). Called automatically from `__torch_function__` and
+        any path that exposes the bool view to PyTorch ops or user code.
+
+        Runs inside `DisableTorchFunctionSubclass`: attribute accesses on
+        `self` (e.g. `.shape`, `._version`) would otherwise re-enter
+        `__torch_function__` and recurse back here.
+        """
+        if not self.__dict__.get('_bool_dirty', False):
+            return
+        packed = self.__dict__.get('_packed_buf_cache')
+        if packed is None:
+            self.__dict__['_bool_dirty'] = False
+            return
+        with torch._C.DisableTorchFunctionSubclass():
+            shape = list(self.shape)
+            unpacked = torch.ops.brute.unpack_bool(
+                packed, shape, _PACK_BITS[self._pack_dtype])
+            # `copy_` bumps the storage version; immediately re-pin `_packed_ver`
+            # to the new version so the packed cache stays valid in the getter.
+            self.as_subclass(torch.Tensor).copy_(unpacked)
+            ver = self._version
+        self.__dict__['_bool_dirty'] = False
+        self.__dict__['_packed_ver'] = ver
+
+    # Properties 
 
     @property
     def dtype(self):
@@ -194,8 +273,14 @@ class Tensor(torch.Tensor):
         in-place (detected via PyTorch's per-storage version counter).  This makes
         in-place ops such as fill_(), copy_(), index_put_(), and __setitem__
         automatically correct without needing per-op overrides.
+
+        When `_bool_dirty` is set (after a packed-output op produced this tensor
+        without unpacking) the cache is the *only* valid source — the version
+        counter would re-pack from invalid bool storage, so we skip it.
         """
         if not getattr(self, '_is_bit1', False):
+            return self.__dict__.get('_packed_buf_cache')
+        if self.__dict__.get('_bool_dirty', False):
             return self.__dict__.get('_packed_buf_cache')
         cache = self.__dict__.get('_packed_buf_cache')
         try:
@@ -219,7 +304,7 @@ class Tensor(torch.Tensor):
         else:
             self.__dict__.pop('_packed_ver', None)
 
-    # ── element_size ──────────────────────────────────────────────────────────────
+    # element_size 
 
     def element_size(self) -> int:
         if getattr(self, '_is_bit1', False):
@@ -253,10 +338,12 @@ class Tensor(torch.Tensor):
             if getattr(self, '_is_bit1', False):
                 return 'brute.Bit1Tensor'
             return super().type()
+        if getattr(self, '_is_bit1', False):
+            self._ensure_bool_valid()
         result = self.as_subclass(torch.Tensor).type(dtype, non_blocking=non_blocking, **kwargs)
         return Tensor._make_plain(result)
 
-    # ── Factory methods (preserve bit1 dtype) ───────────────────────────────────
+    # Factory methods (preserve bit1 dtype) 
 
     def new_tensor(self, data, *, dtype=None, device=None, **kwargs) -> Tensor:
         """Create a new tensor from *data* with the same dtype/device as self by default."""
@@ -313,7 +400,7 @@ class Tensor(torch.Tensor):
             return Tensor._make_bit1(bool_t, pd)
         return Tensor._make_plain(base.new_zeros(size, dtype=dtype, device=device, **kwargs))
 
-    # ── Conversion ──────────────────────────────────────────────────────────────
+    # Conversion 
 
     def bool(self) -> Tensor:
         """
@@ -322,10 +409,10 @@ class Tensor(torch.Tensor):
         For bit1: wraps the underlying bool storage as a plain brute.Tensor.
         For other dtypes: casts elements to bool and wraps.
         """
-        base = self.as_subclass(torch.Tensor)
         if getattr(self, '_is_bit1', False):
-            return Tensor._make_plain(base)
-        return Tensor._make_plain(base.bool())
+            self._ensure_bool_valid()
+            return Tensor._make_plain(self.as_subclass(torch.Tensor))
+        return Tensor._make_plain(self.as_subclass(torch.Tensor).bool())
 
     def to(self, *args, **kwargs) -> Tensor:
         # Extract brute-specific pack_dtype before forwarding to torch.
@@ -340,6 +427,8 @@ class Tensor(torch.Tensor):
                     break
 
         if isinstance(dtype_arg, _Bit1DType):
+            if getattr(self, '_is_bit1', False):
+                self._ensure_bool_valid()
             base = self.as_subclass(torch.Tensor)
             if not getattr(self, '_is_bit1', False):
                 base = _to_bool(base)
@@ -363,6 +452,7 @@ class Tensor(torch.Tensor):
                     if isinstance(a, torch.dtype):
                         explicit_dtype = a
                         break
+            self._ensure_bool_valid()
             new_base = self.as_subclass(torch.Tensor).to(*args, **kwargs)
             if explicit_dtype is None and new_base.dtype == torch.bool:
                 # Device-only / format-only conversion — preserve bit1.
@@ -377,7 +467,7 @@ class Tensor(torch.Tensor):
             raise TypeError("unpack_pm1() is only valid for bit1 tensors")
         return _unpack_pm1(self._packed_buf, list(self.shape), self._pack_dtype)
 
-    # ── Binary ops on packed buffers ─────────────────────────────────────────────
+    # Binary ops on packed buffers 
     # For same-shape bit1 tensors we operate directly on the packed integer
     # buffers — XOR/AND/OR of two identically-packed buffers gives the correct
     # packed result because the pad bits are 0 in both operands:
@@ -424,11 +514,33 @@ class Tensor(torch.Tensor):
         return super().__xor__(other)
 
     def __invert__(self):
-        # Invert on packed buffer would flip pad bits (0→1), corrupting popcount.
-        # Use bool NOT on the underlying storage and repack — one pass, correct.
+        # Operate directly on the packed buffer: ~A then mask the pad bits in
+        # the tail word so popcount/sum stay correct. The bool view stays
+        # lazy — never materialised unless a non-bitwise op demands it.
         if getattr(self, '_is_bit1', False):
-            return Tensor._make_bit1(~self.as_subclass(torch.Tensor), self._pack_dtype)
+            new_packed = torch.ops.brute.bit1_not_packed(
+                self._packed_buf, self.numel(), _PACK_BITS[self._pack_dtype],
+            )
+            return Tensor._make_bit1_from_packed(
+                new_packed, list(self.shape), self._pack_dtype,
+            )
         return super().__invert__()
+
+    def _iop_packed(self, other, op):
+        """Shared body for __iand__/__ior__/__ixor__.
+
+        Updates only the packed cache and marks bool dirty — the bool view is
+        materialised lazily on next access. This avoids the unpack+copy that
+        previously dominated in-place bitwise cost.
+        """
+        new_packed = op(self._packed_buf, other._packed_buf)
+        self.__dict__['_packed_buf_cache'] = new_packed
+        self.__dict__['_bool_dirty'] = True
+        try:
+            self.__dict__['_packed_ver'] = self._version
+        except Exception:
+            self.__dict__['_packed_ver'] = None
+        return self
 
     def __iand__(self, other):
         if (getattr(self, '_is_bit1', False)
@@ -437,12 +549,7 @@ class Tensor(torch.Tensor):
                 and self.shape == other.shape
                 and self._pack_dtype == other._pack_dtype
                 and self.dim() >= 1):
-            new_packed = torch.ops.brute.bitwise_and(self._packed_buf, other._packed_buf)
-            new_bool = torch.ops.brute.unpack_bool(
-                new_packed, list(self.shape), _PACK_BITS[self._pack_dtype])
-            self.as_subclass(torch.Tensor).copy_(new_bool)
-            self._packed_buf = new_packed
-            return self
+            return self._iop_packed(other, torch.ops.brute.bitwise_and)
         return super().__iand__(other)
 
     def __ior__(self, other):
@@ -452,12 +559,7 @@ class Tensor(torch.Tensor):
                 and self.shape == other.shape
                 and self._pack_dtype == other._pack_dtype
                 and self.dim() >= 1):
-            new_packed = torch.ops.brute.bitwise_or(self._packed_buf, other._packed_buf)
-            new_bool = torch.ops.brute.unpack_bool(
-                new_packed, list(self.shape), _PACK_BITS[self._pack_dtype])
-            self.as_subclass(torch.Tensor).copy_(new_bool)
-            self._packed_buf = new_packed
-            return self
+            return self._iop_packed(other, torch.ops.brute.bitwise_or)
         return super().__ior__(other)
 
     def __ixor__(self, other):
@@ -467,13 +569,85 @@ class Tensor(torch.Tensor):
                 and self.shape == other.shape
                 and self._pack_dtype == other._pack_dtype
                 and self.dim() >= 1):
-            new_packed = torch.ops.brute.bitwise_xor(self._packed_buf, other._packed_buf)
-            new_bool = torch.ops.brute.unpack_bool(
-                new_packed, list(self.shape), _PACK_BITS[self._pack_dtype])
-            self.as_subclass(torch.Tensor).copy_(new_bool)
-            self._packed_buf = new_packed
-            return self
+            return self._iop_packed(other, torch.ops.brute.bitwise_xor)
         return super().__ixor__(other)
+
+    # Indexing fast paths (leading-axis only) 
+    # `x[i]`, `x[a:b]`, `x[i] = scalar`, `x[a:b] = scalar` on a bit1 tensor of
+    # dim >= 2 can be served by slicing the packed buffer directly — rows are
+    # contiguous in packed storage. The last axis (packed axis) requires bit
+    # gather/scatter and falls through to the bool path.
+
+    def _leading_axis_fast(self, idx) -> bool:
+        """True iff `idx` only touches axes other than the last (packed) axis."""
+        if not getattr(self, '_is_bit1', False) or self.dim() < 2:
+            return False
+        if isinstance(idx, int):
+            return True
+        if isinstance(idx, slice):
+            # Reject negative step; need contiguous packed slice.
+            return (idx.step is None or idx.step == 1)
+        return False
+
+    def __getitem__(self, idx):
+        if self._leading_axis_fast(idx):
+            packed = self._packed_buf
+            sub = packed[idx]
+            # `x[int]` drops the leading axis; `x[slice]` keeps it.
+            new_shape = list(self.shape[1:]) if isinstance(idx, int) else \
+                        [sub.shape[0]] + list(self.shape[1:])
+            if not isinstance(sub, torch.Tensor) or sub.numel() == 0:
+                # Empty or unexpected — fall through to safe path.
+                return super().__getitem__(idx)
+            return Tensor._make_bit1_from_packed(
+                sub.contiguous(), new_shape, self._pack_dtype,
+            )
+        return super().__getitem__(idx)
+
+    def _row_pattern(self, value: bool) -> torch.Tensor:
+        """One row of packed words representing `value` across the last dim.
+
+        For `True`: all live bits set, pad bits zero.
+        For `False`: all bits zero.
+        """
+        pw     = _PACK_BITS[self._pack_dtype]
+        K      = int(self.shape[-1])
+        n_words = (K + pw - 1) // pw
+        valid_bits = K % pw
+        # Always materialise via the packed cache so dtype/device match exactly.
+        ref = self._packed_buf
+        row = torch.zeros(n_words, dtype=ref.dtype, device=ref.device)
+        if not value:
+            return row
+        # ~0 in the unsigned dtype: pre-zero then bitwise_not_ avoids the
+        # uint64-overflow issue when passing 2**64-1 as a Python int.
+        row.bitwise_not_()
+        if valid_bits != 0:
+            mask = (1 << valid_bits) - 1
+            row[-1] = mask
+        return row
+
+    def __setitem__(self, idx, value):
+        # Fast path: scalar bool value on a leading axis. Mutates the packed
+        # buffer directly and marks bool dirty; the bool view is unpacked
+        # lazily on next read.
+        if (self._leading_axis_fast(idx)
+                and isinstance(value, (bool, int))):
+            pb = self._packed_buf
+            row = self._row_pattern(bool(value))
+            if isinstance(idx, int):
+                pb[idx].copy_(row)
+            else:
+                # slice — broadcast the row into every selected row.
+                pb[idx].copy_(row.unsqueeze(0).expand(pb[idx].shape[0], -1))
+            self.__dict__['_packed_buf_cache'] = pb
+            self.__dict__['_bool_dirty'] = True
+            try:
+                self.__dict__['_packed_ver'] = self._version
+            except Exception:
+                self.__dict__['_packed_ver'] = None
+            return
+        return super().__setitem__(idx, value)
 
     def popcount(self) -> Tensor:
         """
@@ -531,19 +705,30 @@ class Tensor(torch.Tensor):
     def randomize_(self) -> 'Tensor':
         """Fill this bit1 tensor with uniformly random bits, in place.
 
-        Uses the backend's fast randomize_bits kernel on the packed buffer, then
-        syncs back to the bool backing storage.
+        Operates directly on the packed buffer; bool view is marked dirty and
+        unpacked lazily on first access.
         """
         if not getattr(self, '_is_bit1', False):
             raise TypeError("randomize_() is only defined for bit1 tensors")
         pb = self._packed_buf.clone()
         torch.ops.brute.randomize_bits(pb)
-        new_bool = torch.ops.brute.unpack_bool(pb, list(self.shape), _PACK_BITS[self._pack_dtype])
-        self.as_subclass(torch.Tensor).copy_(new_bool)
-        self._packed_buf = pb
+        # Mask off pad bits so packed_popcount / sum etc. stay correct.
+        pw = _PACK_BITS[self._pack_dtype]
+        numel = self.numel()
+        valid_bits = numel % pw
+        if valid_bits != 0 and pb.numel() > 0:
+            mask = (1 << valid_bits) - 1
+            flat = pb.flatten()
+            flat[-1] = flat[-1] & mask
+        self.__dict__['_packed_buf_cache'] = pb
+        self.__dict__['_bool_dirty'] = True
+        try:
+            self.__dict__['_packed_ver'] = self._version
+        except Exception:
+            self.__dict__['_packed_ver'] = None
         return self
 
-    # ── Transpose (preserves _t_source for fast A @ B.t() matmul) ───────────────
+    # Transpose (preserves _t_source for fast A @ B.t() matmul) 
 
     def t(self) -> 'Tensor':
         """2-D transpose preserving bit1 dtype and enabling the A @ B.t() fast path.
@@ -552,6 +737,13 @@ class Tensor(torch.Tensor):
         __matmul__ can read self's packed buffer (N×K form) instead of repacking
         the transposed K×N tensor, which would break the xnor_popcount_matmul layout.
         """
+        if getattr(self, '_is_bit1', False):
+            # The transpose returns a *view* of self's bool storage. If we're
+            # still dirty, that view would be invalid; force materialisation
+            # before slicing. Note: matmul against t() goes through _t_source
+            # and reads self._packed_buf directly, which is dirty-safe — but
+            # any other code touching the transposed bool view needs valid data.
+            self._ensure_bool_valid()
         base   = self.as_subclass(torch.Tensor)
         result = base.t()
         if not getattr(self, '_is_bit1', False):
@@ -564,7 +756,7 @@ class Tensor(torch.Tensor):
             t_inst.__dict__['_t_source'] = self
         return t_inst
 
-    # ── Matmul ──────────────────────────────────────────────────────────────────
+    # Matmul 
 
     def __matmul__(self, other):
         if (getattr(self, '_is_bit1', False)
@@ -600,7 +792,7 @@ class Tensor(torch.Tensor):
 
         return super().__matmul__(other)
 
-    # ── __torch_function__ ──────────────────────────────────────────────────────
+    # __torch_function__ 
 
     @classmethod
     def __torch_function__(cls, func, types, args=(), kwargs=None):
@@ -690,6 +882,74 @@ class Tensor(torch.Tensor):
                         a._packed_buf, b._packed_buf
                     ).item() == 0
 
+            # torch.bitwise_*(a, b) / torch.logical_*(a, b) and the equivalent
+            # Tensor methods. Identical shape + pack_dtype → operate on packed.
+            if func in _BITWISE_BIN_FAST and len(bit1_ins) >= 2:
+                a, b = bit1_ins[0], bit1_ins[1]
+                if (a.shape == b.shape
+                        and a._pack_dtype == b._pack_dtype
+                        and a.dim() >= 1):
+                    op_name = _BITWISE_BIN_FAST[func]
+                    op_fn = getattr(torch.ops.brute, op_name)
+                    return Tensor._make_bit1_from_packed(
+                        op_fn(a._packed_buf, b._packed_buf),
+                        list(a.shape), a._pack_dtype,
+                    )
+
+            # torch.bitwise_not(a) / torch.logical_not(a) — pad-safe packed NOT.
+            # 0-dim scalars fall through to the bool path (the lazy-bool
+            # unpack helper requires dim >= 1).
+            if func in _BITWISE_NOT_FAST and len(bit1_ins) == 1 \
+                    and bit1_ins[0].dim() >= 1:
+                a = bit1_ins[0]
+                return Tensor._make_bit1_from_packed(
+                    torch.ops.brute.bit1_not_packed(
+                        a._packed_buf, a.numel(), _PACK_BITS[a._pack_dtype]
+                    ),
+                    list(a.shape), a._pack_dtype,
+                )
+
+            # torch.eq(a, b) / a == b — bit1-bit1 same shape. Equivalent to
+            # ~(a ^ b): a single packed XOR then a pad-masked NOT.
+            if func in (torch.eq, torch.Tensor.eq, torch.Tensor.__eq__) \
+                    and len(bit1_ins) >= 2:
+                a, b = bit1_ins[0], bit1_ins[1]
+                if (a.shape == b.shape
+                        and a._pack_dtype == b._pack_dtype
+                        and a.dim() >= 1):
+                    xored = torch.ops.brute.bitwise_xor(a._packed_buf, b._packed_buf)
+                    inverted = torch.ops.brute.bit1_not_packed(
+                        xored, a.numel(), _PACK_BITS[a._pack_dtype],
+                    )
+                    return Tensor._make_bit1_from_packed(
+                        inverted, list(a.shape), a._pack_dtype,
+                    )
+
+            # torch.ne(a, b) / a != b — bit1-bit1 same shape. Identical to XOR.
+            if func in (torch.ne, torch.Tensor.ne, torch.Tensor.__ne__) \
+                    and len(bit1_ins) >= 2:
+                a, b = bit1_ins[0], bit1_ins[1]
+                if (a.shape == b.shape
+                        and a._pack_dtype == b._pack_dtype
+                        and a.dim() >= 1):
+                    return Tensor._make_bit1_from_packed(
+                        torch.ops.brute.bitwise_xor(a._packed_buf, b._packed_buf),
+                        list(a.shape), a._pack_dtype,
+                    )
+
+        # No fast path matched — we are about to expose the bit1 inputs as
+        # torch.Tensor bool views to the generic fallback. Any input that was
+        # produced via `_make_bit1_from_packed` (lazy bool) must materialise
+        # its bool storage now, otherwise the underlying op would read garbage.
+        #
+        # Skip this for pure-metadata ops (`.shape`, `.dim()`, `.dtype`, ...)
+        # which never touch bool data — paying a full unpack on every shape
+        # access would be absurd.
+        if func not in _BOOL_FREE_FUNCS:
+            for inp in bit1_ins:
+                if inp.__dict__.get('_bool_dirty', False):
+                    inp._ensure_bool_valid()
+
         def _unwrap(x):
             return x.as_subclass(torch.Tensor) if isinstance(x, Tensor) else x
 
@@ -733,7 +993,7 @@ class Tensor(torch.Tensor):
             return type(result)(_rewrap(r) for r in result)
         return result
 
-    # ── Serialisation ────────────────────────────────────────────────────────────
+    # Serialisation 
 
     def __deepcopy__(self, memo):
         new_t = super().__deepcopy__(memo)
@@ -746,7 +1006,10 @@ class Tensor(torch.Tensor):
 
     def __reduce_ex__(self, _):
         """Tells pickle how to serialize and reconstruct this subclass."""
-        # Demote to plain tensor to prevent infinite recursion during serialization
+        # Demote to plain tensor to prevent infinite recursion during serialization.
+        # Pickled state must be self-contained, so we materialise the bool view.
+        if getattr(self, '_is_bit1', False):
+            self._ensure_bool_valid()
         plain_t = self.as_subclass(torch.Tensor)
         return (
             _rebuild_brute_tensor,
@@ -755,21 +1018,25 @@ class Tensor(torch.Tensor):
 
     def __array__(self, dtype=None, copy=None):
         """NumPy 2.0+ interop hook."""
+        if getattr(self, '_is_bit1', False):
+            self._ensure_bool_valid()
         base_t = self.as_subclass(torch.Tensor)
-        
+
         # For bit1, base_t is already torch.bool storage, so just convert to numpy natively
         arr = base_t.numpy(force=True)
-            
+
         if dtype is not None:
             return arr.astype(dtype, copy=copy if copy is not None else False)
         if copy:
             return arr.copy()
         return arr
-    
+
     def __tensor_flatten__(self):
         """Tells torch.compile how to extract standard tensors from this subclass."""
         # AOTAutograd needs string attribute names to extract tensors.
         # Since we use .as_subclass(), we temporarily attach the plain tensor data.
+        if getattr(self, '_is_bit1', False):
+            self._ensure_bool_valid()
         self._base_data = self.as_subclass(torch.Tensor)
         
         tensor_attrs = ["_base_data"]
@@ -807,9 +1074,11 @@ class Tensor(torch.Tensor):
             
         return instance
 
-    # ── Repr ─────────────────────────────────────────────────────────────────────
+    # Repr 
 
     def __repr__(self):
+        if getattr(self, '_is_bit1', False):
+            self._ensure_bool_valid()
         base = self.as_subclass(torch.Tensor).__repr__()
         if getattr(self, '_is_bit1', False):
             if 'dtype=torch.bool' in base:

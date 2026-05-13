@@ -12,7 +12,7 @@ import torch
 from brute.tensor import Tensor, _Bit1DType, resolve_pack_dtype, bit1
 
 
-# ── Internal normaliser ───────────────────────────────────────────────────────
+# Internal normaliser 
 
 def _norm_size(size) -> tuple:
     """Accept zeros(2,3), zeros((2,3)), or zeros([2,3])."""
@@ -21,7 +21,7 @@ def _norm_size(size) -> tuple:
     return size
 
 
-# ── Creators: bit1-aware ──────────────────────────────────────────────────────
+# Creators: bit1-aware 
 
 def zeros(*size, dtype=None, device=None, pack_dtype: torch.dtype = torch.uint8, **kwargs) -> Tensor:
     size = _norm_size(size)
@@ -82,7 +82,7 @@ def from_numpy(ndarray) -> Tensor:
     return Tensor._make_plain(torch.from_numpy(ndarray))
 
 
-# ── Random creators ───────────────────────────────────────────────────────────
+# Random creators 
 
 def rand(*size, dtype=None, device=None, pack_dtype: torch.dtype = torch.uint8,
          generator=None, **kwargs) -> Tensor:
@@ -187,7 +187,7 @@ def empty_like(input: Tensor, *, dtype=None, device=None,
     ))
 
 
-# ── Arange / linspace / eye ───────────────────────────────────────────────────
+# Arange / linspace / eye 
 
 def arange(start, end=None, step=1, *, dtype=None, device=None, **kwargs) -> Tensor:
     if end is None:
@@ -205,7 +205,7 @@ def eye(n, m=None, *, dtype=None, device=None, **kwargs) -> Tensor:
     return Tensor._make_plain(torch.eye(n, m, dtype=dtype, device=device, **kwargs))
 
 
-# ── Re-exports: work correctly via __torch_function__ ─────────────────────────
+# Re-exports: work correctly via __torch_function__ 
 # All of the ops below unwrap brute.Tensor inputs to their bool/underlying base,
 # execute the standard torch op, and re-wrap results (including bit1 promotion)
 # via brute.Tensor.__torch_function__. No custom implementation is needed.

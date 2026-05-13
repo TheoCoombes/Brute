@@ -15,7 +15,7 @@ HWY_BEFORE_NAMESPACE();
 namespace cbrute { namespace cpu { namespace HWY_NAMESPACE {
 namespace hn = hwy::HWY_NAMESPACE;
 
-// ── Word-level bitwise ─────────────────────────────────────────────────────────
+//  Word-level bitwise 
 // Templated on the storage word type T ∈ {uint8_t, uint32_t, uint64_t}.
 
 template <typename T>

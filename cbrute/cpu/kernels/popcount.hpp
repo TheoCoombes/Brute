@@ -23,7 +23,7 @@ HWY_BEFORE_NAMESPACE();
 namespace cbrute { namespace cpu { namespace HWY_NAMESPACE {
 namespace hn = hwy::HWY_NAMESPACE;
 
-// ── Bulk popcount: total set-bit count over a contiguous byte range ─────────
+//  Bulk popcount: total set-bit count over a contiguous byte range 
 // Vector accumulator with ReduceSum at the end — single pass, no intermediate
 // XOR/AND buffer required from the caller.
 HWY_ATTR inline uint64_t TotalPopcountBytes(const void* HWY_RESTRICT bytes,
@@ -88,7 +88,7 @@ HWY_ATTR inline uint64_t TotalPopcountXor(const void* HWY_RESTRICT a_bytes,
     return total;
 }
 
-// ── Per-element popcount: input is T-typed words, output is int32 counts ──────
+//  Per-element popcount: input is T-typed words, output is int32 counts 
 //
 // We use scalar __builtin_popcountll per word. Hardware POPCNT / NEON CNT are
 // single-cycle and the compiler vectorizes well; Highway's PopulationCount
@@ -102,7 +102,7 @@ HWY_ATTR void PopcountPerWord(const T* HWY_RESTRICT in, int32_t* HWY_RESTRICT ou
     }
 }
 
-// ── Hamming weight check: returns true iff buffer has any set bit ────────────
+//  Hamming weight check: returns true iff buffer has any set bit 
 HWY_ATTR inline bool AnyBitsSetBytes(const void* HWY_RESTRICT bytes, size_t n_bytes) {
     if (n_bytes == 0) return false;
     const hn::ScalableTag<uint64_t> d;

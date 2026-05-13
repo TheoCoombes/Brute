@@ -18,7 +18,7 @@ except ImportError:
 
 from brute.tensor import Tensor, bit1
 
-# ── dtypes ────────────────────────────────────────────────────────────────────
+# dtypes 
 bool            = _t.bool
 float32         = _t.float32
 float64         = _t.float64
@@ -37,7 +37,7 @@ complex128      = _t.complex128
 float8_e4m3fn   = _t.float8_e4m3fn
 float8_e5m2     = _t.float8_e5m2
 
-# ── Factory / creator functions ───────────────────────────────────────────────
+# Factory / creator functions 
 from brute.functional import (
     # Bit1-aware creators
     zeros, ones, empty, full,
@@ -49,7 +49,7 @@ from brute.functional import (
     arange, linspace, eye,
 )
 
-# ── Reductions ────────────────────────────────────────────────────────────────
+# Reductions 
 from brute.functional import (
     all, any, sum, max, min, mean, prod,
     amax, amin, aminmax,
@@ -58,10 +58,10 @@ from brute.functional import (
     nansum, nanmean, logsumexp,
 )
 
-# ── Combining / stacking ──────────────────────────────────────────────────────
+# Combining / stacking 
 from brute.functional import cat, stack
 
-# ── Shape manipulation ────────────────────────────────────────────────────────
+# Shape manipulation 
 from brute.functional import (
     reshape, flatten, squeeze, unsqueeze,
     permute, transpose, t,
@@ -71,35 +71,35 @@ from brute.functional import (
     atleast_1d, atleast_2d, atleast_3d,
 )
 
-# ── Splitting ─────────────────────────────────────────────────────────────────
+# Splitting 
 from brute.functional import (
     split, chunk, unbind, tensor_split,
     hsplit, vsplit, dsplit,
 )
 
-# ── Clone / detach ────────────────────────────────────────────────────────────
+# Clone / detach 
 from brute.functional import clone, detach
 
-# ── Logical (bit1-relevant) ───────────────────────────────────────────────────
+# Logical (bit1-relevant) 
 from brute.functional import (
     where,
     logical_and, logical_or, logical_xor, logical_not,
 )
 
-# ── Bitwise ───────────────────────────────────────────────────────────────────
+# Bitwise 
 from brute.functional import (
     bitwise_and, bitwise_or, bitwise_xor, bitwise_not,
     bitwise_left_shift, bitwise_right_shift,
 )
 
-# ── Comparison ────────────────────────────────────────────────────────────────
+# Comparison 
 from brute.functional import (
     eq, ne, lt, le, gt, ge,
     equal, allclose, isclose,
     isnan, isinf, isfinite, isneginf, isposinf,
 )
 
-# ── Arithmetic ────────────────────────────────────────────────────────────────
+# Arithmetic 
 from brute.functional import (
     add, sub, mul, div, divide,
     neg, negative, abs, absolute,
@@ -108,38 +108,38 @@ from brute.functional import (
     pow, sqrt, rsqrt,
 )
 
-# ── Cumulative ────────────────────────────────────────────────────────────────
+# Cumulative 
 from brute.functional import cumsum, cumprod, cummax, cummin
 
-# ── Sorting / selection ───────────────────────────────────────────────────────
+# Sorting / selection 
 from brute.functional import (
     sort, argsort, topk, kthvalue, msort,
     unique, unique_consecutive,
 )
 
-# ── Indexing / masking ────────────────────────────────────────────────────────
+# Indexing / masking 
 from brute.functional import (
     gather, index_select, masked_select, take, scatter,
 )
 
-# ── Rearrangement / replication ───────────────────────────────────────────────
+# Rearrangement / replication 
 from brute.functional import (
     roll, flip, fliplr, flipud, rot90,
     tile, repeat_interleave,
 )
 
-# ── Matrix / linear algebra ───────────────────────────────────────────────────
+# Matrix / linear algebra 
 from brute.functional import (
     mm, bmm, matmul, mv, dot, inner, outer, vdot, cross,
 )
 
-# ── Diagonal / triangular ─────────────────────────────────────────────────────
+# Diagonal / triangular 
 from brute.functional import (
     diagonal, diag, diag_embed, diagflat,
     tril, triu, trace,
 )
 
-# ── Misc ──────────────────────────────────────────────────────────────────────
+# Misc 
 from brute.functional import (
     nan_to_num, diff, block_diag, cartesian_prod,
 )

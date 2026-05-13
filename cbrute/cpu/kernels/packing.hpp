@@ -15,7 +15,7 @@ HWY_BEFORE_NAMESPACE();
 namespace cbrute { namespace cpu { namespace HWY_NAMESPACE {
 namespace hn = hwy::HWY_NAMESPACE;
 
-// ── Pack bool bytes (0/1) → packed bytes (LSB-first) ─────────────────────────
+//  Pack bool bytes (0/1) → packed bytes (LSB-first) 
 // Writes ceil(n_bits / 8) bytes. Pad bits (in the trailing byte beyond n_bits)
 // are zero.
 HWY_ATTR inline void PackBoolBytesToBits(const uint8_t* HWY_RESTRICT in_bool,
@@ -54,7 +54,7 @@ HWY_ATTR inline void PackBoolBytesToBits(const uint8_t* HWY_RESTRICT in_bool,
     }
 }
 
-// ── Pack float32 (>0) → packed bytes ──────────────────────────────────────────
+//  Pack float32 (>0) → packed bytes 
 // Bit = 1 iff input > 0.0f.
 HWY_ATTR inline void PackFloatToBits(const float* HWY_RESTRICT in_f,
                                      uint8_t* HWY_RESTRICT out_bytes,
@@ -91,7 +91,7 @@ HWY_ATTR inline void PackFloatToBits(const float* HWY_RESTRICT in_f,
     }
 }
 
-// ── Unpack packed bytes → float32 (+1.0 / −1.0) ──────────────────────────────
+//  Unpack packed bytes → float32 (+1.0 / −1.0) 
 HWY_ATTR inline void UnpackBitsToPm1(const uint8_t* HWY_RESTRICT in_bytes,
                                      float* HWY_RESTRICT out, size_t n_bits) {
     const hn::CappedTag<float, 8> df;
@@ -122,7 +122,7 @@ HWY_ATTR inline void UnpackBitsToPm1(const uint8_t* HWY_RESTRICT in_bytes,
     }
 }
 
-// ── Unpack packed bytes → bool bytes (0/1) ───────────────────────────────────
+//  Unpack packed bytes → bool bytes (0/1) 
 HWY_ATTR inline void UnpackBitsToBoolBytes(const uint8_t* HWY_RESTRICT in_bytes,
                                            uint8_t* HWY_RESTRICT out_bool,
                                            size_t n_bits) {

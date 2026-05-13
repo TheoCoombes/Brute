@@ -40,7 +40,7 @@
 
 namespace cbrute { namespace mps {
 
-// ── Pipeline cache ────────────────────────────────────────────────────────────
+//  Pipeline cache 
 struct PipelineCache {
     std::mutex mtx;
     id<MTLDevice>      dev       = nil;
@@ -105,7 +105,7 @@ struct PipelineCache {
 
 static PipelineCache g_cache;
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+//  Helpers 
 
 static inline id<MTLBuffer> mtl_buf(const at::Tensor& t) {
     return (__bridge id<MTLBuffer>)(t.storage().data());
@@ -129,7 +129,7 @@ static inline const char* type_suffix(const at::Tensor& t) {
     }
 }
 
-// ── Unified dispatcher ───────────────────────────────────────────────────────
+//  Unified dispatcher 
 // One entry point. The caller specifies the kernel name, buffer/offset pairs,
 // inline int32 constants, the grid (in threads), and the threadgroup size.
 // All MPS-stream coalescing handling is owned here.
@@ -157,7 +157,7 @@ static void dispatch_kernel(
     g_cache.commit_if_standalone(cmd);
 }
 
-// ── Op implementations ───────────────────────────────────────────────────────
+//  Op implementations 
 
 static at::Tensor _pack_common(const std::string& kernel_name,
                                const at::Tensor& inp,
@@ -253,7 +253,7 @@ at::Tensor unpack_bool(const at::Tensor& packed, at::IntArrayRef logical_shape, 
     return _unpack_common("unpack_bool_chunked", packed, logical_shape, pw, at::kBool);
 }
 
-// ── Matmul ───────────────────────────────────────────────────────────────────
+//  Matmul 
 // Three tiers of kernels, selected at runtime:
 //
 //  1. xnor_u32_tiled / xnor_u32_wide / xnor_u64_wide — fast paths.
@@ -281,7 +281,7 @@ at::Tensor xnor_popcount_matmul(const at::Tensor& A, const at::Tensor& B,
     auto C  = at::zeros({M, N}, A.options().dtype(at::kInt));
     const int32_t K_eff = (int32_t)(2LL * Kp * pw - K);
 
-    // ── Tier 1a: threadgroup-tiled u32 (large M × N) ─────────────────────
+    //  Tier 1a: threadgroup-tiled u32 (large M × N) 
     // TM=2, TN=4; TG = (TN*32, TM, 1) = (128, 2, 1).
     // Grid = (ceil(N/TN), ceil(M/TM), 1) in threadgroup coords, but we use
     // dispatchThreads which takes total threads so:
@@ -301,7 +301,7 @@ at::Tensor xnor_popcount_matmul(const at::Tensor& A, const at::Tensor& B,
         return C;
     }
 
-    // ── Tier 1b: wide-vector per-cell kernels ─────────────────────────────
+    //  Tier 1b: wide-vector per-cell kernels 
     // xnor_u32_wide: Kp4 = Kp/4 wide words; xnor_u64_wide: Kp2 = Kp/2.
     // Grid/TG identical to the base per-cell kernels: (N*32, M) / (32, 1).
     if (pw == 32 && Kp % 4 == 0) {
@@ -327,7 +327,7 @@ at::Tensor xnor_popcount_matmul(const at::Tensor& A, const at::Tensor& B,
         return C;
     }
 
-    // ── Tier 2: base per-cell kernel (universal fallback) ─────────────────
+    //  Tier 2: base per-cell kernel (universal fallback) 
     MTLSize grid = MTLSizeMake((NSUInteger)N * 32, (NSUInteger)M, 1);
     MTLSize tg   = MTLSizeMake(32, 1, 1);
     dispatch_kernel(std::string("xnor") + pw_suffix(pw),
@@ -339,7 +339,7 @@ at::Tensor xnor_popcount_matmul(const at::Tensor& A, const at::Tensor& B,
     return C;
 }
 
-// ── Per-element popcount ─────────────────────────────────────────────────────
+//  Per-element popcount 
 at::Tensor popcount(const at::Tensor& packed) {
     auto p = packed.contiguous();
     auto out = at::empty(p.sizes(), p.options().dtype(at::kInt));
@@ -355,7 +355,7 @@ at::Tensor popcount(const at::Tensor& packed) {
     return out;
 }
 
-// ── Total popcount / total hamming — two-pass reduction ─────────────────────
+//  Total popcount / total hamming — two-pass reduction 
 //
 // Pass 1: each threadgroup of 256 threads grid-strides its slice and writes
 //         one int32 partial. Number of threadgroups is sized to saturate the
@@ -449,7 +449,7 @@ at::Tensor bit1_hamming_total(const at::Tensor& A, const at::Tensor& B) {
     return partials.sum(at::kLong);
 }
 
-// ── Per-element hamming + bitwise (1-D, one thread per word) ────────────────
+//  Per-element hamming + bitwise (1-D, one thread per word) 
 static at::Tensor binary_op(const std::string& prefix, const at::Tensor& A, const at::Tensor& B) {
     auto Ac = A.contiguous(), Bc = B.contiguous();
     auto C  = at::empty_like(Ac);
@@ -465,21 +465,14 @@ static at::Tensor binary_op(const std::string& prefix, const at::Tensor& A, cons
 }
 
 at::Tensor hamming_distance(const at::Tensor& A, const at::Tensor& B) { return binary_op("hamming", A, B); }
-at::Tensor bitwise_and    (const at::Tensor& A, const at::Tensor& B) { return binary_op("bw_and",  A, B); }
-at::Tensor bitwise_or     (const at::Tensor& A, const at::Tensor& B) { return binary_op("bw_or",   A, B); }
-at::Tensor bitwise_xor    (const at::Tensor& A, const at::Tensor& B) { return binary_op("bw_xor",  A, B); }
 
-at::Tensor bitwise_not(const at::Tensor& A) {
-    auto Ac = A.contiguous();
-    auto B  = at::empty_like(Ac);
-    MTLSize grid = MTLSizeMake((NSUInteger)Ac.numel(), 1, 1);
-    MTLSize tg   = MTLSizeMake(256, 1, 1);
-    dispatch_kernel(std::string("bw_not") + type_suffix(Ac),
-        {{mtl_buf(Ac), byte_offset(Ac)}, {mtl_buf(B), byte_offset(B)}},
-        {},
-        grid, tg);
-    return B;
-}
+// Bitwise pass-throughs. PyTorch's MPSGraph elementwise ops are highly
+// vectorised on integer dtypes and avoid the per-launch dispatch cost we
+// paid in the previous custom-kernel path (one thread per word).
+at::Tensor bitwise_and(const at::Tensor& A, const at::Tensor& B) { return at::bitwise_and(A, B); }
+at::Tensor bitwise_or (const at::Tensor& A, const at::Tensor& B) { return at::bitwise_or (A, B); }
+at::Tensor bitwise_xor(const at::Tensor& A, const at::Tensor& B) { return at::bitwise_xor(A, B); }
+at::Tensor bitwise_not(const at::Tensor& A)                       { return at::bitwise_not(A);    }
 
 at::Tensor& randomize_bits(at::Tensor& out) {
     out.random_();

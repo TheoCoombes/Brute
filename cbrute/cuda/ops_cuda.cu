@@ -63,9 +63,9 @@ inline const uint8_t*  as_u8 (const at::Tensor& t) { return reinterpret_cast<con
 
 }  // anon
 
-// ─────────────────────────────────────────────────────────────────────────────
+// 
 // pack_bits (float input → packed bits)
-// ─────────────────────────────────────────────────────────────────────────────
+// 
 at::Tensor pack_bits(const at::Tensor& input, int64_t pw) {
     TORCH_CHECK(input.dim() >= 1, "pack_bits: input must have >= 1 dim");
     TORCH_CHECK(pw == 8 || pw == 32 || pw == 64,
@@ -96,9 +96,9 @@ at::Tensor pack_bits(const at::Tensor& input, int64_t pw) {
     return output;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// 
 // pack_bool (bool input → packed bits; fast path used by Python _pack_bool)
-// ─────────────────────────────────────────────────────────────────────────────
+// 
 at::Tensor pack_bool(const at::Tensor& input, int64_t pw) {
     TORCH_CHECK(input.dim() >= 1, "pack_bool: input must have >= 1 dim");
     TORCH_CHECK(pw == 8 || pw == 32 || pw == 64,
@@ -131,9 +131,9 @@ at::Tensor pack_bool(const at::Tensor& input, int64_t pw) {
     return output;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// 
 // unpack_bits (packed → ±1 float32)
-// ─────────────────────────────────────────────────────────────────────────────
+// 
 at::Tensor unpack_bits(const at::Tensor& packed, at::IntArrayRef logical_shape, int64_t pw) {
     TORCH_CHECK(pw == 8 || pw == 32 || pw == 64,
                 "unpack_bits: pack_width must be 8, 32, or 64");
@@ -159,9 +159,9 @@ at::Tensor unpack_bits(const at::Tensor& packed, at::IntArrayRef logical_shape, 
     return output;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// 
 // unpack_bool (packed → bool)
-// ─────────────────────────────────────────────────────────────────────────────
+// 
 at::Tensor unpack_bool(const at::Tensor& packed, at::IntArrayRef logical_shape, int64_t pw) {
     TORCH_CHECK(pw == 8 || pw == 32 || pw == 64,
                 "unpack_bool: pack_width must be 8, 32, or 64");
@@ -187,10 +187,10 @@ at::Tensor unpack_bool(const at::Tensor& packed, at::IntArrayRef logical_shape, 
     return output;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// 
 // xnor_popcount_matmul — CUTLASS B1 GEMM where supported, hand kernel else.
 // Output semantic identical to CPU: C = 2*popc_xnor − K_eff = K − 2*popc_xor.
-// ─────────────────────────────────────────────────────────────────────────────
+// 
 at::Tensor xnor_popcount_matmul(const at::Tensor& A, const at::Tensor& B,
                                 int64_t K, int64_t pw) {
     TORCH_CHECK(A.dim() == 2 && B.dim() == 2,
@@ -264,9 +264,9 @@ at::Tensor xnor_popcount_matmul(const at::Tensor& A, const at::Tensor& B,
     return C;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// 
 // popcount — per-element, output int32. Supports all integer dtypes (+ bool).
-// ─────────────────────────────────────────────────────────────────────────────
+// 
 at::Tensor popcount(const at::Tensor& x) {
     const auto p = x.contiguous();
     auto out = at::empty(p.sizes(), p.options().dtype(at::kInt));
@@ -305,9 +305,9 @@ at::Tensor popcount(const at::Tensor& x) {
     return out;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// 
 // packed_popcount — total bit count across the buffer (int64 scalar).
-// ─────────────────────────────────────────────────────────────────────────────
+// 
 at::Tensor packed_popcount(const at::Tensor& x) {
     const auto p = x.contiguous();
     auto out = at::zeros({}, p.options().dtype(at::kLong));
@@ -331,18 +331,18 @@ at::Tensor packed_popcount(const at::Tensor& x) {
     return out;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// 
 // hamming_distance — per-element popcount(A^B), output int32.
 // Broadcasting handled by torch's TensorIterator on the XOR.
-// ─────────────────────────────────────────────────────────────────────────────
+// 
 at::Tensor hamming_distance(const at::Tensor& A, const at::Tensor& B) {
     return popcount(at::bitwise_xor(A, B));
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// 
 // bit1_hamming_total — fused XOR + popcount over equal-shape packed buffers
 // (int64 scalar). No XOR temporary.
-// ─────────────────────────────────────────────────────────────────────────────
+// 
 at::Tensor bit1_hamming_total(const at::Tensor& A, const at::Tensor& B) {
     TORCH_CHECK(A.sizes()       == B.sizes(),       "bit1_hamming_total: shape mismatch");
     TORCH_CHECK(A.scalar_type() == B.scalar_type(), "bit1_hamming_total: dtype mismatch");
@@ -371,9 +371,9 @@ at::Tensor bit1_hamming_total(const at::Tensor& A, const at::Tensor& B) {
     return out;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// 
 // Bitwise pass-throughs.
-// ─────────────────────────────────────────────────────────────────────────────
+// 
 at::Tensor bitwise_and(const at::Tensor& A, const at::Tensor& B) { return at::bitwise_and(A, B); }
 at::Tensor bitwise_or (const at::Tensor& A, const at::Tensor& B) { return at::bitwise_or (A, B); }
 at::Tensor bitwise_xor(const at::Tensor& A, const at::Tensor& B) { return at::bitwise_xor(A, B); }

@@ -35,7 +35,7 @@ if(APPLE)
   message(STATUS "brute: Metal/MPS backend enabled")
 endif()
 
-# ── Google Highway (vendored submodule, static dispatch) ──────────────────────
+# Google Highway (vendored submodule, static dispatch) 
 set(HWY_ENABLE_CONTRIB  OFF CACHE BOOL "" FORCE)
 set(HWY_ENABLE_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(HWY_ENABLE_TESTS    OFF CACHE BOOL "" FORCE)
@@ -56,7 +56,7 @@ if(HAVE_MPS)
   set_source_files_properties(cbrute/metal/ops_metal.mm
     PROPERTIES COMPILE_FLAGS "-x objective-c++")
 
-  # ── AOT MSL kernel compilation ──────────────────────────────────────────────
+  # AOT MSL kernel compilation 
   # Each .metal source → .air via `xcrun metal`, all linked into a single
   # .metallib via `xcrun metallib`, then embedded into a generated header
   # (brute_kernels_data.h) and #included by ops_metal.mm. The result is one

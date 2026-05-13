@@ -17,7 +17,7 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// ── per-element popcount ─────────────────────────────────────────────────────
+//  per-element popcount 
 kernel void popcnt_u8(device const uchar* in [[buffer(0)]],
                       device int*         out[[buffer(1)]],
                       uint g [[thread_position_in_grid]]) {
@@ -34,7 +34,7 @@ kernel void popcnt_u64(device const ulong* in [[buffer(0)]],
     out[g] = (int)popcount(in[g]);
 }
 
-// ── Total popcount of a byte stream — partial reduction ─────────────────────
+//  Total popcount of a byte stream — partial reduction 
 //
 // Grid-stride loop over the input as ulong words; simdgroup-reduce; one
 // uint per threadgroup written to `partials`. Host runs at::sum(partials,
@@ -74,7 +74,7 @@ kernel void packed_popcount_partial(
     }
 }
 
-// ── Tail (< 8 bytes) — single-threadgroup, written to partials[0] ────────────
+//  Tail (< 8 bytes) — single-threadgroup, written to partials[0] 
 //
 // `tail_bytes` is the byte count to read (must be < 8). The host writes the
 // tail bytes into a small staging buffer for us; this kernel popcounts them

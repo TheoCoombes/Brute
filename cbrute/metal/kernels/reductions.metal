@@ -13,7 +13,7 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// ── Per-element Hamming distance ─────────────────────────────────────────────
+//  Per-element Hamming distance 
 kernel void hamming_u8 (device const uchar* a[[buffer(0)]],
                         device const uchar* b[[buffer(1)]],
                         device int*         c[[buffer(2)]],
@@ -33,7 +33,7 @@ kernel void hamming_u64(device const ulong* a[[buffer(0)]],
     c[g] = (int)popcount(a[g] ^ b[g]);
 }
 
-// ── Fused total Hamming distance — partial reduction ────────────────────────
+//  Fused total Hamming distance — partial reduction 
 // Treats both inputs as byte streams of identical length; tail < 8 bytes
 // handled host-side via `tail_hamming_u8`.
 kernel void bit1_hamming_total_partial(

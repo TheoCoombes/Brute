@@ -27,7 +27,7 @@ static inline uint ballot_to_u32(simd_vote v) {
     return (uint)((ulong)v);
 }
 
-// ── Common chunk-write helper: write 4 bytes (or fewer at row tail) ──────────
+//  Common chunk-write helper: write 4 bytes (or fewer at row tail) 
 static inline void write_chunk_bytes(device uchar* out,
                                      int out_off,
                                      int bytes_left_in_row,
@@ -41,12 +41,12 @@ static inline void write_chunk_bytes(device uchar* out,
     }
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
+// 
 // pack_bits: float → packed bits. Bit = 1 iff input > 0.f.
 // Kernel name kept identical to the legacy version (driver pw_suffix dispatch).
 // pw_suffix only affects the driver's output-tensor dtype + row_bytes math;
 // the kernel itself is dtype-agnostic — it writes bytes.
-// ──────────────────────────────────────────────────────────────────────────────
+// 
 kernel void pack_bits_chunked(
     device const float* input     [[buffer(0)]],
     device uchar*       output    [[buffer(1)]],
@@ -68,10 +68,10 @@ kernel void pack_bits_chunked(
     }
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
+// 
 // pack_bool: bool bytes → packed bits. Skips the float intermediate that the
 // Python composite fallback used to materialize.
-// ──────────────────────────────────────────────────────────────────────────────
+// 
 kernel void pack_bool_chunked(
     device const uchar* input     [[buffer(0)]],
     device uchar*       output    [[buffer(1)]],
@@ -93,10 +93,10 @@ kernel void pack_bool_chunked(
     }
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
+// 
 // unpack to ±1.0f. Lane 0 reads one 32-bit chunk; shuffle-broadcast to all
 // lanes; each lane writes its own bit.
-// ──────────────────────────────────────────────────────────────────────────────
+// 
 kernel void unpack_pm1_chunked(
     device const uchar* input     [[buffer(0)]],
     device float*       output    [[buffer(1)]],
@@ -128,9 +128,9 @@ kernel void unpack_pm1_chunked(
     }
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
+// 
 // unpack to bool (1 byte per logical bit). Same shape as unpack_pm1.
-// ──────────────────────────────────────────────────────────────────────────────
+// 
 kernel void unpack_bool_chunked(
     device const uchar* input     [[buffer(0)]],
     device uchar*       output    [[buffer(1)]],

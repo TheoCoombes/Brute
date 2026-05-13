@@ -18,7 +18,7 @@ from tests.benchmarks._helpers import (
 )
 
 
-# ── 1-D pack/unpack across scales ─────────────────────────────────────────────
+# 1-D pack/unpack across scales 
 
 @pytest.mark.parametrize("n_bits", VECTOR_SCALES)
 def test_pack_bool(benchmark, device, n_bits):
@@ -54,7 +54,7 @@ def test_unpack_bool(benchmark, device, n_bits):
     benchmark(with_sync(lambda: bit.bool(), device))
 
 
-# ── Pack-width sweep at the largest 2-D shape ────────────────────────────────
+# Pack-width sweep at the largest 2-D shape 
 # pw doesn't change the bit content, only the leading-dim alignment. Surfaces
 # any cache / strided-access cliffs in the kernel.
 
@@ -70,7 +70,7 @@ def test_pack_pack_width(benchmark, device, pack_dtype):
     benchmark(with_sync(lambda: bit1(src, pack_dtype=pack_dtype), device))
 
 
-# ── 2-D matrix pack/unpack — row-major batching exercise ─────────────────────
+# 2-D matrix pack/unpack — row-major batching exercise 
 
 @pytest.mark.parametrize("shape", MATRIX_SCALES)
 def test_pack_2d(benchmark, device, shape):
