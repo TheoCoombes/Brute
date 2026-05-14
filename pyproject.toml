@@ -29,12 +29,19 @@ markers = [
     "fuzz: hypothesis-driven fuzz tests",
     "cuda: requires CUDA",
     "mps: requires MPS",
+    "needs_dispatch_parity: requires bit1 dispatch parity with torch.bool",
 ]
 # Benchmark defaults — when running `pytest tests/benchmarks --benchmark-only`,
 # results are auto-grouped by op (group=...) and sorted by name so scales read
-# tiny→huge top-to-bottom. Override on the CLI if needed (e.g. --benchmark-sort=mean).
+# dispatch→huge top-to-bottom. Override on the CLI if needed.
 #
-# Recommended invocation:
+# Recommended single-run invocation:
 #   pytest tests/benchmarks --benchmark-only \
 #       --benchmark-group-by=group --benchmark-sort=name \
-#       --benchmark-columns=mean,stddev,median,ops,rounds
+#       --benchmark-json=.benchmarks/$(date +%Y%m%d_%H%M).json
+#
+# Then render the report:
+#   python -m tests.benchmarks.make_report
+#
+# Version comparison (head vs base):
+#   python -m tests.benchmarks.make_report base.json head.json -o diff.md

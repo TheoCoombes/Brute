@@ -1,12 +1,18 @@
-"""Helpers shared across benchmark files.
+"""Benchmark + catalog scale tiers and device-sync helpers.
 
-The CPU vs CUDA vs MPS contrast only makes sense if we (a) synchronize the
-device before stopping the timer, and (b) actually load enough work that we
-escape the kernel-launch / dispatch noise floor. Scales below are chosen with
-those two goals in mind.
+Scales are 3-tier (dispatch / medium / huge) so the matrix stays small enough
+to iterate on without dropping signal at either end:
 
-Scale ID naming uses a `NN_label` prefix so the default lexicographic sort
-pytest-benchmark applies produces a sensible small→huge ordering in the report.
+- **dispatch**: the minimum input size (a single packed word for 1D, (1,1) for
+  matrices). Times almost-pure dispatch + kernel-launch overhead. If bit1 is
+  slower than bool here, it is a pure Python-side cost.
+- **medium**:  ~4 Mi bits / (2048, 2048) — exits L2 on most CPUs, fits in the
+  GPU's outer-cache levels. The "fair" comparison point.
+- **huge**:    ~64 Mi bits / (8192, 8192) — multi-pass DRAM on CPU, fills a
+  decent chunk of GPU memory. Surfaces the asymptotic speedup.
+
+Scale IDs use a `NN_label` prefix so the default lexicographic sort
+pytest-benchmark applies produces a sensible small→huge ordering.
 """
 from __future__ import annotations
 
@@ -14,46 +20,46 @@ import torch
 import pytest
 
 
-# Scales for 1-D vector / flat-buffer benchmarks 
-# Counted in logical bits. Ranges chosen to span:
-#   tiny   – kernel-launch / dispatch overhead dominates
-#   small  – L2 resident
-#   medium – DRAM bandwidth
-#   large  – multi-pass DRAM (CPU) / fits in GPU memory comfortably
-#   huge   – stresses the device (skip-by-default if too slow)
+# 1-D / flat-buffer scales (counted in logical bits).
+# `dispatch=64` = exactly one uint64 packed word; smallest representative input.
 VECTOR_SCALES = [
-    pytest.param(1 << 10, id="01_tiny"),       # 1 Ki bits  ≈ 128 B
-    pytest.param(1 << 16, id="02_small"),      # 64 Ki bits ≈   8 KiB
-    pytest.param(1 << 20, id="03_medium"),     #  1 Mi bits ≈ 128 KiB
-    pytest.param(1 << 24, id="04_large"),      # 16 Mi bits ≈   2 MiB
-    pytest.param(1 << 28, id="05_huge"),       # 256 Mi bits ≈ 32 MiB
+    pytest.param(1 << 6,  id="01_dispatch"),   # 64 bits  (1 uint64 word)
+    pytest.param(1 << 22, id="02_medium"),     # ~4 Mi bits  (~512 KiB)
+    pytest.param(1 << 26, id="03_huge"),       # ~64 Mi bits (~8 MiB)
 ]
 
 
-# Scales for 2-D matrices (rows × cols), bool/bit1 elementwise 
+# 2-D matrix scales (rows, cols) — bool/bit1 elementwise.
 MATRIX_SCALES = [
-    pytest.param((128,  128),  id="01_tiny"),
-    pytest.param((512,  512),  id="02_small"),
-    pytest.param((1024, 1024), id="03_medium"),
-    pytest.param((2048, 4096), id="04_large"),
-    pytest.param((4096, 8192), id="05_huge"),
+    pytest.param((1,    1),    id="01_dispatch"),
+    pytest.param((2048, 2048), id="02_medium"),
+    pytest.param((8192, 8192), id="03_huge"),
 ]
 
 
-# Scales for matmul: (M, K, N) — K stresses the inner dim 
+# Matmul scales: (M, K, N). K aligned to pack_width=64.
 MATMUL_SCALES = [
-    pytest.param((128,  128,  128),   id="01_tiny"),
-    pytest.param((256,  512,  256),   id="02_small"),
-    pytest.param((512,  1024, 512),   id="03_medium"),
-    pytest.param((1024, 2048, 1024),  id="04_large"),
-    pytest.param((2048, 4096, 2048),  id="05_huge"),
+    pytest.param((1,    64,   1),    id="01_dispatch"),
+    pytest.param((512,  1024, 512),  id="02_medium"),
+    pytest.param((2048, 4096, 2048), id="03_huge"),
 ]
 
 
-# Device sync helpers 
+# Number of bits / elements per scale tier — used to set throughput labels.
+def scale_size(scale_param) -> int:
+    """Return the bit/element count for a scale param."""
+    v = scale_param
+    if isinstance(v, tuple):
+        n = 1
+        for d in v:
+            n *= d
+        return n
+    return int(v)
 
+
+# Device sync helpers
 def sync(device: str) -> None:
-    """Block on the current device. Required to actually time GPU kernels."""
+    """Block on the current device. Required to time GPU kernels honestly."""
     if device == "cuda":
         torch.cuda.synchronize()
     elif device == "mps":
@@ -71,20 +77,7 @@ def with_sync(fn, device: str):
     return _run
 
 
-# Throughput helper 
-
-def set_throughput(benchmark, n_elems: int, label: str = "elems/s") -> None:
+# Throughput helper
+def set_throughput(benchmark, n_elems: int, label: str = "bits") -> None:
     """Attach a throughput metric to the benchmark for easier comparison."""
     benchmark.extra_info[label] = n_elems
-
-
-# Scale guards 
-
-def skip_if_mps_composite(device: str) -> None:  # noqa: ARG001
-    """Historical guard for the pre-overhaul MPS path. After the Apple
-    Silicon backend rewrite, `bit1_hamming_total` has a native MSL kernel
-    (fused XOR + popcount + simdgroup reduce), so the composite fallback is
-    no longer used on MPS and this guard is a no-op. Kept as a stable hook
-    so individual benchmarks can re-introduce a device-specific skip without
-    touching every call site."""
-    return

@@ -18,9 +18,28 @@ pip install brute
 ### From Source
 
 ```bash
-git clone https://github.com/TheoCoombes/Brute.git
+git clone --recurse-submodules -j8 https://github.com/TheoCoombes/Brute.git
 cd Brute
 pip install --no-build-isolation -ve .
+```
+
+## Tests
+
+A single op catalog (`tests/ops_catalog.py`) drives three parity test
+files and the benchmark suite. Adding a new op means adding one `OpSpec`.
+
+```bash
+# Unit parity (fast, every op × device × pack-dtype)
+pytest tests/unit/test_parity_catalog.py
+
+# Edge cases (empty / 0-dim / non-contig / broadcast / tail-misalign)
+pytest tests/unit/test_edge_cases_catalog.py
+
+# Hypothesis fuzz (BRUTE_FUZZ_EXAMPLES=N to widen)
+pytest tests/unit/test_fuzz_catalog.py
+
+# All unit tests
+pytest tests/unit/
 ```
 
 ## Benchmarks
@@ -29,8 +48,12 @@ pip install --no-build-isolation -ve .
 pytest tests/benchmarks --benchmark-only \
         --benchmark-group-by=group \
         --benchmark-sort=name \
-        --benchmark-json=.benchmarks/full.json
+        --benchmark-json=.benchmarks/$(date +%Y%m%d_%H%M).json
 
-python -m tests.benchmarks.make_report .benchmarks/full.json
+# Render markdown report (single run)
+python -m tests.benchmarks.make_report
+
+# Or, compare two runs (head vs base) to track per-op deltas
+python -m tests.benchmarks.make_report base.json head.json -o diff.md
 ```
 
