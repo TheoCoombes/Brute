@@ -104,7 +104,7 @@ def parity_shape(scale: str) -> tuple[int, ...]:
     For "matmul" the returned shape is (M, K, N); the input builder splits
     that into a pair of (M, K) and (N, K) tensors.
     """
-    if scale == "vector":
+    if scale in ("vector", "diag_vector"):
         return (16,)
     if scale == "matrix":
         return (4, 8)
@@ -139,7 +139,7 @@ def edge_inputs(spec: "OpSpec", edge: str, device: str):
     arity = max(spec.arity, 1)
 
     if edge == "empty":
-        if spec.scale == "vector":
+        if spec.scale in ("vector", "diag_vector"):
             shapes = [(0,)] * arity
         elif spec.scale == "matrix":
             shapes = [(0, 8)] * arity
@@ -154,7 +154,7 @@ def edge_inputs(spec: "OpSpec", edge: str, device: str):
         return tuple(_bit1(s) for s in srcs), tuple(srcs)
 
     if edge == "non-contig":
-        if spec.scale == "vector":
+        if spec.scale in ("vector", "diag_vector"):
             srcs = [_rand_bool((32,), device, seed=30 + i)[::2] for i in range(arity)]
         else:
             srcs = [_rand_bool((8, 4), device, seed=30 + i).t() for i in range(arity)]
@@ -163,14 +163,14 @@ def edge_inputs(spec: "OpSpec", edge: str, device: str):
     if edge == "broadcast":
         if spec.arity < 2:
             return None, None
-        if spec.scale == "vector":
+        if spec.scale in ("vector", "diag_vector"):
             return None, None
         a_src = _rand_bool((4, 8), device, seed=40)
         b_src = _rand_bool((1, 8), device, seed=41)
         return (_bit1(a_src), _bit1(b_src)), (a_src, b_src)
 
     if edge == "tail-misalign":
-        shape = (3, 13) if spec.scale != "vector" else (13,)
+        shape = (3, 13) if spec.scale not in ("vector", "diag_vector") else (13,)
         srcs = [_rand_bool(shape, device, seed=50 + i) for i in range(arity)]
         return tuple(_bit1(s) for s in srcs), tuple(srcs)
 
@@ -667,10 +667,10 @@ _add(OpSpec("diagonal",   "diag/diagonal",   "diag", 1, "matrix",
 _add(OpSpec("diag",       "diag/diag",       "diag", 1, "matrix",
             run=lambda a: torch.diag(a) if a.dim() >= 2 else a,
             edges=frozenset(["non-contig"])))
-_add(OpSpec("diag_embed", "diag/diag_embed", "diag", 1, "vector",
+_add(OpSpec("diag_embed", "diag/diag_embed", "diag", 1, "diag_vector",
             run=lambda a: torch.diag_embed(a),
             edges=frozenset(["non-contig"])))
-_add(OpSpec("diagflat",   "diag/diagflat",   "diag", 1, "vector",
+_add(OpSpec("diagflat",   "diag/diagflat",   "diag", 1, "diag_vector",
             run=lambda a: torch.diagflat(a),
             edges=frozenset(["non-contig"])))
 _add(OpSpec("tril",       "diag/tril",       "diag", 1, "matrix",

@@ -104,8 +104,21 @@ _BOOL_FREE_FUNCS = frozenset(
     ] if f is not None
 )
 
+# Dynamo's _automatic_dynamic walks the view chain via _is_view() / _base.
+# brute.Tensor is implemented with `as_subclass`, which makes every instance a
+# C++-level view: _is_view() is True, _base is the plain backing tensor.
+#
+# If the generic __torch_function__ fallback handles _base, _rewrap wraps the
+# plain tensor back into a brute.Tensor — whose _base is again the same plain
+# tensor — and Dynamo walks the chain forever. So intercept _base here and
+# return the C++ result directly (a plain torch.Tensor, whose _is_view() is
+# False), which lets Dynamo's traversal terminate after one step.
+_BASE_FUNCS = frozenset(
+    f for f in [_metadata_get('_base')] if f is not None
+)
 
-# Internal helpers 
+
+# Internal helpers
 
 def _to_bool(t: torch.Tensor) -> torch.Tensor:
     """Cast any tensor to bool (>0 for floats, standard .bool() otherwise)."""
@@ -1486,6 +1499,15 @@ class Tensor(torch.Tensor):
                     a.__dict__['_packed_ver'] = a._version
                     return a
 
+        # Dynamo's _automatic_dynamic walks `e._base` recursively. The generic
+        # fallback would rewrap our plain-tensor _base back into brute.Tensor —
+        # whose _base is the same plain tensor again — and that loops forever.
+        # Bypass the fallback for _base: return the raw C++ result (a plain
+        # torch.Tensor whose own _is_view() is False), terminating the walk.
+        if func in _BASE_FUNCS:
+            with torch._C.DisableTorchFunctionSubclass():
+                return args[0]._base
+
         # No fast path matched — we are about to expose the bit1 inputs as
         # torch.Tensor bool views to the generic fallback. Any input that was
         # produced via `_make_bit1_from_packed` (lazy bool) must materialise
@@ -1623,48 +1645,15 @@ class Tensor(torch.Tensor):
             return arr.copy()
         return arr
 
-    def __tensor_flatten__(self):
-        """Tells torch.compile how to extract standard tensors from this subclass."""
-        # AOTAutograd needs string attribute names to extract tensors.
-        # Since we use .as_subclass(), we temporarily attach the plain tensor data.
-        if getattr(self, '_is_bit1', False):
-            self._ensure_bool_valid()
-        self._base_data = self.as_subclass(torch.Tensor)
-        
-        tensor_attrs = ["_base_data"]
-        
-        # Dynamo MUST know about any cached tensors hiding in __dict__
-        if self.__dict__.get('_packed_buf_cache') is not None:
-            tensor_attrs.append("_packed_buf_cache")
-            
-        metadata = {
-            "is_bit1": getattr(self, '_is_bit1', False),
-            "pack_dtype": getattr(self, '_pack_dtype', None),
-            "packed_ver": self.__dict__.get('_packed_ver')
-        }
-        return tensor_attrs, metadata
-
-    @classmethod
-    def __tensor_unflatten__(cls, inner_tensors, metadata, outer_size, outer_stride):
-        """Tells torch.compile how to rebuild this subclass from the standard tensors."""
-        base_data = inner_tensors["_base_data"]
-        
-        # Rebuild using your internal factories
-        if metadata["is_bit1"]:
-            # We don't want to re-trigger _pack_bool if we already have the cache, 
-            # so we manually rebuild the instance state.
-            instance = base_data.as_subclass(cls)
-            instance._is_bit1 = True
-            instance._pack_dtype = metadata["pack_dtype"]
-        else:
-            instance = cls._make_plain(base_data)
-            
-        # Restore the cache if it existed in the graph
-        if "_packed_buf_cache" in inner_tensors:
-            instance.__dict__['_packed_buf_cache'] = inner_tensors["_packed_buf_cache"]
-            instance.__dict__['_packed_ver'] = metadata["packed_ver"]
-            
-        return instance
+    # NOTE: We deliberately do NOT implement __tensor_flatten__ /
+    # __tensor_unflatten__. Those methods opt into PyTorch's "traceable wrapper
+    # subclass" protocol, which assumes the OUTER tensor is metadata and the
+    # INNER tensors hold the storage. brute.Tensor uses `as_subclass` instead —
+    # outer and inner share the same TensorImpl — so the wrapper protocol is
+    # the wrong shape for us: FakeTensorMode tries to re-subclass an existing
+    # FakeTensor and crashes ("raw Tensor object is already associated to a
+    # python object of type FakeTensor"). Without these methods, Dynamo treats
+    # us as a plain tensor subclass and the compile path works end-to-end.
 
     # Repr 
 

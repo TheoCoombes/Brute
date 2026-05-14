@@ -23,7 +23,7 @@ import torch
 import brute
 from tests import ops_catalog
 from tests.benchmarks._helpers import (
-    VECTOR_SCALES, MATRIX_SCALES, MATMUL_SCALES,
+    VECTOR_SCALES, MATRIX_SCALES, MATMUL_SCALES, DIAG_VECTOR_SCALES,
     with_sync, set_throughput, scale_size,
 )
 
@@ -45,12 +45,14 @@ def _scales_for(scale: str):
         return MATRIX_SCALES
     if scale == "matmul":
         return MATMUL_SCALES
+    if scale == "diag_vector":
+        return DIAG_VECTOR_SCALES
     raise ValueError(scale)
 
 
 def _input_shapes(scale: str, size_param):
     """Return one shape per tensor input, given (scale, size_param)."""
-    if scale == "vector":
+    if scale in ("vector", "diag_vector"):
         return [(int(size_param),)]
     if scale == "matrix":
         return [tuple(size_param)]

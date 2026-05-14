@@ -29,6 +29,15 @@ VECTOR_SCALES = [
 ]
 
 
+# 1-D scales for ops whose output is O(N²) (e.g. diag_embed, diagflat).
+# Keep N small enough that the (N, N) output doesn't OOM.
+DIAG_VECTOR_SCALES = [
+    pytest.param(64,   id="01_dispatch"),   # → (64, 64)   ≈ 4 Ki elements
+    pytest.param(2048, id="02_medium"),     # → (2048, 2048) ≈ 4 Mi elements
+    pytest.param(4096, id="03_huge"),       # → (4096, 4096) ≈ 16 Mi elements
+]
+
+
 # 2-D matrix scales (rows, cols) — bool/bit1 elementwise.
 MATRIX_SCALES = [
     pytest.param((1,    1),    id="01_dispatch"),

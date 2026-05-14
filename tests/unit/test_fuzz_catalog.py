@@ -27,7 +27,7 @@ MAX_EXAMPLES = int(os.environ.get("BRUTE_FUZZ_EXAMPLES", "20"))
 
 # Strategy for random shapes by scale.
 def _shape_strategy(scale: str):
-    if scale == "vector":
+    if scale in ("vector", "diag_vector"):
         return st.lists(
             st.integers(min_value=1, max_value=64),
             min_size=1, max_size=1,
@@ -78,7 +78,7 @@ def test_fuzz_parity(spec, device, seed, pack_dtype):
     # we just use a fast deterministic shape from the seed:
     rng = torch.Generator(device="cpu").manual_seed(seed)
 
-    if spec.scale == "vector":
+    if spec.scale in ("vector", "diag_vector"):
         n = int(torch.randint(1, 65, (), generator=rng))
         shapes = [(n,)] * max(spec.arity, 1)
     elif spec.scale == "matrix":
