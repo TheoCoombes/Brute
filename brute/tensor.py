@@ -15,7 +15,8 @@ from brute.dtype import (
 
 _MATMUL_FUNCS = frozenset([
     torch.matmul, torch.mm, torch.bmm,
-    torch.Tensor.matmul, torch.Tensor.__matmul__,
+    torch.Tensor.matmul, torch.Tensor.mm, torch.Tensor.bmm,
+    torch.Tensor.__matmul__,
 ])
 
 # Reductions where the fast-path on bit1 is a direct call to packed_popcount.
