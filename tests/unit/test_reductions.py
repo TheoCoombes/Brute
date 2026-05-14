@@ -69,14 +69,18 @@ def test_nonzero(device):
 
 
 def test_argmax_argmin(device):
-    """argmax/argmin on bool inputs is unsupported in torch — verify parity of the error."""
+    """`torch.argmax`/`argmin` on torch.bool is unsupported by PyTorch, but
+    bit1 fills that gap by casting transparently to uint8 inside
+    `__torch_function__`."""
     src = torch.tensor([False, True, False, True, False], device=device)
     bit = bit1(src)
-    # torch.argmax on bool raises; bit1 must mirror.
+    # torch.argmax on bool still raises (we do not patch torch.bool).
     with pytest.raises((RuntimeError, NotImplementedError)):
         torch.argmax(src)
-    with pytest.raises((RuntimeError, NotImplementedError)):
-        torch.argmax(bit)
+    # On bit1 we cast through uint8, so it returns the index of the first True.
+    expected = int(torch.argmax(src.to(torch.uint8)))
+    assert int(torch.argmax(bit)) == expected
+    assert int(torch.argmin(bit)) == int(torch.argmin(src.to(torch.uint8)))
 
 
 def test_argmax_argmin_on_int(device):

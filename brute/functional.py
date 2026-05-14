@@ -32,6 +32,18 @@ def _packed_shape(size: tuple, pack_dtype: torch.dtype) -> tuple:
     return tuple(size[:-1]) + (n_words,)
 
 
+# Map the user-facing pack_dtype (uint8/uint32/uint64) to the actual storage
+# dtype of the packed buffer. We use SIGNED int32/int64 for pw=32/64 because
+# PyTorch's `bitwise_not` is not implemented on UInt32/UInt64 on CPU, and the
+# existing `pack_bool` C++ impl already uses int32/int64. Keeping the same
+# storage dtype across all bit1 tensors avoids cross-tensor dtype surprises.
+_PACK_STORAGE_DTYPE: dict[torch.dtype, torch.dtype] = {
+    torch.uint8:  torch.uint8,
+    torch.uint32: torch.int32,
+    torch.uint64: torch.int64,
+}
+
+
 def _make_bit1_eager(packed: torch.Tensor, size: tuple, pack_dtype: torch.dtype,
                      device) -> Tensor:
     """Wrap a freshly-allocated packed buffer as a bit1 tensor with empty
@@ -54,9 +66,10 @@ def zeros(*size, dtype=None, device=None, pack_dtype: torch.dtype = torch.uint8,
     size = _norm_size(size)
     if isinstance(dtype, _Bit1DType):
         pd = resolve_pack_dtype(pack_dtype)
+        storage_dtype = _PACK_STORAGE_DTYPE[pd]
         # Allocate only the packed buffer (zeros) + empty bool. Skips the
         # 8/32/64× memory tax of materialising and re-reading a full bool zero.
-        packed = torch.zeros(_packed_shape(size, pd), dtype=pd, device=device)
+        packed = torch.zeros(_packed_shape(size, pd), dtype=storage_dtype, device=device)
         return _make_bit1_eager(packed, size, pd, device)
     return Tensor._make_plain(torch.zeros(size, dtype=dtype, device=device, **kwargs))
 
@@ -67,7 +80,8 @@ def ones(*size, dtype=None, device=None, pack_dtype: torch.dtype = torch.uint8, 
         pd = resolve_pack_dtype(pack_dtype)
         pw = _PACK_BITS[pd]
         ps = _packed_shape(size, pd)
-        packed = torch.zeros(ps, dtype=pd, device=device)
+        storage_dtype = _PACK_STORAGE_DTYPE[pd]
+        packed = torch.zeros(ps, dtype=storage_dtype, device=device)
         packed.bitwise_not_()                    # all-ones in the packed dtype
         if size and size[-1] > 0 and size[-1] % pw != 0 and packed.numel() > 0:
             # Mask pad bits in the tail word so popcount/sum stay correct.
@@ -84,7 +98,7 @@ def empty(*size, dtype=None, device=None, pack_dtype: torch.dtype = torch.uint8,
         pd = resolve_pack_dtype(pack_dtype)
         pw = _PACK_BITS[pd]
         ps = _packed_shape(size, pd)
-        packed = torch.empty(ps, dtype=pd, device=device)
+        packed = torch.empty(ps, dtype=_PACK_STORAGE_DTYPE[pd], device=device)
         # Zero the tail word so pad bits are 0 — `torch.empty` for bit1 leaves
         # live bits undefined but preserves the popcount invariant.
         if size and size[-1] > 0 and size[-1] % pw != 0 and packed.numel() > 0:

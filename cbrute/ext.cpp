@@ -63,22 +63,27 @@ at::Tensor bit1_hamming_total_composite(const at::Tensor& A, const at::Tensor& B
 }
 
 // Pad-safe inversion of a packed bit1 buffer. `~A` over the whole buffer
-// flips the (zero) padding bits in the last word to ones, which would
-// corrupt every popcount/sum/all/any path that trusts pad bits to be 0.
-// We mask the tail word back to the live-bit window before returning.
+// flips the (zero) padding bits in every row's tail word to ones, which
+// would corrupt every popcount/sum/all/any path that trusts pad bits to be 0.
+//
+// Multi-row layout: the packed buffer has shape (..., ceil(K / pw)) where K
+// is the last logical dim. EACH row's last word holds (pw - K % pw) pad
+// bits, so we mask every row's tail column — not just the global last word.
+//
+// `last_dim_bits` = the LAST LOGICAL DIMENSION (i.e. `tensor.shape[-1]`),
+// not the total numel.
 at::Tensor bit1_not_packed_composite(const at::Tensor& A,
-                                     int64_t logical_numel, int64_t pack_width) {
+                                     int64_t last_dim_bits, int64_t pack_width) {
     auto out = at::bitwise_not(A);
-    if (out.numel() == 0 || logical_numel == 0) return out;
-    int64_t valid_bits = logical_numel % pack_width;
+    if (out.numel() == 0 || last_dim_bits == 0) return out;
+    int64_t valid_bits = last_dim_bits % pack_width;
     if (valid_bits == 0) return out;
-    // Mask the final word: keep low `valid_bits` bits, zero the rest.
     const uint64_t mask = (valid_bits == 64)
         ? ~uint64_t(0)
         : ((uint64_t(1) << valid_bits) - 1);
-    auto flat = out.flatten();
-    auto tail = flat.narrow(0, flat.numel() - 1, 1);
-    tail.bitwise_and_(at::scalar_tensor((int64_t)mask, tail.options()));
+    // Mask the last column of every row in one shot.
+    auto last_col = out.select(-1, out.size(-1) - 1);
+    last_col.bitwise_and_(at::scalar_tensor((int64_t)mask, last_col.options()));
     return out;
 }
 
@@ -108,7 +113,7 @@ TORCH_LIBRARY(brute, m) {
     m.def("bitwise_not(Tensor A) -> Tensor");
     // pad-safe NOT on the packed buffer of a bit1 tensor: ~A then zero the
     // padding bits in the final word so packed_popcount / sum remain correct.
-    m.def("bit1_not_packed(Tensor A, int logical_numel, int pack_width) -> Tensor");
+    m.def("bit1_not_packed(Tensor A, int last_dim_bits, int pack_width) -> Tensor");
 
     m.def("randomize_bits(Tensor(a!) out) -> Tensor(a!)");
 }
