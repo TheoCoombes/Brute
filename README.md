@@ -22,3 +22,15 @@ git clone https://github.com/TheoCoombes/Brute.git
 cd Brute
 pip install --no-build-isolation -ve .
 ```
+
+## Benchmarks
+
+```bash
+pytest tests/benchmarks --benchmark-only \
+        --benchmark-group-by=group \
+        --benchmark-sort=name \
+        --benchmark-json=.benchmarks/full.json
+
+python -m tests.benchmarks.make_report .benchmarks/full.json
+```
+

@@ -13,7 +13,10 @@ from brute.dtype import (
 )
 
 
-_MATMUL_FUNCS = frozenset([torch.matmul, torch.mm, torch.bmm])
+_MATMUL_FUNCS = frozenset([
+    torch.matmul, torch.mm, torch.bmm,
+    torch.Tensor.matmul, torch.Tensor.__matmul__,
+])
 
 # Reductions where the fast-path on bit1 is a direct call to packed_popcount.
 _SUM_FUNCS = frozenset([
@@ -1214,6 +1217,40 @@ class Tensor(torch.Tensor):
                     torch.tensor(int(total) == a.numel(), dtype=torch.bool)
                 )
 
+            # any(dim=-1) / all(dim=-1) — reduce over the packed last dim
+            # without unpacking the full bool storage. The packed buffer has
+            # shape (..., ceil(K/pw)). Pad bits are zero, so:
+            #   any(row) = ((packed_row != 0)).any(dim=-1)
+            #   all(row) = popcount(packed_row).sum(dim=-1) == K
+            # Both avoid materialising a (..., K) bool temporary.
+            if (func in _ANY_FUNCS or func in _ALL_FUNCS) \
+                    and len(bit1_ins) == 1 and not no_dim:
+                a = bit1_ins[0]
+                dim_arg = args[1] if len(args) > 1 else kwargs.get('dim')
+                keepdim = (args[2] if len(args) > 2
+                           else kwargs.get('keepdim', False))
+                if (a.dim() >= 1 and isinstance(dim_arg, int)
+                        and isinstance(keepdim, bool)):
+                    ndim = a.dim()
+                    dim_p = dim_arg if dim_arg >= 0 else ndim + dim_arg
+                    if dim_p == ndim - 1:
+                        packed = a._packed_buf
+                        if func in _ANY_FUNCS:
+                            result = (packed != 0).any(dim=-1,
+                                                       keepdim=keepdim)
+                        else:
+                            K = int(a.shape[-1])
+                            pops = torch.ops.brute.popcount(packed)
+                            row_total = pops.to(torch.int64).sum(
+                                dim=-1, keepdim=keepdim)
+                            result = (row_total == K)
+                        # Match the generic-fallback wrap: non-scalar bool
+                        # reductions over a bit1 input get promoted back to
+                        # bit1; scalar results stay plain (no shape).
+                        if result.dim() == 0:
+                            return Tensor._make_plain(result)
+                        return Tensor._make_bit1(result, a._pack_dtype)
+
             # torch.equal(a, b) -> Python bool. Pad bits are zero in both
             # operands, so packed equality ⇔ logical equality. `torch.equal`
             # on uint packed buffers short-circuits on the first mismatching
@@ -1430,8 +1467,12 @@ class Tensor(torch.Tensor):
                         pb = torch.empty(packed_shape, dtype=a._pack_dtype,
                                          device=a.device)
                     if bool(value):
-                        pb.zero_()
-                        pb.bitwise_not_()
+                        # Single byte-wise fill — works for any unsigned pack
+                        # dtype without going through (zero_ + bitwise_not_),
+                        # which used two passes over packed memory. view as
+                        # uint8 because uint32/uint64 fill_ doesn't accept
+                        # negative literals in pytorch.
+                        pb.view(torch.uint8).fill_(0xFF)
                         if K > 0 and K % pw != 0:
                             valid_bits = K % pw
                             mask = (1 << valid_bits) - 1
@@ -1461,7 +1502,50 @@ class Tensor(torch.Tensor):
 
         u_args   = torch.utils._pytree.tree_map(_unwrap, args)
         u_kwargs = torch.utils._pytree.tree_map(_unwrap, kwargs)
-        result   = func(*u_args, **u_kwargs)
+
+        # CUDA has no addmm/bmm kernel for integer dtypes — promote int tensor
+        # operands to float for the matmul and demote the result back to the
+        # promoted integer dtype. CPU/MPS handle int matmul natively, so guard
+        # on device.
+        if func in _MATMUL_FUNCS and not bit1_ins:
+            cuda_int_tensors = [
+                x for x in flat
+                if isinstance(x, torch.Tensor)
+                and x.device.type == 'cuda'
+                and not x.is_floating_point()
+                and not x.is_complex()
+                and x.dtype != torch.bool
+            ]
+            if cuda_int_tensors:
+                target_int = cuda_int_tensors[0].dtype
+                for x in cuda_int_tensors[1:]:
+                    target_int = torch.promote_types(target_int, x.dtype)
+                # int64 needs float64 to preserve precision; everything else
+                # fits in float32.
+                compute_dtype = (torch.float64 if target_int == torch.int64
+                                 else torch.float32)
+                def _to_compute(x):
+                    if (isinstance(x, torch.Tensor)
+                            and x.device.type == 'cuda'
+                            and not x.is_floating_point()
+                            and not x.is_complex()
+                            and x.dtype != torch.bool):
+                        return x.to(compute_dtype)
+                    return x
+                u_args   = torch.utils._pytree.tree_map(_to_compute, u_args)
+                u_kwargs = torch.utils._pytree.tree_map(_to_compute, u_kwargs)
+                result   = func(*u_args, **u_kwargs)
+                if isinstance(result, torch.Tensor):
+                    result = result.to(target_int)
+                else:
+                    result = type(result)(
+                        r.to(target_int) if isinstance(r, torch.Tensor) else r
+                        for r in result
+                    )
+            else:
+                result = func(*u_args, **u_kwargs)
+        else:
+            result = func(*u_args, **u_kwargs)
 
         def _rewrap(r):
             if not isinstance(r, torch.Tensor):

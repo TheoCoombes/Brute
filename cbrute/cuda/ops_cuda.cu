@@ -56,7 +56,6 @@ inline int compute_capability() {
 
 // Reinterpret a byte-aligned device pointer as a uint64*. Caller guarantees
 // at least 8-byte alignment (true for any at::Tensor data_ptr).
-inline uint64_t*       as_u64(at::Tensor& t)       { return reinterpret_cast<uint64_t*>(t.data_ptr()); }
 inline const uint64_t* as_u64(const at::Tensor& t) { return reinterpret_cast<const uint64_t*>(t.data_ptr()); }
 inline uint8_t*        as_u8 (at::Tensor& t)       { return reinterpret_cast<uint8_t*>(t.data_ptr()); }
 inline const uint8_t*  as_u8 (const at::Tensor& t) { return reinterpret_cast<const uint8_t*>(t.data_ptr()); }

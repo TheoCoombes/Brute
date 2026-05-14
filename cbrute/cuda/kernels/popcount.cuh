@@ -14,13 +14,10 @@
 
 #include <cstdint>
 #include <cuda_runtime.h>
-#include <cooperative_groups.h>
 
 namespace cbrute { namespace cuda { namespace kernels {
 
-namespace cg = cooperative_groups;
-
-//  Per-element popcount 
+//  Per-element popcount
 
 __global__ inline void k_popcnt_u8 (const uint8_t* __restrict__ in,
                                     int32_t* __restrict__ out, int64_t n) {
@@ -68,10 +65,12 @@ __device__ inline uint64_t block_reduce_sum_u64(uint64_t v) {
     return v;     // valid only on thread 0
 }
 
-//  Total popcount over a flat byte stream 
-// Each thread processes one uint64 word; blocks reduce locally; one atomicAdd
-// per block. Output is a single uint64 (cast to int64 by caller).
-// 
+//  Total popcount over a flat byte stream
+// Each thread issues 128-bit (ulonglong2) vectorized loads — two uint64 words
+// per memory transaction — and falls back to scalar loads on the odd-word
+// residual. Blocks reduce locally; one atomicAdd per block.
+// Output is a single uint64 (cast to int64 by caller).
+//
 
 __global__ inline void k_packed_popcount_total(const uint64_t* __restrict__ in,
                                                int64_t n_words,
@@ -79,8 +78,18 @@ __global__ inline void k_packed_popcount_total(const uint64_t* __restrict__ in,
     const int64_t tid    = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     const int64_t stride = (int64_t)gridDim.x * blockDim.x;
     uint64_t local = 0;
-    for (int64_t i = tid; i < n_words; i += stride) {
-        local += (uint64_t)__popcll(in[i]);
+
+    // PyTorch tensor data is 64-byte aligned, so the base pointer always
+    // satisfies the 16-byte alignment required for ulonglong2 loads.
+    const int64_t n_pairs = n_words >> 1;
+    const ulonglong2* in2 = reinterpret_cast<const ulonglong2*>(in);
+    for (int64_t i = tid; i < n_pairs; i += stride) {
+        ulonglong2 v = in2[i];
+        local += (uint64_t)__popcll(v.x) + (uint64_t)__popcll(v.y);
+    }
+    // Trailing odd word (n_words is odd).
+    if ((n_words & 1) && tid == 0) {
+        local += (uint64_t)__popcll(in[n_words - 1]);
     }
     uint64_t block_sum = block_reduce_sum_u64(local);
     if (threadIdx.x == 0) {
@@ -88,7 +97,7 @@ __global__ inline void k_packed_popcount_total(const uint64_t* __restrict__ in,
     }
 }
 
-//  Total Hamming distance: fused popc(A XOR B) over the buffer 
+//  Total Hamming distance: fused popc(A XOR B) over the buffer
 __global__ inline void k_hamming_total(const uint64_t* __restrict__ a,
                                        const uint64_t* __restrict__ b,
                                        int64_t n_words,
@@ -96,8 +105,17 @@ __global__ inline void k_hamming_total(const uint64_t* __restrict__ a,
     const int64_t tid    = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     const int64_t stride = (int64_t)gridDim.x * blockDim.x;
     uint64_t local = 0;
-    for (int64_t i = tid; i < n_words; i += stride) {
-        local += (uint64_t)__popcll(a[i] ^ b[i]);
+
+    const int64_t n_pairs = n_words >> 1;
+    const ulonglong2* a2 = reinterpret_cast<const ulonglong2*>(a);
+    const ulonglong2* b2 = reinterpret_cast<const ulonglong2*>(b);
+    for (int64_t i = tid; i < n_pairs; i += stride) {
+        ulonglong2 va = a2[i], vb = b2[i];
+        local += (uint64_t)__popcll(va.x ^ vb.x)
+               + (uint64_t)__popcll(va.y ^ vb.y);
+    }
+    if ((n_words & 1) && tid == 0) {
+        local += (uint64_t)__popcll(a[n_words - 1] ^ b[n_words - 1]);
     }
     uint64_t block_sum = block_reduce_sum_u64(local);
     if (threadIdx.x == 0) {
