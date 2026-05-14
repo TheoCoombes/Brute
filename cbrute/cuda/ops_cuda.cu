@@ -84,16 +84,17 @@ at::Tensor pack_bits(const at::Tensor& input, int64_t pw) {
     const int64_t batch     = inp.numel() / ld;
     out_shape.back() = pd_words;
 
-    auto output = at::zeros(out_shape, inp.options().dtype(pack_scalar_type(pw)));
-    const int chunks = (int)((ld + 31) / 32);
-    dim3 grid((unsigned)chunks, (unsigned)batch);
-    dim3 block(32);   // exactly one warp per block — matches __ballot_sync usage
-    kernels::k_pack_float_warp<<<grid, block, 0, cur_stream()>>>(
-        inp.data_ptr<float>(),
-        as_u8(output),
-        ld, row_bytes);
-    return output;
-}
+     auto output = at::zeros(out_shape, inp.options().dtype(pack_scalar_type(pw)));
+     const int chunks = (int)((ld + 31) / 32);
+     const bool aligned4 = (pw == 32 || pw == 64);
+     dim3 grid((unsigned)chunks, (unsigned)batch);
+     dim3 block(32);   // exactly one warp per block — matches __ballot_sync usage
+     kernels::k_pack_float_warp<<<grid, block, 0, cur_stream()>>>(
+         inp.data_ptr<float>(),
+         as_u8(output),
+         ld, row_bytes, aligned4);
+     return output;
+ }
 
 // 
 // pack_bool (bool input → packed bits; fast path used by Python _pack_bool)
@@ -119,16 +120,17 @@ at::Tensor pack_bool(const at::Tensor& input, int64_t pw) {
     const int64_t batch     = inp.numel() / ld;
     out_shape.back() = pd_words;
 
-    auto output = at::zeros(out_shape, inp.options().dtype(pack_scalar_type(pw)));
-    const int chunks = (int)((ld + 31) / 32);
-    dim3 grid((unsigned)chunks, (unsigned)batch);
-    dim3 block(32);
-    kernels::k_pack_bool_warp<<<grid, block, 0, cur_stream()>>>(
-        reinterpret_cast<const uint8_t*>(inp.data_ptr<bool>()),
-        as_u8(output),
-        ld, row_bytes);
-    return output;
-}
+     auto output = at::zeros(out_shape, inp.options().dtype(pack_scalar_type(pw)));
+     const int chunks = (int)((ld + 31) / 32);
+     const bool aligned4 = (pw == 32 || pw == 64);
+     dim3 grid((unsigned)chunks, (unsigned)batch);
+     dim3 block(32);
+     kernels::k_pack_bool_warp<<<grid, block, 0, cur_stream()>>>(
+         reinterpret_cast<const uint8_t*>(inp.data_ptr<bool>()),
+         as_u8(output),
+         ld, row_bytes, aligned4);
+     return output;
+ }
 
 // 
 // unpack_bits (packed → ±1 float32)
@@ -143,20 +145,21 @@ at::Tensor unpack_bits(const at::Tensor& packed, at::IntArrayRef logical_shape, 
         return at::empty(logical_shape.vec(), p.options().dtype(at::kFloat));
     }
 
-    const int64_t pl_words  = p.size(-1);
-    const int64_t row_bytes = pl_words * (pw / 8);
-    const int64_t batch     = p.numel() / pl_words;
+     const int64_t pl_words  = p.size(-1);
+     const int64_t row_bytes = pl_words * (pw / 8);
+     const int64_t batch     = p.numel() / pl_words;
+     const bool aligned4 = (pw == 32 || pw == 64);
 
-    auto output = at::empty(logical_shape.vec(), p.options().dtype(at::kFloat));
-    const int chunks = (int)((ll + 31) / 32);
-    dim3 grid((unsigned)chunks, (unsigned)batch);
-    dim3 block(32);
-    kernels::k_unpack_pm1_warp<<<grid, block, 0, cur_stream()>>>(
-        as_u8(p),
-        output.data_ptr<float>(),
-        ll, row_bytes);
-    return output;
-}
+     auto output = at::empty(logical_shape.vec(), p.options().dtype(at::kFloat));
+     const int chunks = (int)((ll + 31) / 32);
+     dim3 grid((unsigned)chunks, (unsigned)batch);
+     dim3 block(32);
+     kernels::k_unpack_pm1_warp<<<grid, block, 0, cur_stream()>>>(
+         as_u8(p),
+         output.data_ptr<float>(),
+         ll, row_bytes, aligned4);
+     return output;
+ }
 
 // 
 // unpack_bool (packed → bool)
@@ -171,20 +174,21 @@ at::Tensor unpack_bool(const at::Tensor& packed, at::IntArrayRef logical_shape, 
         return at::empty(logical_shape.vec(), p.options().dtype(at::kBool));
     }
 
-    const int64_t pl_words  = p.size(-1);
-    const int64_t row_bytes = pl_words * (pw / 8);
-    const int64_t batch     = p.numel() / pl_words;
+     const int64_t pl_words  = p.size(-1);
+     const int64_t row_bytes = pl_words * (pw / 8);
+     const int64_t batch     = p.numel() / pl_words;
+     const bool aligned4 = (pw == 32 || pw == 64);
 
-    auto output = at::empty(logical_shape.vec(), p.options().dtype(at::kBool));
-    const int chunks = (int)((ll + 31) / 32);
-    dim3 grid((unsigned)chunks, (unsigned)batch);
-    dim3 block(32);
-    kernels::k_unpack_bool_warp<<<grid, block, 0, cur_stream()>>>(
-        as_u8(p),
-        reinterpret_cast<uint8_t*>(output.data_ptr<bool>()),
-        ll, row_bytes);
-    return output;
-}
+     auto output = at::empty(logical_shape.vec(), p.options().dtype(at::kBool));
+     const int chunks = (int)((ll + 31) / 32);
+     dim3 grid((unsigned)chunks, (unsigned)batch);
+     dim3 block(32);
+     kernels::k_unpack_bool_warp<<<grid, block, 0, cur_stream()>>>(
+         as_u8(p),
+         reinterpret_cast<uint8_t*>(output.data_ptr<bool>()),
+         ll, row_bytes, aligned4);
+     return output;
+ }
 
 // 
 // xnor_popcount_matmul — CUTLASS B1 GEMM where supported, hand kernel else.

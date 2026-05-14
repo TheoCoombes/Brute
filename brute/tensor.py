@@ -1033,8 +1033,10 @@ class Tensor(torch.Tensor):
                         new_packed, new_shape, self._pack_dtype,
                     )
                 if self.shape[-1] == 1:
-                    # The packed axis itself is size-1 → fall through (bool path).
-                    return super().squeeze(*args, **kwargs)
+                     # The packed axis itself is size-1 — we deliberately keep
+                     # the packed axis intact to stay within the parity envelope.
+                     # Return self unchanged as a bit1 tensor.
+                     return self
                 # Nothing to squeeze.
                 return self
             nd = self.dim()
