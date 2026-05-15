@@ -281,18 +281,26 @@ at::Tensor xnor_popcount_matmul(const at::Tensor& A, const at::Tensor& B,
     auto C  = at::zeros({M, N}, A.options().dtype(at::kInt));
     const int32_t K_eff = (int32_t)(2LL * Kp * pw - K);
 
-    //  Tier 1a: threadgroup-tiled u32 (large M × N) 
+    //  Tier 1a: threadgroup-tiled u32 (large M × N)
     // TM=2, TN=4; TG = (TN*32, TM, 1) = (128, 2, 1).
     // Grid = (ceil(N/TN), ceil(M/TM), 1) in threadgroup coords, but we use
     // dispatchThreads which takes total threads so:
     //   grid_x = ceil(N/4) * 4 * 32,  grid_y = ceil(M/2) * 2.
+    //
+    // Within Tier 1a we pick the double-buffered variant (`xnor_u32_tiled_db`)
+    // whenever Kp ≥ 2*KT — gives the pipeline at least one round of overlap.
+    // KT=256 in the kernel; below that the bootstrap-only single-buffer kernel
+    // is identical and slightly cheaper (no second tile alloc).
     constexpr int64_t TM = 2, TN = 4;
+    constexpr int64_t KT = 256;
     if (pw == 32 && M >= TM * 2 && N >= TN * 2) {
         const int64_t grid_x = ((N + TN - 1) / TN) * TN * 32;
         const int64_t grid_y = ((M + TM - 1) / TM) * TM;
         MTLSize grid = MTLSizeMake((NSUInteger)grid_x, (NSUInteger)grid_y, 1);
         MTLSize tg   = MTLSizeMake((NSUInteger)(TN * 32), (NSUInteger)TM, 1);
-        dispatch_kernel("xnor_u32_tiled",
+        const char* kernel_name =
+            (Kp >= 2 * KT) ? "xnor_u32_tiled_db" : "xnor_u32_tiled";
+        dispatch_kernel(kernel_name,
             {{mtl_buf(Ac), byte_offset(Ac)},
              {mtl_buf(Bc), byte_offset(Bc)},
              {mtl_buf(C),  byte_offset(C)}},

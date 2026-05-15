@@ -47,7 +47,10 @@ inline const uint8_t* byte_ptr(const at::Tensor& t) { return static_cast<const u
 // Grain size for at::parallel_for: roughly "min work per thread" in elements.
 // Tuned so that single-element / tiny-tensor cases stay on the calling thread.
 constexpr int64_t POPCOUNT_GRAIN = 4096;
-constexpr int64_t ROW_GRAIN      = 1;       // per-row workloads (matmul, pack)
+constexpr int64_t ROW_GRAIN      = 1;       // per-row workloads (pack/unpack)
+// Matmul grain: 4 rows = one Mr microkernel block. Keeps each parallel_for
+// worker doing whole-microkernel-batches instead of fragmenting Mr groups.
+constexpr int64_t MATMUL_M_GRAIN = 4;
 
 } // anon
 
@@ -183,10 +186,14 @@ at::Tensor unpack_bool(const at::Tensor& packed, at::IntArrayRef logical_shape, 
     return output;
 }
 
-// 
-// xnor_popcount_matmul — in-register XNOR + PopulationCount + ReduceSum
-// fused inner loop. No scratch buffer; pure register pipeline.
-// 
+//
+// xnor_popcount_matmul — register-blocked XOR + PopulationCount + ReduceSum.
+// Mr×Nr=4×4 microkernel computes 16 output cells per inner-K iteration with
+// 8 vector loads, quadrupling arithmetic intensity vs the legacy single-cell
+// loop. Outer loop is N-tiled (N_TILE=64) so the active B-tile stays in L1/L2
+// and is reused across all M rows in this worker. Parallel-for slices M in
+// MATMUL_M_GRAIN=4 chunks so each worker handles whole microkernel groups.
+//
 at::Tensor xnor_popcount_matmul(const at::Tensor& A, const at::Tensor& B,
                                 int64_t K, int64_t pw) {
     TORCH_CHECK(A.dim() == 2 && B.dim() == 2,
@@ -198,59 +205,49 @@ at::Tensor xnor_popcount_matmul(const at::Tensor& A, const at::Tensor& B,
 
     auto Ac = A.contiguous();
     auto Bc = B.contiguous();
-    auto C  = at::zeros({M, N}, at::kInt);
+    auto C  = at::empty({M, N}, at::kInt);
     int32_t* c = C.data_ptr<int32_t>();
 
-    const int32_t K_eff = (int32_t)(2LL * Kp * pw - K);
+    const int32_t K_logical = (int32_t)K;
 
-    // N-tiling: process B in N_TILE-column chunks so the active B-tile
-    // (N_TILE × Kp words) fits in L1/L2 and is reused across all A rows
-    // handled by the same parallel worker, rather than streaming the full
-    // B matrix once per A row.  N_TILE=64 keeps a 64×Kp tile in L1 for
-    // small Kp and comfortably in L2 for larger ones.
+    // N-tiling keeps the active B-tile in L1/L2 across all M rows in this
+    // worker. N_TILE=64 chosen empirically: 64 * Kp uint64 words ≈ 0.5 KB ×
+    // Kp/8, well within L1 for typical Kp ≤ 256 and L2 for everything else.
     constexpr int64_t N_TILE = 64;
 
-    // Dispatch by pack width to instantiate the right unsigned word type.
-    if (pw == 64) {
-        const auto* a = reinterpret_cast<const uint64_t*>(Ac.data_ptr<int64_t>());
-        const auto* b = reinterpret_cast<const uint64_t*>(Bc.data_ptr<int64_t>());
-        at::parallel_for(0, M, ROW_GRAIN, [&](int64_t ms, int64_t me) {
+    // Dispatch by pack width. The microkernel reinterprets all word types as
+    // uint64; choice of T only affects pointer arithmetic.
+    auto run = [&](auto T_tag) {
+        using T = decltype(T_tag);
+        const T* a = reinterpret_cast<const T*>(Ac.data_ptr());
+        const T* b = reinterpret_cast<const T*>(Bc.data_ptr());
+
+        at::parallel_for(0, M, MATMUL_M_GRAIN, [&](int64_t ms, int64_t me) {
             for (int64_t n_start = 0; n_start < N; n_start += N_TILE) {
                 const int64_t n_cnt = std::min(N_TILE, N - n_start);
-                for (int64_t m = ms; m < me; ++m) {
-                    hnk::XnorPopcountRow<uint64_t>(
-                        a + m * Kp, b + n_start * Kp, Kp, n_cnt, K_eff,
+
+                // Process Mr=4 rows at a time with the register-blocked
+                // microkernel; trailing rows fall to the single-row driver.
+                int64_t m = ms;
+                for (; m + 4 <= me; m += 4) {
+                    hnk::XorPopcountBlock_4xN<T>(
+                        a + (m + 0) * Kp, a + (m + 1) * Kp,
+                        a + (m + 2) * Kp, a + (m + 3) * Kp,
+                        b + n_start * Kp, Kp, n_cnt, K_logical,
+                        c + m * N + n_start, /*ldC=*/N);
+                }
+                for (; m < me; ++m) {
+                    hnk::XorPopcountRow<T>(
+                        a + m * Kp, b + n_start * Kp, Kp, n_cnt, K_logical,
                         c + m * N + n_start);
                 }
             }
         });
-    } else if (pw == 32) {
-        const auto* a = reinterpret_cast<const uint32_t*>(Ac.data_ptr<int32_t>());
-        const auto* b = reinterpret_cast<const uint32_t*>(Bc.data_ptr<int32_t>());
-        at::parallel_for(0, M, ROW_GRAIN, [&](int64_t ms, int64_t me) {
-            for (int64_t n_start = 0; n_start < N; n_start += N_TILE) {
-                const int64_t n_cnt = std::min(N_TILE, N - n_start);
-                for (int64_t m = ms; m < me; ++m) {
-                    hnk::XnorPopcountRow<uint32_t>(
-                        a + m * Kp, b + n_start * Kp, Kp, n_cnt, K_eff,
-                        c + m * N + n_start);
-                }
-            }
-        });
-    } else { // pw == 8
-        const auto* a = Ac.data_ptr<uint8_t>();
-        const auto* b = Bc.data_ptr<uint8_t>();
-        at::parallel_for(0, M, ROW_GRAIN, [&](int64_t ms, int64_t me) {
-            for (int64_t n_start = 0; n_start < N; n_start += N_TILE) {
-                const int64_t n_cnt = std::min(N_TILE, N - n_start);
-                for (int64_t m = ms; m < me; ++m) {
-                    hnk::XnorPopcountRow<uint8_t>(
-                        a + m * Kp, b + n_start * Kp, Kp, n_cnt, K_eff,
-                        c + m * N + n_start);
-                }
-            }
-        });
-    }
+    };
+
+    if      (pw == 64) run(uint64_t{});
+    else if (pw == 32) run(uint32_t{});
+    else               run(uint8_t{});
     return C;
 }
 

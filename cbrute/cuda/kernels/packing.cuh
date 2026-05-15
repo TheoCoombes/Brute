@@ -21,6 +21,9 @@
 //
 // Throughput tricks:
 //   * pack: one warp (32 threads) → one 32-bit packed chunk via __ballot_sync.
+//     Each thread loads its bool via `__ldg` (read-only cache); for huge inputs
+//     a persistent variant batches multiple chunks per warp to amortise grid
+//     launch + setup costs.
 //   * unpack: lane 0 reads the chunk, __shfl_sync broadcasts, each lane extracts
 //             its own bit. No global-memory bank conflicts.
 
@@ -74,7 +77,10 @@ __global__ inline void k_pack_bool_warp(const uint8_t* __restrict__ in_bool,
     const int lane      = threadIdx.x;          // exactly one warp / block
     const int64_t bit_in_row = (int64_t)chunk_idx * 32 + lane;
 
-    const bool b = (bit_in_row < ld) ? (in_bool[row * ld + bit_in_row] != 0)
+    // __ldg: route load through the read-only cache. pack_bool is a one-shot
+    // read (no aliasing risk) so the texture cache amortises L2 traffic
+    // across warps that touch nearby bytes.
+    const bool b = (bit_in_row < ld) ? (__ldg(in_bool + row * ld + bit_in_row) != 0)
                                      : false;
     const unsigned mask = __ballot_sync(0xFFFFFFFFu, b);
 
@@ -82,6 +88,39 @@ __global__ inline void k_pack_bool_warp(const uint8_t* __restrict__ in_bool,
         const int64_t out_off    = row * row_bytes + (int64_t)chunk_idx * 4;
         const int64_t bytes_left = row_bytes - (int64_t)chunk_idx * 4;
         store_chunk(out_bytes + out_off, mask, bytes_left, aligned4 != 0);
+    }
+}
+
+// Persistent kernel variant: each warp grid-strides over multiple chunks,
+// amortising launch overhead for huge batches. The driver picks this when
+// total work (n_chunks * batch) is large enough that scheduler overhead would
+// otherwise dominate.
+__global__ inline void k_pack_bool_persistent(const uint8_t* __restrict__ in_bool,
+                                              uint8_t* __restrict__ out_bytes,
+                                              int64_t ld, int64_t row_bytes,
+                                              int64_t batch,
+                                              int chunks_per_row,
+                                              int aligned4) {
+    const int lane = threadIdx.x & 31;
+    const int warp_in_block = threadIdx.x >> 5;
+    const int warps_per_block = blockDim.x >> 5;
+    const int64_t global_warp_id =
+        (int64_t)blockIdx.x * warps_per_block + warp_in_block;
+    const int64_t total_warps = (int64_t)gridDim.x * warps_per_block;
+    const int64_t total_work  = batch * (int64_t)chunks_per_row;
+
+    for (int64_t w = global_warp_id; w < total_work; w += total_warps) {
+        const int64_t row       = w / chunks_per_row;
+        const int     chunk_idx = (int)(w % chunks_per_row);
+        const int64_t bit_in_row = (int64_t)chunk_idx * 32 + lane;
+        const bool b = (bit_in_row < ld) ? (__ldg(in_bool + row * ld + bit_in_row) != 0)
+                                         : false;
+        const unsigned mask = __ballot_sync(0xFFFFFFFFu, b);
+        if (lane == 0) {
+            const int64_t out_off    = row * row_bytes + (int64_t)chunk_idx * 4;
+            const int64_t bytes_left = row_bytes - (int64_t)chunk_idx * 4;
+            store_chunk(out_bytes + out_off, mask, bytes_left, aligned4 != 0);
+        }
     }
 }
 
@@ -94,7 +133,7 @@ __global__ inline void k_pack_float_warp(const float* __restrict__ in_f,
     const int lane      = threadIdx.x;
     const int64_t bit_in_row = (int64_t)chunk_idx * 32 + lane;
 
-    const bool b = (bit_in_row < ld) ? (in_f[row * ld + bit_in_row] > 0.0f)
+    const bool b = (bit_in_row < ld) ? (__ldg(in_f + row * ld + bit_in_row) > 0.0f)
                                      : false;
     const unsigned mask = __ballot_sync(0xFFFFFFFFu, b);
 
@@ -151,6 +190,38 @@ __global__ inline void k_unpack_pm1_warp(const uint8_t* __restrict__ in_bytes,
     const int64_t bit_in_row = (int64_t)chunk_idx * 32 + lane;
     if (bit_in_row < ll) {
         out_f[row * ll + bit_in_row] = ((mask >> lane) & 1u) ? 1.0f : -1.0f;
+    }
+}
+
+// Persistent unpack-bool: amortise launch overhead for huge batches.
+__global__ inline void k_unpack_bool_persistent(const uint8_t* __restrict__ in_bytes,
+                                                uint8_t* __restrict__ out_bool,
+                                                int64_t ll, int64_t row_bytes,
+                                                int64_t batch,
+                                                int chunks_per_row,
+                                                int aligned4) {
+    const int lane = threadIdx.x & 31;
+    const int warp_in_block = threadIdx.x >> 5;
+    const int warps_per_block = blockDim.x >> 5;
+    const int64_t global_warp_id =
+        (int64_t)blockIdx.x * warps_per_block + warp_in_block;
+    const int64_t total_warps = (int64_t)gridDim.x * warps_per_block;
+    const int64_t total_work  = batch * (int64_t)chunks_per_row;
+
+    for (int64_t w = global_warp_id; w < total_work; w += total_warps) {
+        const int64_t row       = w / chunks_per_row;
+        const int     chunk_idx = (int)(w % chunks_per_row);
+        unsigned mask = 0;
+        if (lane == 0) {
+            const int64_t in_off     = row * row_bytes + (int64_t)chunk_idx * 4;
+            const int64_t bytes_left = row_bytes - (int64_t)chunk_idx * 4;
+            mask = load_chunk(in_bytes + in_off, bytes_left, aligned4 != 0);
+        }
+        mask = __shfl_sync(0xFFFFFFFFu, mask, 0);
+        const int64_t bit_in_row = (int64_t)chunk_idx * 32 + lane;
+        if (bit_in_row < ll) {
+            out_bool[row * ll + bit_in_row] = (uint8_t)((mask >> lane) & 1u);
+        }
     }
 }
 

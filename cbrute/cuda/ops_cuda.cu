@@ -120,17 +120,33 @@ at::Tensor pack_bool(const at::Tensor& input, int64_t pw) {
     const int64_t batch     = inp.numel() / ld;
     out_shape.back() = pd_words;
 
-     auto output = at::zeros(out_shape, inp.options().dtype(pack_scalar_type(pw)));
-     const int chunks = (int)((ld + 31) / 32);
-     const bool aligned4 = (pw == 32 || pw == 64);
-     dim3 grid((unsigned)chunks, (unsigned)batch);
-     dim3 block(32);
-     kernels::k_pack_bool_warp<<<grid, block, 0, cur_stream()>>>(
-         reinterpret_cast<const uint8_t*>(inp.data_ptr<bool>()),
-         as_u8(output),
-         ld, row_bytes, aligned4);
-     return output;
- }
+    auto output = at::zeros(out_shape, inp.options().dtype(pack_scalar_type(pw)));
+    const int chunks = (int)((ld + 31) / 32);
+    const bool aligned4 = (pw == 32 || pw == 64);
+
+    // Persistent kernel for large inputs: ~256 blocks × 256 threads = 8 warps
+    // per block × 256 blocks = 2048 warps grid-strides over total work.
+    // Cuts launch overhead drastically for the huge-batch case while remaining
+    // correct (each warp handles disjoint chunks).
+    const int64_t total_chunks = batch * (int64_t)chunks;
+    constexpr int64_t PERSISTENT_THRESHOLD = 32 * 1024;  // ≈ 1 MB of bool input
+    if (total_chunks >= PERSISTENT_THRESHOLD) {
+        dim3 block(256);                   // 8 warps per block
+        dim3 grid(256);                    // saturate most consumer GPUs
+        kernels::k_pack_bool_persistent<<<grid, block, 0, cur_stream()>>>(
+            reinterpret_cast<const uint8_t*>(inp.data_ptr<bool>()),
+            as_u8(output),
+            ld, row_bytes, batch, chunks, aligned4);
+    } else {
+        dim3 grid((unsigned)chunks, (unsigned)batch);
+        dim3 block(32);
+        kernels::k_pack_bool_warp<<<grid, block, 0, cur_stream()>>>(
+            reinterpret_cast<const uint8_t*>(inp.data_ptr<bool>()),
+            as_u8(output),
+            ld, row_bytes, aligned4);
+    }
+    return output;
+}
 
 // 
 // unpack_bits (packed → ±1 float32)
@@ -179,21 +195,50 @@ at::Tensor unpack_bool(const at::Tensor& packed, at::IntArrayRef logical_shape, 
      const int64_t batch     = p.numel() / pl_words;
      const bool aligned4 = (pw == 32 || pw == 64);
 
-     auto output = at::empty(logical_shape.vec(), p.options().dtype(at::kBool));
-     const int chunks = (int)((ll + 31) / 32);
-     dim3 grid((unsigned)chunks, (unsigned)batch);
-     dim3 block(32);
-     kernels::k_unpack_bool_warp<<<grid, block, 0, cur_stream()>>>(
-         as_u8(p),
-         reinterpret_cast<uint8_t*>(output.data_ptr<bool>()),
-         ll, row_bytes, aligned4);
-     return output;
- }
+    auto output = at::empty(logical_shape.vec(), p.options().dtype(at::kBool));
+    const int chunks = (int)((ll + 31) / 32);
 
-// 
-// xnor_popcount_matmul — CUTLASS B1 GEMM where supported, hand kernel else.
-// Output semantic identical to CPU: C = 2*popc_xnor − K_eff = K − 2*popc_xor.
-// 
+    // Persistent variant for huge inputs (same threshold as pack_bool).
+    const int64_t total_chunks = batch * (int64_t)chunks;
+    constexpr int64_t PERSISTENT_THRESHOLD = 32 * 1024;
+    if (total_chunks >= PERSISTENT_THRESHOLD) {
+        dim3 block(256);
+        dim3 grid(256);
+        kernels::k_unpack_bool_persistent<<<grid, block, 0, cur_stream()>>>(
+            as_u8(p),
+            reinterpret_cast<uint8_t*>(output.data_ptr<bool>()),
+            ll, row_bytes, batch, chunks, aligned4);
+    } else {
+        dim3 grid((unsigned)chunks, (unsigned)batch);
+        dim3 block(32);
+        kernels::k_unpack_bool_warp<<<grid, block, 0, cur_stream()>>>(
+            as_u8(p),
+            reinterpret_cast<uint8_t*>(output.data_ptr<bool>()),
+            ll, row_bytes, aligned4);
+    }
+    return output;
+}
+
+//
+// xnor_popcount_matmul — CUTLASS B1 GEMM with auto-padding for arbitrary
+// shapes; hand-tuned fallback only when CUTLASS truly cannot run.
+//
+// Output semantic: C = K − 2·popc_xor(A, B).
+//
+// Strategy:
+//   1. Always reinterpret packed buffer as uint32 storage (CUTLASS B1 requires
+//      it). pw==8 / pw==64 just changes the leading-dim arithmetic — bytes are
+//      identical regardless. As long as Kp_bits is a multiple of 32, we can
+//      view the storage as uint32 array.
+//   2. Pad M, N, K to CUTLASS tile alignment (M%8, N%8, K%256) by allocating
+//      padded views with zero padding bits. The pad rows/cols of the result
+//      are computed by the GEMM but discarded by slicing.
+//   3. Run CUTLASS, slice output, apply C = K − 2H epilogue.
+//   4. Fallback to the hand-tuned fallback kernel only when:
+//        * compute capability < 80 (no B1 tensor cores), OR
+//        * total padded K cost would exceed the actual K (i.e. K is so small
+//          that padding to 256 bits is mostly waste — the fallback is faster).
+//
 at::Tensor xnor_popcount_matmul(const at::Tensor& A, const at::Tensor& B,
                                 int64_t K, int64_t pw) {
     TORCH_CHECK(A.dim() == 2 && B.dim() == 2,
@@ -205,29 +250,72 @@ at::Tensor xnor_popcount_matmul(const at::Tensor& A, const at::Tensor& B,
 
     auto Ac = A.contiguous();
     auto Bc = B.contiguous();
-    auto C  = at::zeros({M, N}, A.options().dtype(at::kInt));
 
     const int64_t Kp_bits = Kp * pw;
     const int     cc      = compute_capability();
-    const bool    cutlass_ok =
-        (cc >= 80) && (Kp_bits % 256 == 0) && (Kp_bits >= 256)
-        && (M % 8 == 0) && (N % 8 == 0);
 
-    if (cutlass_ok) {
-        // CUTLASS B1 XOR-popc GEMM. The accumulator is the Hamming distance H;
-        // we then post-process C = K − 2·H to match the CPU semantic.
+    // Decide CUTLASS eligibility:
+    //   cc >= 80 (Ampere+, has B1 MMA)
+    //   Kp_bits % 32 == 0 (true for any pw≥32; for pw=8 requires Kp%4==0).
+    //   Kp_bits >= 256 (B1 MMA's K-tile is 256 bits — anything smaller forces
+    //                   so much padding that the fallback kernel wins).
+    const bool kp_bits_aligned32 = (Kp_bits % 32 == 0);
+    const bool cutlass_eligible  = (cc >= 80) && kp_bits_aligned32 && (Kp_bits >= 256);
+
+    if (cutlass_eligible) {
+        // CUTLASS tile alignment requirements.
+        constexpr int64_t M_ALIGN = 8;
+        constexpr int64_t N_ALIGN = 8;
+        constexpr int64_t K_BIT_ALIGN = 256;
+        const int64_t M_pad = (M + M_ALIGN - 1) / M_ALIGN * M_ALIGN;
+        const int64_t N_pad = (N + N_ALIGN - 1) / N_ALIGN * N_ALIGN;
+        const int64_t Kp_bits_pad =
+            (Kp_bits + K_BIT_ALIGN - 1) / K_BIT_ALIGN * K_BIT_ALIGN;
+        // Padded packed-uint32 leading dim. CUTLASS works in bits internally
+        // but our buffer is uint32-aligned; size it to an integral uint32 count
+        // so allocations and copies stay byte-aligned.
+        const int64_t Kp32_pad = Kp_bits_pad / 32;
+
+        const bool needs_pad = (M_pad != M) || (N_pad != N)
+                            || (Kp_bits_pad != Kp_bits) || (pw != 32);
+
+        // View / allocate uint32 working tensors.
+        auto opts_u32 = A.options().dtype(at::kInt);
+        at::Tensor A_u32, B_u32;
+        if (!needs_pad && pw == 32) {
+            // Zero-copy fast path.
+            A_u32 = Ac;
+            B_u32 = Bc;
+        } else {
+            A_u32 = at::zeros({M_pad, Kp32_pad}, opts_u32);
+            B_u32 = at::zeros({N_pad, Kp32_pad}, opts_u32);
+            // Compute the unpadded uint32 leading dim, then memcpy each row.
+            const int64_t Kp32_in = Kp_bits / 32;
+            // Per-row byte stride of source = Kp * pw/8 = Kp_bits/8 bytes.
+            // Per-row byte stride in uint32 dest = Kp32_pad * 4 bytes.
+            cudaMemcpy2DAsync(
+                A_u32.data_ptr(), Kp32_pad * sizeof(uint32_t),
+                Ac.data_ptr(),    Kp32_in  * sizeof(uint32_t),
+                Kp32_in * sizeof(uint32_t), M,
+                cudaMemcpyDeviceToDevice, cur_stream());
+            cudaMemcpy2DAsync(
+                B_u32.data_ptr(), Kp32_pad * sizeof(uint32_t),
+                Bc.data_ptr(),    Kp32_in  * sizeof(uint32_t),
+                Kp32_in * sizeof(uint32_t), N,
+                cudaMemcpyDeviceToDevice, cur_stream());
+            // Trailing M_pad - M, N_pad - N rows stay all-zero (already zeroed).
+        }
+
+        auto C_pad = at::empty({M_pad, N_pad}, opts_u32);
+
         using Gemm = kernels::CutlassB1XorGemm;
         Gemm gemm_op;
-
-        // Bit-level leading dimensions: A is (M, Kp_bits), B is laid out in
-        // memory as (N, Kp_bits) row-major, which is equivalent to a
-        // (Kp_bits, N) column-major view with leading dim = Kp_bits.
         typename Gemm::Arguments args{
-            {(int)M, (int)N, (int)Kp_bits},
-            {reinterpret_cast<cutlass::uint1b_t const*>(Ac.data_ptr()), (int)Kp_bits},
-            {reinterpret_cast<cutlass::uint1b_t const*>(Bc.data_ptr()), (int)Kp_bits},
-            {C.data_ptr<int32_t>(), (int)N},
-            {C.data_ptr<int32_t>(), (int)N},
+            {(int)M_pad, (int)N_pad, (int)Kp_bits_pad},
+            {reinterpret_cast<cutlass::uint1b_t const*>(A_u32.data_ptr()), (int)Kp_bits_pad},
+            {reinterpret_cast<cutlass::uint1b_t const*>(B_u32.data_ptr()), (int)Kp_bits_pad},
+            {C_pad.data_ptr<int32_t>(), (int)N_pad},
+            {C_pad.data_ptr<int32_t>(), (int)N_pad},
             {1, 0}    // alpha=1, beta=0 — accum is H directly.
         };
 
@@ -235,15 +323,22 @@ at::Tensor xnor_popcount_matmul(const at::Tensor& A, const at::Tensor& B,
         TORCH_CHECK(status == cutlass::Status::kSuccess,
                     "CUTLASS B1 GEMM failed: ", int(status));
 
-        const int64_t n_elems = M * N;
+        // Pad bits in A_u32 / B_u32 are zero, so they XOR to zero and contribute
+        // nothing to H — the slice [:M, :N] of C_pad is the correct H matrix
+        // for the unpadded inputs. Apply K - 2H epilogue in-place.
+        const int64_t n_elems_pad = M_pad * N_pad;
         dim3 block(256);
-        dim3 grid((unsigned)((n_elems + 255) / 256));
+        dim3 grid((unsigned)((n_elems_pad + 255) / 256));
         kernels::k_kminus2_inplace<<<grid, block, 0, cur_stream()>>>(
-            C.data_ptr<int32_t>(), n_elems, (int32_t)K);
-        return C;
+            C_pad.data_ptr<int32_t>(), n_elems_pad, (int32_t)K);
+
+        if (M_pad == M && N_pad == N) return C_pad;
+        return C_pad.slice(0, 0, M).slice(1, 0, N).contiguous();
     }
 
-    // Fallback path: hand-tuned XNOR-popc kernel.
+    // Fallback path: hand-tuned XOR-popc kernel. Used for sm_70/sm_75 or for
+    // tiny K where the CUTLASS pad cost outweighs its tensor-core win.
+    auto C = at::zeros({M, N}, A.options().dtype(at::kInt));
     const int32_t K_eff = (int32_t)(2LL * Kp * pw - K);
     dim3 block(16, 16);
     dim3 grid((unsigned)((N + 15) / 16), (unsigned)((M + 15) / 16));

@@ -76,6 +76,7 @@ _FLATTEN_FUNCS  = frozenset([torch.Tensor.flatten, torch.flatten])
 _TRANSPOSE_FUNCS = frozenset([torch.Tensor.transpose, torch.transpose])
 _CONTIG_FUNCS   = frozenset([torch.Tensor.contiguous])
 _CLONE_FUNCS    = frozenset([torch.Tensor.clone, torch.clone])
+_DETACH_FUNCS   = frozenset([torch.Tensor.detach, torch.detach])
 _FILL_FUNCS     = frozenset([torch.Tensor.fill_])
 _ZERO_FUNCS     = frozenset([torch.Tensor.zero_])
 
@@ -1070,6 +1071,19 @@ class Tensor(torch.Tensor):
             )
         return super().clone(memory_format=memory_format)
 
+    def detach(self):
+        # Detach should be a pure-metadata op: same packed storage, autograd
+        # severed. Forwarding to the bool-view fallback would unpack the
+        # entire packed buffer for nothing. Reuse `_packed_buf_cache` directly
+        # via `_make_bit1_from_packed` — no copy, no unpack.
+        if getattr(self, '_is_bit1', False) and self.dim() >= 1:
+            pb = self.__dict__.get('_packed_buf_cache')
+            if pb is not None:
+                return Tensor._make_bit1_from_packed(
+                    pb.detach(), list(self.shape), self._pack_dtype,
+                )
+        return super().detach()
+
     # Transpose (preserves _t_source for fast A @ B.t() matmul)
 
     def t(self) -> 'Tensor':
@@ -1437,6 +1451,18 @@ class Tensor(torch.Tensor):
                     return Tensor._make_bit1_from_packed(
                         a._packed_buf.clone(), list(a.shape), a._pack_dtype,
                     )
+
+            # detach() — pure metadata. Reuses the existing packed buffer
+            # (with autograd severed) instead of forcing a full bool unpack.
+            # Closes the 0.00× regression on `view/detach_fn` benchmarks.
+            if func in _DETACH_FUNCS and len(bit1_ins) == 1:
+                a = bit1_ins[0]
+                if a.dim() >= 1:
+                    pb = a.__dict__.get('_packed_buf_cache')
+                    if pb is not None:
+                        return Tensor._make_bit1_from_packed(
+                            pb.detach(), list(a.shape), a._pack_dtype,
+                        )
 
             # torch.index_select(x, dim, idx) on axis 0 — gather rows of packed.
             if func in (torch.index_select, torch.Tensor.index_select) \

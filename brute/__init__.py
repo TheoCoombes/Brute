@@ -139,7 +139,16 @@ from brute.functional import (
     tril, triu, trace,
 )
 
-# Misc 
+# Misc
 from brute.functional import (
     nan_to_num, diff, block_diag, cartesian_prod,
 )
+
+# Neural-network building blocks (BruteLinear etc.)
+from brute import nn  # noqa: F401  (subpackage exposed as brute.nn)
+
+# CUDA helpers — import lazily to avoid hard dependency on torch.cuda symbols
+# in non-CUDA builds.
+from brute import cuda_graphs  # noqa: F401
+from brute import streams       # noqa: F401
+parallel_streams = streams.parallel_streams

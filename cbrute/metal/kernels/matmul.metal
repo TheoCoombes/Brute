@@ -229,3 +229,118 @@ kernel void xnor_u32_tiled(
         C[m * N + n] = 2 * (int)total - K_eff;
     }
 }
+
+//  Double-buffered tiled matmul
+// Same per-tile dimensions as `xnor_u32_tiled` but uses two A/B threadgroup
+// tile buffers and overlaps load[k+1] with compute[k]. Hides L1↔threadgroup
+// load latency behind compute. Active when Kp ≥ 2*KT (otherwise the second
+// tile would run dry).
+//
+// Layout (identical to xnor_u32_tiled): TM=2, TN=4, KT=256.
+//   TG = (TN*32, TM, 1) = (128, 2, 1) = 256 threads
+//   threadgroup memory: 2× A_tile[TM*KT] + 2× B_tile[TN*KT] = ~12 KB
+//
+// Ping-pong index `buf` flips each K-tile iteration: thread loads into
+// `1 - buf` while computing from `buf`. Both `mem_threadgroup` barriers
+// keep the read/write phases ordered relative to each simdgroup.
+
+kernel void xnor_u32_tiled_db(
+    device const uint* A     [[buffer(0)]],
+    device const uint* B     [[buffer(1)]],
+    device int*        C     [[buffer(2)]],
+    constant int&      N     [[buffer(3)]],
+    constant int&      Kp    [[buffer(4)]],
+    constant int&      K_eff [[buffer(5)]],
+    constant int&      M     [[buffer(6)]],
+    uint3 tgid  [[threadgroup_position_in_grid]],
+    uint  sg_id [[simdgroup_index_in_threadgroup]],
+    uint  lane  [[thread_index_in_simdgroup]],
+    uint  tid   [[thread_index_in_threadgroup]])
+{
+    constexpr int TM = 2, TN = 4, KT = 256;
+    threadgroup uint A_tile[2][TM * KT];
+    threadgroup uint B_tile[2][TN * KT];
+
+    const int n_base = (int)tgid.x;
+    const int m_base = (int)tgid.y;
+
+    const int sg_y = (int)sg_id / TN;
+    const int sg_x = (int)sg_id % TN;
+
+    const int m = m_base * TM + sg_y;
+    const int n = n_base * TN + sg_x;
+
+    uint total = 0u;
+    const int total_threads = TM * TN * 32;
+    int buf = 0;
+
+    // ── Bootstrap: load tile 0 into buf=0 ──
+    {
+        const int k_start = 0;
+        const int k_cnt   = min(KT, Kp);
+        for (int t = (int)tid; t < TM * k_cnt; t += total_threads) {
+            const int row = t / k_cnt, col = t % k_cnt;
+            const int src_m = m_base * TM + row;
+            A_tile[0][row * KT + col] =
+                (src_m < M) ? A[src_m * Kp + k_start + col] : 0u;
+        }
+        for (int t = (int)tid; t < TN * k_cnt; t += total_threads) {
+            const int row = t / k_cnt, col = t % k_cnt;
+            const int src_n = n_base * TN + row;
+            B_tile[0][row * KT + col] =
+                (src_n < N) ? B[src_n * Kp + k_start + col] : 0u;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // ── Pipeline body: load tile k+1 while computing tile k ──
+    int k_start = 0;
+    while (true) {
+        const int k_cnt = min(KT, Kp - k_start);
+        const int next_k_start = k_start + KT;
+        const bool has_next = (next_k_start < Kp);
+
+        // Issue loads for the next tile (into 1-buf) before computing.
+        if (has_next) {
+            const int next_k_cnt = min(KT, Kp - next_k_start);
+            const int nb = 1 - buf;
+            for (int t = (int)tid; t < TM * next_k_cnt; t += total_threads) {
+                const int row = t / next_k_cnt, col = t % next_k_cnt;
+                const int src_m = m_base * TM + row;
+                A_tile[nb][row * KT + col] =
+                    (src_m < M) ? A[src_m * Kp + next_k_start + col] : 0u;
+            }
+            for (int t = (int)tid; t < TN * next_k_cnt; t += total_threads) {
+                const int row = t / next_k_cnt, col = t % next_k_cnt;
+                const int src_n = n_base * TN + row;
+                B_tile[nb][row * KT + col] =
+                    (src_n < N) ? B[src_n * Kp + next_k_start + col] : 0u;
+            }
+        }
+
+        // Compute current tile from `buf`. acc accumulated by every lane in
+        // the simdgroup so simd_sum is uniform — out-of-bounds threads add 0.
+        // XNOR-popcount (matches the original xnor_u32_tiled semantic).
+        uint acc = 0u;
+        if (m < M && n < N) {
+            for (int k = (int)lane; k < k_cnt; k += 32) {
+                acc += popcount(~(A_tile[buf][sg_y * KT + k]
+                                ^ B_tile[buf][sg_x * KT + k]));
+            }
+        }
+        total += simd_sum(acc);
+
+        // Barrier ensures next iteration sees completed loads in 1-buf
+        // AND that the simd_sum results from this iteration are sequenced
+        // before any future read of `buf`.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (!has_next) break;
+        buf = 1 - buf;
+        k_start = next_k_start;
+    }
+
+    if (lane == 0 && m < M && n < N) {
+        C[m * N + n] = 2 * (int)total - K_eff;
+    }
+}
