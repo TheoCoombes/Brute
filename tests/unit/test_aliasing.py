@@ -9,37 +9,36 @@ from tests.helpers import (
     assert_bit1_matches_bool,
     assert_different_storage,
     assert_same_storage,
-    bit1,
 )
 
 
 def test_view_shares_storage(device):
-    x = bit1(torch.zeros((8, 8), dtype=torch.bool, device=device))
+    x = brute.zeros((8, 8), dtype=brute.bit1, device=device)
     v = x[:, ::2]
     assert_same_storage(x, v)
 
 
 def test_transpose_shares_storage(device):
-    x = bit1(torch.zeros((4, 5), dtype=torch.bool, device=device))
+    x = brute.zeros((4, 5), dtype=brute.bit1, device=device)
     t = x.t()
     assert_same_storage(x, t)
 
 
 def test_clone_distinct_storage(device):
-    x = bit1(torch.zeros((4,), dtype=torch.bool, device=device))
+    x = brute.zeros(4, dtype=brute.bit1, device=device)
     c = x.clone()
     assert_different_storage(x, c)
 
 
 def test_contiguous_distinct_storage_after_transpose(device):
-    x = bit1(torch.zeros((4, 5), dtype=torch.bool, device=device))
+    x = brute.zeros((4, 5), dtype=brute.bit1, device=device)
     c = x.t().contiguous()
     assert_different_storage(x, c)
 
 
 def test_view_alias_propagation(device):
     """Mutation through a view must propagate back to the base."""
-    base = bit1(torch.zeros((8, 8), dtype=torch.bool, device=device))
+    base = brute.zeros((8, 8), dtype=brute.bit1, device=device)
     view = base[:, ::2]
 
     view.fill_(True)
@@ -50,7 +49,7 @@ def test_view_alias_propagation(device):
 
 
 def test_overlapping_view_inplace(device):
-    x = bit1(torch.zeros((16,), dtype=torch.bool, device=device))
+    x = brute.zeros(16, dtype=brute.bit1, device=device)
     a = x[1:]
     a.fill_(True)
     expected = torch.tensor([False] + [True] * 15, device=device)
@@ -58,7 +57,7 @@ def test_overlapping_view_inplace(device):
 
 
 def test_mutation_through_setitem_propagates(device):
-    base = bit1(torch.zeros((4, 4), dtype=torch.bool, device=device))
+    base = brute.zeros((4, 4), dtype=brute.bit1, device=device)
     base[0, :] = True
     expected = torch.zeros((4, 4), dtype=torch.bool, device=device)
     expected[0, :] = True
@@ -66,9 +65,8 @@ def test_mutation_through_setitem_propagates(device):
 
 
 def test_clone_does_not_alias_packed_buf(device):
-    x = bit1(torch.zeros((16,), dtype=torch.bool, device=device))
+    x = brute.zeros(16, dtype=brute.bit1, device=device)
     c = x.clone()
-    # Mutate the clone — original must remain untouched.
     c.as_subclass(torch.Tensor).fill_(True)
     assert torch.equal(
         x.bool().as_subclass(torch.Tensor),
@@ -77,6 +75,6 @@ def test_clone_does_not_alias_packed_buf(device):
 
 
 def test_view_dtype_preserved(device):
-    x = bit1(torch.zeros((4, 4), dtype=torch.bool, device=device))
+    x = brute.zeros((4, 4), dtype=brute.bit1, device=device)
     v = x[:, ::2]
     assert v.dtype == brute.bit1

@@ -6,7 +6,6 @@ import torch
 import torch.fx
 
 import brute
-from tests.helpers import bit1
 
 
 def test_fx_trace_simple(device):
@@ -18,7 +17,7 @@ def test_fx_trace_simple(device):
     except Exception as e:
         pytest.xfail(f"FX trace unsupported: {e}")
 
-    a = bit1(torch.tensor([True, False, True], device=device))
+    a = brute.tensor([True, False, True], dtype=brute.bit1, device=device)
     out = traced(a)
     ref = torch.logical_not(torch.tensor([True, False, True], device=device))
     assert torch.equal(out.bool().as_subclass(torch.Tensor).cpu(), ref.cpu())
@@ -33,8 +32,8 @@ def test_fx_trace_compose(device):
     except Exception as e:
         pytest.xfail(f"FX trace unsupported: {e}")
 
-    a = bit1(torch.tensor([True, False, True], device=device))
-    b = bit1(torch.tensor([True, True, False], device=device))
+    a = brute.tensor([True, False, True], dtype=brute.bit1, device=device)
+    b = brute.tensor([True, True, False], dtype=brute.bit1, device=device)
     out = traced(a, b)
     ref = (torch.tensor([True, False, True], device=device)
            & torch.tensor([True, True, False], device=device)).logical_not()

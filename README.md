@@ -1,13 +1,13 @@
 # Brute
 
-An ultra-fast, lightweight binary deep learning framework extension for PyTorch.
+A PyTorch extension implementing native 1-bit tensors for extremely fast binary neural networks.
 
 ### Features
 
-- Native 1-bit tensors, with optimised CPU / CUDA / Apple Silicon kernels.
-- Complete Torch backwards compatibility, `brute.Tensor` inherits from `torch.Tensor` and keeps all existing data types / hardware optimisations.
-- Native binary support for `autograd`.
-- Implementations of some recent BNN papers, including BOLD.
+- Extremely optimised 1-bit tensor CPU / CUDA / Apple Silicon kernels, written in C++.
+- Complete PyTorch backwards compatibility, keeping all existing torch data types and device support.
+- Native binary Linear module implementation.
+- Extremely comprehensive test & benchmark suite, ensuring `brute.bit1` has a 1:1 compatibility with `torch.bool`.
 
 ## Installation
 

@@ -49,15 +49,15 @@ def test_brute_reexports_torch_dtype(dtype):
 
 
 def test_bit1_to_bool_roundtrip(device):
-    x = bit1(torch.tensor([True, False, True, False], device=device))
+    x = brute.tensor([True, False, True, False], dtype=brute.bit1, device=device)
     as_bool = x.bool()
     assert as_bool.dtype == torch.bool
-    back = bit1(as_bool)
+    back = brute.tensor(as_bool, dtype=brute.bit1)
     assert_bit1_matches_bool(back, as_bool.as_subclass(torch.Tensor))
 
 
 def test_to_dtype_bit1_to_bool(device):
-    x = bit1(torch.tensor([True, False], device=device))
+    x = brute.tensor([True, False], dtype=brute.bit1, device=device)
     as_bool = x.to(torch.bool)
     assert as_bool.dtype == torch.bool
 
@@ -79,7 +79,6 @@ def test_to_dtype_int_to_bit1(device):
 def test_to_dtype_float_to_bit1(device):
     x = brute.tensor([-1.0, 0.0, 0.5, 1.0], dtype=torch.float32, device=device)
     out = x.to(brute.bit1)
-    # >0 → True for floats (per brute._to_bool convention)
     expected = torch.tensor([False, False, True, True], device=device)
     assert_bit1_matches_bool(out, expected)
 
@@ -100,7 +99,7 @@ def test_dtype_promotion_arithmetic(lhs, rhs, device):
 
 def test_bit1_arithmetic_promotes(device):
     """bit1 + int32 should promote (matching torch.bool semantics)."""
-    a = bit1(torch.tensor([True, False, True], device=device))
+    a = brute.tensor([True, False, True], dtype=brute.bit1, device=device)
     b = brute.tensor([1, 2, 3], dtype=torch.int32, device=device)
     out = a + b
     ref = torch.tensor([True, False, True], device=device).int() + torch.tensor([1, 2, 3], device=device, dtype=torch.int32)
@@ -109,9 +108,8 @@ def test_bit1_arithmetic_promotes(device):
 
 
 def test_dtype_attribute_stable_across_views(device):
-    x = bit1(torch.zeros((4, 4), dtype=torch.bool, device=device))
+    x = brute.zeros((4, 4), dtype=brute.bit1, device=device)
     assert x.dtype == brute.bit1
-    # Views should preserve dtype.
     v = x[:, ::2]
     assert v.dtype == brute.bit1
     t = x.t()

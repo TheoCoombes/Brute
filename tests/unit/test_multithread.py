@@ -7,7 +7,6 @@ import pytest
 import torch
 
 import brute
-from tests.helpers import bit1
 
 
 def _readonly_worker(tensor, iters: int):
@@ -20,7 +19,7 @@ def _readonly_worker(tensor, iters: int):
 
 def test_multithreaded_readonly():
     """Concurrent readers must not crash or corrupt state."""
-    x = bit1(torch.randint(0, 2, (256,), dtype=torch.bool))
+    x = brute.randint(0, 2, (256,), dtype=brute.bit1)
     expected = int(x.popcount().item())
     with ThreadPoolExecutor(max_workers=4) as ex:
         futures = [ex.submit(_readonly_worker, x, 50) for _ in range(4)]
@@ -36,7 +35,7 @@ def _clone_worker(tensor, iters: int):
 
 def test_multithreaded_clone():
     """Cloning from multiple threads must not crash."""
-    x = bit1(torch.zeros((128,), dtype=torch.bool))
+    x = brute.zeros(128, dtype=brute.bit1)
     with ThreadPoolExecutor(max_workers=4) as ex:
         futures = [ex.submit(_clone_worker, x, 50) for _ in range(4)]
         for f in futures:
@@ -46,8 +45,8 @@ def test_multithreaded_clone():
 def _ops_worker(iters: int):
     """Stress the dispatcher with many independent ops."""
     for _ in range(iters):
-        a = bit1(torch.randint(0, 2, (32,), dtype=torch.bool))
-        b = bit1(torch.randint(0, 2, (32,), dtype=torch.bool))
+        a = brute.randint(0, 2, (32,), dtype=brute.bit1)
+        b = brute.randint(0, 2, (32,), dtype=brute.bit1)
         _ = a & b
         _ = a | b
         _ = ~a

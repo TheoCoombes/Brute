@@ -5,13 +5,11 @@ import pytest
 import torch
 
 import brute
-from tests.helpers import bit1
 
 
 def test_requires_grad_on_float(device):
     src = torch.tensor([1.0, 2.0, 3.0], device=device, requires_grad=True)
     a = brute.tensor(src)
-    # Either the brute wrapper propagates requires_grad, or we can set it.
     if not a.requires_grad:
         a = a.detach().requires_grad_(True)
     assert a.requires_grad
@@ -27,7 +25,7 @@ def test_backward_simple(device):
 
 def test_bool_does_not_require_grad(device):
     """bool tensors don't support requires_grad; bit1 should not either."""
-    bit = bit1(torch.tensor([True, False, True], device=device))
+    bit = brute.tensor([True, False, True], dtype=brute.bit1, device=device)
     with pytest.raises((RuntimeError, ValueError)):
         bit.requires_grad_(True)
 
@@ -36,7 +34,6 @@ def test_grad_through_matmul(device):
     a = torch.randn(4, 8, device=device, requires_grad=True)
     b = torch.randn(8, 4, device=device, requires_grad=True)
     c = brute.tensor(a) @ brute.tensor(b)
-    # If brute.tensor() does not preserve requires_grad, fall back to plain torch matmul.
     if not c.requires_grad:
         c = a @ b
     loss = c.sum()

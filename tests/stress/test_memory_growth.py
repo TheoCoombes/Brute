@@ -8,13 +8,12 @@ import pytest
 import torch
 
 import brute
-from tests.helpers import bit1
 
 pytestmark = pytest.mark.stress
 
 
 def test_no_reference_cycles_after_op():
-    x = bit1(torch.randint(0, 2, (128, 128), dtype=torch.bool))
+    x = brute.randint(0, 2, (128, 128), dtype=brute.bit1)
     ref = weakref.ref(x)
     del x
     gc.collect()
@@ -25,8 +24,8 @@ def test_chained_ops_release_intermediates():
     """A long expression should not retain its intermediates after the result is dropped."""
     leaked = []
     for _ in range(8):
-        a = bit1(torch.randint(0, 2, (64,), dtype=torch.bool))
-        b = bit1(torch.randint(0, 2, (64,), dtype=torch.bool))
+        a = brute.randint(0, 2, (64,), dtype=brute.bit1)
+        b = brute.randint(0, 2, (64,), dtype=brute.bit1)
         c = (a & b) | (a ^ b)
         leaked.append(weakref.ref(c))
         del a, b, c
@@ -36,7 +35,7 @@ def test_chained_ops_release_intermediates():
 
 
 def test_clone_does_not_leak():
-    base = bit1(torch.zeros((128,), dtype=torch.bool))
+    base = brute.zeros(128, dtype=brute.bit1)
     refs = []
     for _ in range(64):
         c = base.clone()

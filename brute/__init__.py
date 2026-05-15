@@ -1,9 +1,8 @@
-import torch as _t
+from torch import *
 
 try:
     from . import _cbrute
 except ImportError:
-    # Try site-packages location (i.e. for editable installs).
     try:
         import importlib.util
         spec = importlib.util.find_spec('_cbrute')
@@ -16,142 +15,44 @@ except ImportError:
             "Install with: pip install --no-build-isolation -ve ."
         )
 
+# bit1-aware tensors + dtype
 from brute.tensor import Tensor, bit1
 
-# dtypes 
-bool            = _t.bool
-float32         = _t.float32
-float64         = _t.float64
-float16         = _t.float16
-bfloat16        = _t.bfloat16
-int8            = _t.int8
-int16           = _t.int16
-int32           = _t.int32
-int64           = _t.int64
-uint8           = _t.uint8
-uint16          = _t.uint16
-uint32          = _t.uint32
-uint64          = _t.uint64
-complex64       = _t.complex64
-complex128      = _t.complex128
-float8_e4m3fn   = _t.float8_e4m3fn
-float8_e5m2     = _t.float8_e5m2
-
-# Factory / creator functions 
+# bit1-aware factory functions
 from brute.functional import (
-    # Bit1-aware creators
     zeros, ones, empty, full,
     tensor, as_tensor, from_numpy,
-    # Random creators
     rand, randn, randint,
     rand_like, randn_like, zeros_like, ones_like, full_like, empty_like,
-    # Range / grid
     arange, linspace, eye,
 )
 
-# Reductions 
-from brute.functional import (
-    all, any, sum, max, min, mean, prod,
-    amax, amin, aminmax,
-    argmax, argmin,
-    count_nonzero, nonzero, argwhere,
-    nansum, nanmean, logsumexp,
-)
+# Fast bit1 ops take final priority — they overwrite any torch / functional
+# versions of the same name (bitwise_xor, bitwise_and, eq, ne, matmul, …).
+from brute.fast import *
 
-# Combining / stacking 
-from brute.functional import cat, stack
+from brute import nn
+from brute import cuda_graphs
+from brute import streams
+from brute import fast
 
-# Shape manipulation 
-from brute.functional import (
-    reshape, flatten, squeeze, unsqueeze,
-    permute, transpose, t,
-    movedim, moveaxis, swapaxes, swapdims,
-    broadcast_to, broadcast_tensors,
-    narrow, select,
-    atleast_1d, atleast_2d, atleast_3d,
-)
-
-# Splitting 
-from brute.functional import (
-    split, chunk, unbind, tensor_split,
-    hsplit, vsplit, dsplit,
-)
-
-# Clone / detach 
-from brute.functional import clone, detach
-
-# Logical (bit1-relevant) 
-from brute.functional import (
-    where,
-    logical_and, logical_or, logical_xor, logical_not,
-)
-
-# Bitwise 
-from brute.functional import (
-    bitwise_and, bitwise_or, bitwise_xor, bitwise_not,
-    bitwise_left_shift, bitwise_right_shift,
-)
-
-# Comparison 
-from brute.functional import (
-    eq, ne, lt, le, gt, ge,
-    equal, allclose, isclose,
-    isnan, isinf, isfinite, isneginf, isposinf,
-)
-
-# Arithmetic 
-from brute.functional import (
-    add, sub, mul, div, divide,
-    neg, negative, abs, absolute,
-    sign, sgn,
-    clamp, clip,
-    pow, sqrt, rsqrt,
-)
-
-# Cumulative 
-from brute.functional import cumsum, cumprod, cummax, cummin
-
-# Sorting / selection 
-from brute.functional import (
-    sort, argsort, topk, kthvalue, msort,
-    unique, unique_consecutive,
-)
-
-# Indexing / masking 
-from brute.functional import (
-    gather, index_select, masked_select, take, scatter,
-)
-
-# Rearrangement / replication 
-from brute.functional import (
-    roll, flip, fliplr, flipud, rot90,
-    tile, repeat_interleave,
-)
-
-# Matrix / linear algebra 
-from brute.functional import (
-    mm, bmm, matmul, mv, dot, inner, outer, vdot, cross,
-)
-
-# Diagonal / triangular 
-from brute.functional import (
-    diagonal, diag, diag_embed, diagflat,
-    tril, triu, trace,
-)
-
-# Misc
-from brute.functional import (
-    nan_to_num, diff, block_diag, cartesian_prod,
-)
-
-# Neural-network building blocks (BruteLinear etc.)
-from brute import nn  # noqa: F401  (subpackage exposed as brute.nn)
-
-# CUDA helpers — import lazily to avoid hard dependency on torch.cuda symbols
-# in non-CUDA builds.
-from brute import cuda_graphs  # noqa: F401
-from brute import streams       # noqa: F401
 parallel_streams = streams.parallel_streams
 
-# Direct-call shortcuts that bypass __torch_function__ for hot inference loops.
-from brute import fast  # noqa: F401
+# Re-export torch submodules not covered by `from torch import *`.
+# These are accessible as brute.optim, brute.linalg, brute.cuda, etc.
+from torch import (  # noqa: F401, E402
+    optim,
+    linalg,
+    fft,
+    special,
+    autograd,
+    cuda,
+    backends,
+    distributions,
+    utils,
+    jit,
+    hub,
+    profiler,
+    ao,
+    fx,
+)

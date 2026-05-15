@@ -5,7 +5,6 @@ import pytest
 import torch
 
 import brute
-from tests.helpers import bit1
 
 
 def test_dlpack_roundtrip_float(device):
@@ -47,7 +46,7 @@ def test_dlpack_roundtrip_bool(device):
 def test_dlpack_bit1_falls_back_to_bool(device):
     """bit1's underlying storage IS bool; DLPack export should expose that bool."""
     src = torch.tensor([True, False, True, False], device=device)
-    x = bit1(src)
+    x = brute.tensor(src, dtype=brute.bit1)
     try:
         cap = torch.utils.dlpack.to_dlpack(x.as_subclass(torch.Tensor))
         y = torch.utils.dlpack.from_dlpack(cap)

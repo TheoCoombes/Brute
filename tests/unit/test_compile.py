@@ -5,7 +5,7 @@ import pytest
 import torch
 
 import brute
-from tests.helpers import assert_bit1_matches_bool, bit1
+from tests.helpers import assert_bit1_matches_bool
 
 
 @pytest.mark.skipif(not hasattr(torch, "compile"), reason="torch.compile unavailable")
@@ -16,8 +16,8 @@ def test_compile_logical_ops(device):
     def fn(x, y):
         return torch.logical_not(x & y)
 
-    a = bit1(torch.tensor([True, False, True], device=device))
-    b = bit1(torch.tensor([False, True, True], device=device))
+    a = brute.tensor([True, False, True], dtype=brute.bit1, device=device)
+    b = brute.tensor([False, True, True], dtype=brute.bit1, device=device)
 
     eager = fn(a, b)
     try:

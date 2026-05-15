@@ -5,12 +5,10 @@ import pytest
 import torch
 
 import brute
-from tests.helpers import bit1
 
 
 def test_numpy_export_bool():
-    src = torch.tensor([True, False, True, False])
-    bit = bit1(src)
+    bit = brute.tensor([True, False, True, False], dtype=brute.bit1)
     arr = bit.numpy()
     assert arr.dtype.kind == "b"
     assert arr.tolist() == [True, False, True, False]
@@ -34,7 +32,7 @@ def test_numpy_import_via_from_numpy():
 def test_numpy_array_interface():
     """__array__ protocol should produce a usable numpy array."""
     import numpy as np
-    bit = bit1(torch.tensor([True, False, True]))
+    bit = brute.tensor([True, False, True], dtype=brute.bit1)
     arr = np.asarray(bit)
     assert arr.tolist() == [True, False, True]
 
@@ -42,13 +40,13 @@ def test_numpy_array_interface():
 def test_numpy_to_bit1_roundtrip():
     import numpy as np
     arr = np.array([True, False, True, True, False])
-    bit = bit1(torch.from_numpy(arr))
+    bit = brute.as_tensor(arr, dtype=brute.bit1)
     assert bit.tolist() == [True, False, True, True, False]
 
 
 @pytest.mark.cuda
 def test_numpy_raises_on_cuda():
     """torch refuses to call .numpy() on a CUDA tensor — bit1 must mirror."""
-    x = bit1(torch.tensor([True, False], device="cuda"))
+    x = brute.tensor([True, False], dtype=brute.bit1, device="cuda")
     with pytest.raises((TypeError, RuntimeError)):
         x.as_subclass(torch.Tensor).numpy()

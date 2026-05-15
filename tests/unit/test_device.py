@@ -11,7 +11,7 @@ from tests.helpers import assert_bit1_matches_bool, assert_device, bit1
 
 @pytest.mark.parametrize("dev", DEVICES)
 def test_creation_on_device(dev):
-    t = bit1(torch.tensor([True, False, True], device=dev))
+    t = brute.tensor([True, False, True], dtype=brute.bit1, device=dev)
     assert_device(t, dev)
 
 
@@ -29,28 +29,28 @@ def test_device_roundtrip(src, dst):
 
 @pytest.mark.parametrize("dst", DEVICES)
 def test_to_device_string(dst):
-    x = bit1(torch.tensor([True, False]))
+    x = brute.tensor([True, False], dtype=brute.bit1)
     y = x.to(dst)
     assert_device(y, dst)
 
 
 @pytest.mark.parametrize("dst", DEVICES)
 def test_to_device_obj(dst):
-    x = bit1(torch.tensor([True, False]))
+    x = brute.tensor([True, False], dtype=brute.bit1)
     y = x.to(torch.device(dst))
     assert_device(y, dst)
 
 
 @pytest.mark.cuda
 def test_pinned_memory():
-    x = bit1(torch.zeros((128,), dtype=torch.bool))
+    x = brute.zeros(128, dtype=brute.bit1)
     pinned = x.bool().as_subclass(torch.Tensor).pin_memory()
     assert pinned.is_pinned()
 
 
 @pytest.mark.cuda
 def test_non_blocking_transfer():
-    x = bit1(torch.zeros((128,), dtype=torch.bool))
+    x = brute.zeros(128, dtype=brute.bit1)
     y = x.to("cuda", non_blocking=True)
     torch.cuda.synchronize()
     assert_device(y, "cuda")
@@ -64,14 +64,14 @@ def test_device_inference_from_input(device):
 
 
 def test_device_consistency_across_ops(device):
-    a = bit1(torch.tensor([True, False, True], device=device))
-    b = bit1(torch.tensor([False, True, True], device=device))
+    a = brute.tensor([True, False, True], dtype=brute.bit1, device=device)
+    b = brute.tensor([False, True, True], dtype=brute.bit1, device=device)
     out = a & b
     assert_device(out, device)
 
 
 def test_cpu_to_cpu_noop():
-    x = bit1(torch.tensor([True, False]))
+    x = brute.tensor([True, False], dtype=brute.bit1)
     y = x.cpu()
     assert_device(y, "cpu")
     assert torch.equal(x.bool().as_subclass(torch.Tensor),

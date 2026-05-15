@@ -12,7 +12,7 @@ from tests.helpers import assert_bit1_matches_bool, bit1
 
 
 def test_pickle_bit1_roundtrip(device):
-    x = bit1(torch.tensor([True, False, True, False], device=device))
+    x = brute.tensor([True, False, True, False], dtype=brute.bit1, device=device)
     blob = pickle.dumps(x)
     y = pickle.loads(blob)
     assert y.dtype == brute.bit1
@@ -34,6 +34,7 @@ def test_pickle_non_bool_roundtrip(device):
 
 
 def test_torch_save_load_bit1(tmp_path, device):
+    # Keep src as bool reference for value comparison after save/load.
     src = torch.randint(0, 2, (32, 32), dtype=torch.bool, device=device)
     x = bit1(src)
     path = tmp_path / "bit1.pt"
@@ -55,18 +56,18 @@ def test_torch_save_load_bool(tmp_path, device):
 
 
 def test_deepcopy_bit1(device):
+    # Keep src as bool reference to verify independence after fill_.
     src = torch.tensor([True, False, True], device=device)
     x = bit1(src)
     y = copy.deepcopy(x)
     assert y.dtype == brute.bit1
     assert_bit1_matches_bool(y, src)
-    # Independence: mutating x should not affect y.
     x.fill_(False)
     assert_bit1_matches_bool(y, src)
 
 
 def test_save_load_through_buffer(device):
-    x = bit1(torch.tensor([True, False, True], device=device))
+    x = brute.tensor([True, False, True], dtype=brute.bit1, device=device)
     buf = io.BytesIO()
     torch.save(x, buf)
     buf.seek(0)
@@ -77,7 +78,7 @@ def test_save_load_through_buffer(device):
 
 @pytest.mark.cuda
 def test_cross_device_load_map_to_cpu(tmp_path):
-    x = bit1(torch.tensor([True, False, True], device="cuda"))
+    x = brute.tensor([True, False, True], dtype=brute.bit1, device="cuda")
     path = tmp_path / "x.pt"
     torch.save(x, path)
     y = torch.load(path, map_location="cpu", weights_only=False)
@@ -86,8 +87,10 @@ def test_cross_device_load_map_to_cpu(tmp_path):
 
 
 def test_pack_dtype_preserved_through_save(tmp_path, device):
-    x = bit1(torch.tensor([True, False, True, False, True, False, True, False], device=device),
-             pack_dtype=torch.uint32)
+    x = brute.tensor(
+        [True, False, True, False, True, False, True, False],
+        dtype=brute.bit1, device=device, pack_dtype=torch.uint32,
+    )
     path = tmp_path / "x.pt"
     torch.save(x, path)
     y = torch.load(path, weights_only=False)
