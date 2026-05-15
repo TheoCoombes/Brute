@@ -2,7 +2,6 @@
 
 Covers:
 - device parametrization (cpu / cuda / mps)
-- pack_dtype parametrization (uint8 / uint32 / uint64)
 - contiguity / view transforms
 - a deterministic seed fixture
 """
@@ -28,9 +27,6 @@ if torch.backends.mps.is_available():
     DEVICES.append("mps")
 
 
-PACK_DTYPES: list[torch.dtype] = [torch.uint8, torch.uint32, torch.uint64]
-
-
 # Full torch dtype matrix (used by dtype-promotion tests).
 ALL_DTYPES = [
     torch.bool,
@@ -52,12 +48,6 @@ ALL_DTYPES = [
 @pytest.fixture(params=DEVICES)
 def device(request):
     """Run a test on every available device."""
-    return request.param
-
-
-@pytest.fixture(params=PACK_DTYPES, ids=lambda d: str(d).replace("torch.", ""))
-def pack_dtype(request):
-    """Run a test against every supported packing width."""
     return request.param
 
 

@@ -7,15 +7,9 @@ import torch
 import brute
 from tests.helpers.corruption import (
     clear_packed_buf,
-    corrupt_pack_dtype,
     flip_is_bit1,
     truncate_packed_buf,
 )
-
-
-def test_invalid_pack_dtype():
-    with pytest.raises(TypeError):
-        brute.tensor([True, False], dtype=brute.bit1, pack_dtype=torch.float32)
 
 
 def test_invalid_dtype_for_bit1_creation():
@@ -62,14 +56,6 @@ def test_pack_buffer_truncation_recoverable():
     truncate_packed_buf(x)
     pb = x._packed_buf
     assert pb is not None
-
-
-def test_corrupt_pack_dtype_raises_on_op():
-    """A bad pack_dtype should be caught when an op tries to use it."""
-    x = brute.tensor([True, False], dtype=brute.bit1)
-    corrupt_pack_dtype(x)
-    with pytest.raises((TypeError, RuntimeError, KeyError)):
-        x.unpack_pm1()
 
 
 def test_clear_packed_buf_recovers():

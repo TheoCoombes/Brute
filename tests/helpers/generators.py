@@ -11,15 +11,9 @@ import torch
 import brute
 
 
-def bit1(data, *, pack_dtype=None, device=None):
-    """Construct a bit1 brute.Tensor from any boolean-coercible input.
-
-    Mirrors the convention used throughout the blueprint:
-        bit_t = bit1(bool_tensor)
-    """
-    if pack_dtype is None:
-        return brute.tensor(data, dtype=brute.bit1, device=device)
-    return brute.tensor(data, dtype=brute.bit1, pack_dtype=pack_dtype, device=device)
+def bit1(data, *, device=None):
+    """Construct a bit1 brute.Tensor from any boolean-coercible input."""
+    return brute.tensor(data, dtype=brute.bit1, device=device)
 
 
 def bool_tensor(data, *, device=None):
@@ -38,10 +32,10 @@ def random_bool(shape, device="cpu", seed: int | None = None) -> torch.Tensor:
     return torch.randint(0, 2, shape, device=device, dtype=torch.uint8).bool()
 
 
-def random_bit1(shape, device="cpu", pack_dtype=None, seed: int | None = None):
+def random_bit1(shape, device="cpu", seed: int | None = None):
     """Random bit1 brute.Tensor of `shape`."""
     b = random_bool(shape, device=device, seed=seed)
-    return bit1(b, pack_dtype=pack_dtype, device=device)
+    return bit1(b, device=device)
 
 
 def random_shape(rng, ndim_max=4, dim_max=16, allow_empty=False) -> tuple[int, ...]:

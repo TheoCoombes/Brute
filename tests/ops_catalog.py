@@ -1,7 +1,7 @@
 """Single source of truth for every torch op the bit1 tensor needs to support.
 
 Each `OpSpec` declares:
-  • how to build inputs for a given shape / device / pack_dtype
+  • how to build inputs for a given shape / device
   • the operation (a callable that runs on either a bit1 *or* bool tensor)
   • how to compare the bit1 and bool results (most ops use the default;
     matmul / dot / mv etc. need custom oracles because torch.bool can't run them)
@@ -47,7 +47,7 @@ ALL_EDGES = frozenset([
     "0-dim",          # scalar
     "non-contig",     # produced via .t() or [..., ::2]
     "broadcast",      # mismatched shapes that broadcast (binary ops only)
-    "tail-misalign",  # last-dim is not a multiple of pack_width (e.g. 13)
+    "tail-misalign",  # last-dim is not a multiple of 64 (e.g. 13)
 ])
 
 

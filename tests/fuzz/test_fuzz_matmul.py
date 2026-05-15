@@ -17,20 +17,18 @@ pytestmark = pytest.mark.fuzz
     M=st.integers(min_value=1, max_value=32),
     K=st.integers(min_value=1, max_value=64),
     N=st.integers(min_value=1, max_value=32),
-    pack_width=st.sampled_from([8, 32, 64]),
 )
-def test_fuzz_xnor_matmul(M, K, N, pack_width):
-    pack_dtype = {8: torch.uint8, 32: torch.uint32, 64: torch.uint64}[pack_width]
+def test_fuzz_xnor_matmul(M, K, N):
     a_bool = torch.randint(0, 2, (M, K), dtype=torch.bool)
     b_bool_T = torch.randint(0, 2, (N, K), dtype=torch.bool)
 
-    a_bit = bit1(a_bool, pack_dtype=pack_dtype)
-    b_bit = bit1(b_bool_T, pack_dtype=pack_dtype)
+    a_bit = bit1(a_bool)
+    b_bit = bit1(b_bool_T)
     out = torch.ops.brute.xnor_popcount_matmul(
-        a_bit._packed_buf, b_bit._packed_buf, K, pack_width
+        a_bit._packed_buf, b_bit._packed_buf, K, 64
     ).to(torch.float32)
 
     ref = ref_matmul_pm1(a_bool, b_bool_T.t())
     assert torch.allclose(out, ref), (
-        f"mismatch for M={M}, K={K}, N={N}, pw={pack_width}"
+        f"mismatch for M={M}, K={K}, N={N}"
     )

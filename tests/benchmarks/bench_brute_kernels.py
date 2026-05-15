@@ -76,8 +76,8 @@ def test_bool_unpack_noop(benchmark, device, n_bits):
 def test_bit1_xnor_matmul_kernel(benchmark, device, MKN):
     benchmark.group = "kernels/xnor_matmul"
     M, K, N = MKN
-    a = brute.tensor(_rand_bool((M, K), device), dtype=brute.bit1, pack_dtype=torch.uint64)
-    b = brute.tensor(_rand_bool((N, K), device), dtype=brute.bit1, pack_dtype=torch.uint64)
+    a = brute.tensor(_rand_bool((M, K), device), dtype=brute.bit1)
+    b = brute.tensor(_rand_bool((N, K), device), dtype=brute.bit1)
     set_throughput(benchmark, 2 * M * N * K, "bit-ops")
     benchmark(with_sync(lambda: torch.ops.brute.xnor_popcount_matmul(
         a._packed_buf, b._packed_buf, K, 64), device))

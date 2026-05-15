@@ -96,6 +96,35 @@ kernel void xnor_u64(
 // reducing loop-overhead and maximising arithmetic per load instruction.
 // Caller passes Kp4 = Kp/4 (u32) or Kp2 = Kp/2 (u64); Kp must be divisible.
 
+// xnor_u8_wide: reinterpret the pw=8 byte buffer as uint4 (16 bytes / 128 bits
+// per load) and popcount 32-bit chunks. Bit semantics are identical (XOR +
+// NOT + popcount commute with byte→uint regrouping). Active when Kp % 16 == 0.
+kernel void xnor_u8_wide(
+    device const uint4* A     [[buffer(0)]],
+    device const uint4* B     [[buffer(1)]],
+    device int*         C     [[buffer(2)]],
+    constant int&       N     [[buffer(3)]],
+    constant int&       Kp16  [[buffer(4)]],   // Kp / 16 (bytes -> uint4s)
+    constant int&       K_eff [[buffer(5)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint  lane [[thread_index_in_threadgroup]])
+{
+    const int n = (int)tgid.x;
+    const int m = (int)tgid.y;
+    uint acc = 0u;
+    for (int k = (int)lane; k < Kp16; k += 32) {
+        uint4 va = A[m * Kp16 + k];
+        uint4 vb = B[n * Kp16 + k];
+        uint4 xr = ~(va ^ vb);
+        acc += popcount(xr.x) + popcount(xr.y)
+             + popcount(xr.z) + popcount(xr.w);
+    }
+    const uint total = simd_sum(acc);
+    if (lane == 0) {
+        C[m * N + n] = 2 * (int)total - K_eff;
+    }
+}
+
 kernel void xnor_u32_wide(
     device const uint4* A     [[buffer(0)]],
     device const uint4* B     [[buffer(1)]],
@@ -219,6 +248,167 @@ kernel void xnor_u32_tiled(
         if (m < M && n < N) {
             for (int k = (int)lane; k < k_cnt; k += 32) {
                 acc += popcount(~(A_tile[sg_y * KT + k] ^ B_tile[sg_x * KT + k]));
+            }
+        }
+        total += simd_sum(acc);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (lane == 0 && m < M && n < N) {
+        C[m * N + n] = 2 * (int)total - K_eff;
+    }
+}
+
+//  Threadgroup-tiled matmul with uint4 inner loop
+// Same TM=2, TN=4, KT=256 footprint as xnor_u32_tiled, but the compute phase
+// reads the threadgroup tile as uint4 and processes 4 uint32 words per K-iter.
+// Quadruples per-iteration arithmetic-per-load when KT is divisible by 4
+// (always true here: KT=256). The collaborative load remains uint-wise so the
+// kernel works for any Kp ≥ 1.
+kernel void xnor_u32_tiled_v4(
+    device const uint* A     [[buffer(0)]],
+    device const uint* B     [[buffer(1)]],
+    device int*        C     [[buffer(2)]],
+    constant int&      N     [[buffer(3)]],
+    constant int&      Kp    [[buffer(4)]],
+    constant int&      K_eff [[buffer(5)]],
+    constant int&      M     [[buffer(6)]],
+    uint3 tgid  [[threadgroup_position_in_grid]],
+    uint  sg_id [[simdgroup_index_in_threadgroup]],
+    uint  lane  [[thread_index_in_simdgroup]],
+    uint  tid   [[thread_index_in_threadgroup]])
+{
+    constexpr int TM = 2, TN = 4, KT = 256;
+    threadgroup uint A_tile[TM * KT];
+    threadgroup uint B_tile[TN * KT];
+
+    const int n_base = (int)tgid.x;
+    const int m_base = (int)tgid.y;
+    const int sg_y = (int)sg_id / TN;
+    const int sg_x = (int)sg_id % TN;
+    const int m = m_base * TM + sg_y;
+    const int n = n_base * TN + sg_x;
+
+    uint total = 0u;
+    const int total_threads = TM * TN * 32;
+
+    for (int k_start = 0; k_start < Kp; k_start += KT) {
+        const int k_cnt = min(KT, Kp - k_start);
+
+        for (int t = (int)tid; t < TM * k_cnt; t += total_threads) {
+            const int row = t / k_cnt, col = t % k_cnt;
+            const int src_m = m_base * TM + row;
+            A_tile[row * KT + col] =
+                (src_m < M) ? A[src_m * Kp + k_start + col] : 0u;
+        }
+        for (int t = (int)tid; t < TN * k_cnt; t += total_threads) {
+            const int row = t / k_cnt, col = t % k_cnt;
+            const int src_n = n_base * TN + row;
+            B_tile[row * KT + col] =
+                (src_n < N) ? B[src_n * Kp + k_start + col] : 0u;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // uint4 inner loop. Each lane processes 4 uint32 words at a time
+        // (16 bytes per lane per K step). 4 popcount + 3 add per lane per step.
+        uint acc = 0u;
+        if (m < M && n < N) {
+            // Aligned uint4 chunks: process [0, k4_end) in uint4, then scalar tail.
+            const int k4_end = (k_cnt / 4) * 4;
+            threadgroup const uint4* A4 =
+                (threadgroup const uint4*)(A_tile + sg_y * KT);
+            threadgroup const uint4* B4 =
+                (threadgroup const uint4*)(B_tile + sg_x * KT);
+            const int k4_cnt = k4_end / 4;
+            for (int k = (int)lane; k < k4_cnt; k += 32) {
+                uint4 va = A4[k];
+                uint4 vb = B4[k];
+                uint4 xr = ~(va ^ vb);
+                acc += popcount(xr.x) + popcount(xr.y)
+                     + popcount(xr.z) + popcount(xr.w);
+            }
+            // Scalar tail for the last (< 4) uint32 words.
+            for (int k = k4_end + (int)lane; k < k_cnt; k += 32) {
+                acc += popcount(~(A_tile[sg_y * KT + k]
+                                ^ B_tile[sg_x * KT + k]));
+            }
+        }
+        total += simd_sum(acc);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (lane == 0 && m < M && n < N) {
+        C[m * N + n] = 2 * (int)total - K_eff;
+    }
+}
+
+//  Threadgroup-tiled matmul for ulong (pw=64) packed
+// Mirrors xnor_u32_tiled but with ulong loads. ulong2 vector loads in the
+// inner compute loop give 2× throughput per simdgroup-lane vs scalar ulong.
+// Layout:  TM=2, TN=4, KT=128 (128 ulong = 256 uint = same threadgroup memory
+// footprint as the u32 variant). Activates when M>=4, N>=8.
+kernel void xnor_u64_tiled(
+    device const ulong* A    [[buffer(0)]],
+    device const ulong* B    [[buffer(1)]],
+    device int*         C    [[buffer(2)]],
+    constant int&       N    [[buffer(3)]],
+    constant int&       Kp   [[buffer(4)]],
+    constant int&       K_eff[[buffer(5)]],
+    constant int&       M    [[buffer(6)]],
+    uint3 tgid  [[threadgroup_position_in_grid]],
+    uint  sg_id [[simdgroup_index_in_threadgroup]],
+    uint  lane  [[thread_index_in_simdgroup]],
+    uint  tid   [[thread_index_in_threadgroup]])
+{
+    constexpr int TM = 2, TN = 4, KT = 128;
+    threadgroup ulong A_tile[TM * KT];
+    threadgroup ulong B_tile[TN * KT];
+
+    const int n_base = (int)tgid.x;
+    const int m_base = (int)tgid.y;
+    const int sg_y = (int)sg_id / TN;
+    const int sg_x = (int)sg_id % TN;
+    const int m = m_base * TM + sg_y;
+    const int n = n_base * TN + sg_x;
+
+    uint total = 0u;
+    const int total_threads = TM * TN * 32;
+
+    for (int k_start = 0; k_start < Kp; k_start += KT) {
+        const int k_cnt = min(KT, Kp - k_start);
+
+        for (int t = (int)tid; t < TM * k_cnt; t += total_threads) {
+            const int row = t / k_cnt, col = t % k_cnt;
+            const int src_m = m_base * TM + row;
+            A_tile[row * KT + col] =
+                (src_m < M) ? A[src_m * Kp + k_start + col] : 0ul;
+        }
+        for (int t = (int)tid; t < TN * k_cnt; t += total_threads) {
+            const int row = t / k_cnt, col = t % k_cnt;
+            const int src_n = n_base * TN + row;
+            B_tile[row * KT + col] =
+                (src_n < N) ? B[src_n * Kp + k_start + col] : 0ul;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        uint acc = 0u;
+        if (m < M && n < N) {
+            // ulong2 inner loop.
+            const int k2_end = (k_cnt / 2) * 2;
+            threadgroup const ulong2* A2 =
+                (threadgroup const ulong2*)(A_tile + sg_y * KT);
+            threadgroup const ulong2* B2 =
+                (threadgroup const ulong2*)(B_tile + sg_x * KT);
+            const int k2_cnt = k2_end / 2;
+            for (int k = (int)lane; k < k2_cnt; k += 32) {
+                ulong2 va = A2[k];
+                ulong2 vb = B2[k];
+                ulong2 xr = ~(va ^ vb);
+                acc += (uint)popcount(xr.x) + (uint)popcount(xr.y);
+            }
+            for (int k = k2_end + (int)lane; k < k_cnt; k += 32) {
+                acc += (uint)popcount(~(A_tile[sg_y * KT + k]
+                                      ^ B_tile[sg_x * KT + k]));
             }
         }
         total += simd_sum(acc);

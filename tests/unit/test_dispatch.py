@@ -74,14 +74,6 @@ def test_dispatch_does_not_recurse(device):
     assert isinstance(a, brute.Tensor)
 
 
-def test_clone_preserves_bit1_pack_dtype(device):
-    a = bit1(torch.tensor([True, False, True], device=device), pack_dtype=torch.uint32)
-    c = a.clone()
-    if c.dtype == brute.bit1:
-        # If clone preserves dtype, it should preserve pack_dtype too.
-        assert c.pack_dtype == torch.uint32
-
-
 @pytest.mark.parametrize("op", [
     torch.logical_and, torch.logical_or, torch.logical_xor,
 ])

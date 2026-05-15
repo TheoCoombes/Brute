@@ -1,8 +1,8 @@
 """Hypothesis-driven fuzz parity, generated from `tests.ops_catalog`.
 
 Complements `test_edge_cases_catalog.py`: the latter walks a fixed set of
-named edges; this driver generates random shapes / strides / pack widths
-and exercises every op against random inputs.
+named edges; this driver generates random shapes / strides and exercises
+every op against random inputs.
 
 Cheap by default (max_examples=20 per op). Bump `BRUTE_FUZZ_EXAMPLES` to
 hammer harder when chasing a flake.
@@ -25,7 +25,6 @@ from hypothesis import HealthCheck, given, settings, strategies as st  # noqa: E
 MAX_EXAMPLES = int(os.environ.get("BRUTE_FUZZ_EXAMPLES", "20"))
 
 
-# Strategy for random shapes by scale.
 def _shape_strategy(scale: str):
     if scale in ("vector", "diag_vector"):
         return st.lists(
@@ -38,7 +37,7 @@ def _shape_strategy(scale: str):
             min_size=2, max_size=2,
         ).map(tuple)
     if scale == "matmul":
-        # (M, K, N) with K aligned to 64 (smallest valid pack_width).
+        # K aligned to 64 (pack width).
         return st.tuples(
             st.integers(min_value=1, max_value=8),
             st.sampled_from([64, 128, 192]),
@@ -47,15 +46,10 @@ def _shape_strategy(scale: str):
     raise ValueError(scale)
 
 
-def _pack_dtype_strategy():
-    return st.sampled_from([torch.uint8, torch.uint32, torch.uint64])
-
-
 def _rand_bool(shape, device):
     return torch.randint(0, 2, shape, dtype=torch.bool, device=device)
 
 
-# Build the parametrized matrix outside the test (Hypothesis composes inside).
 _SPECS = [s for s in ops_catalog.CATALOG]
 
 
@@ -67,15 +61,11 @@ _SPECS = [s for s in ops_catalog.CATALOG]
     derandomize=True,
     suppress_health_check=[HealthCheck.function_scoped_fixture],
 )
-@given(seed=st.integers(min_value=0, max_value=2**31 - 1),
-       pack_dtype=_pack_dtype_strategy())
-def test_fuzz_parity(spec, device, seed, pack_dtype):
-    """Random shapes / values / pack widths must keep bit1 ≡ bool."""
+@given(seed=st.integers(min_value=0, max_value=2**31 - 1))
+def test_fuzz_parity(spec, device, seed):
+    """Random shapes / values must keep bit1 ≡ bool."""
     torch.manual_seed(seed)
 
-    shape_strat = _shape_strategy(spec.scale)
-    # Hypothesis doesn't let us depend on a strategy at parametrize time, so
-    # we just use a fast deterministic shape from the seed:
     rng = torch.Generator(device="cpu").manual_seed(seed)
 
     if spec.scale in ("vector", "diag_vector"):
@@ -93,7 +83,7 @@ def test_fuzz_parity(spec, device, seed, pack_dtype):
 
     bool_args = tuple(_rand_bool(s, device) for s in shapes)
     bit1_args = tuple(
-        brute.tensor(b, dtype=brute.bit1, device=device, pack_dtype=pack_dtype)
+        brute.tensor(b, dtype=brute.bit1, device=device)
         for b in bool_args
     )
 
@@ -104,7 +94,6 @@ def test_fuzz_parity(spec, device, seed, pack_dtype):
             pytest.skip(f"backend missing op: {e}")
         raise
     except (RuntimeError, IndexError) as e:
-        # If bool also raises on the same input, that's parity.
         bool_raised = None
         try:
             spec.run(*bool_args) if spec.oracle is None else spec.oracle(*bool_args)
@@ -121,4 +110,4 @@ def test_fuzz_parity(spec, device, seed, pack_dtype):
 
     cmp = spec.cmp if spec.cmp is not None else default_cmp
     cmp(bit1_out, bool_out,
-        note=f"op={spec.name}, dev={device}, pd={pack_dtype}, seed={seed}")
+        note=f"op={spec.name}, dev={device}, seed={seed}")

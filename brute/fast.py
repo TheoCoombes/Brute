@@ -14,11 +14,10 @@ Usage::
     c   = matmul(x, w_packed_T)    # bit1 × bit1 → int32
     n   = popcount(a)              # int64 scalar — total set bits
 
-All helpers assume **valid** bit1 inputs with matching ``_pack_dtype`` and
-shape (where shape compatibility matters). They do NOT validate; they rely
-on the underlying C++ kernels for correctness checks. Use the regular
-:class:`brute.Tensor` API when you need broadcasting, type promotion, or
-mixed-dtype semantics.
+All helpers assume **valid** bit1 inputs with matching shape (where shape
+compatibility matters). They do NOT validate; they rely on the underlying
+C++ kernels for correctness checks. Use the regular :class:`brute.Tensor`
+API when you need broadcasting, type promotion, or mixed-dtype semantics.
 """
 
 from __future__ import annotations
@@ -26,7 +25,7 @@ from __future__ import annotations
 from typing import Any
 import torch
 
-from brute.dtype import _PACK_BITS
+from brute.dtype import _PACK_WIDTH
 from brute.tensor import Tensor
 
 
@@ -37,24 +36,24 @@ def _is_bit1(x) -> bool:
 # ── Bitwise binary ──────────────────────────────────────────────────────
 
 def bitwise_xor(a: Tensor, b: Tensor) -> Tensor:
-    """``a ^ b`` on two same-shape same-pack bit1 tensors. Returns lazy bit1."""
+    """``a ^ b`` on two same-shape bit1 tensors. Returns lazy bit1."""
     return Tensor._make_bit1_from_packed(
         torch.ops.brute.bitwise_xor(a._packed_buf, b._packed_buf),
-        list(a.shape), a._pack_dtype,
+        list(a.shape),
     )
 
 
 def bitwise_and(a: Tensor, b: Tensor) -> Tensor:
     return Tensor._make_bit1_from_packed(
         torch.ops.brute.bitwise_and(a._packed_buf, b._packed_buf),
-        list(a.shape), a._pack_dtype,
+        list(a.shape),
     )
 
 
 def bitwise_or(a: Tensor, b: Tensor) -> Tensor:
     return Tensor._make_bit1_from_packed(
         torch.ops.brute.bitwise_or(a._packed_buf, b._packed_buf),
-        list(a.shape), a._pack_dtype,
+        list(a.shape),
     )
 
 
@@ -62,9 +61,9 @@ def bitwise_not(a: Tensor) -> Tensor:
     """Pad-safe ``~a`` — the trailing word's pad bits stay 0."""
     return Tensor._make_bit1_from_packed(
         torch.ops.brute.bit1_not_packed(
-            a._packed_buf, int(a.shape[-1]), _PACK_BITS[a._pack_dtype],
+            a._packed_buf, int(a.shape[-1]), _PACK_WIDTH,
         ),
-        list(a.shape), a._pack_dtype,
+        list(a.shape),
     )
 
 
@@ -74,16 +73,16 @@ def eq(a: Tensor, b: Tensor) -> Tensor:
     """``a == b`` — pad-safe XNOR."""
     xored = torch.ops.brute.bitwise_xor(a._packed_buf, b._packed_buf)
     inverted = torch.ops.brute.bit1_not_packed(
-        xored, int(a.shape[-1]), _PACK_BITS[a._pack_dtype],
+        xored, int(a.shape[-1]), _PACK_WIDTH,
     )
-    return Tensor._make_bit1_from_packed(inverted, list(a.shape), a._pack_dtype)
+    return Tensor._make_bit1_from_packed(inverted, list(a.shape))
 
 
 def ne(a: Tensor, b: Tensor) -> Tensor:
     """``a != b`` — pure XOR."""
     return Tensor._make_bit1_from_packed(
         torch.ops.brute.bitwise_xor(a._packed_buf, b._packed_buf),
-        list(a.shape), a._pack_dtype,
+        list(a.shape),
     )
 
 
@@ -112,7 +111,7 @@ def matmul(a: Tensor, b_t: Tensor) -> torch.Tensor:
     """
     K = int(a.shape[-1])
     return torch.ops.brute.xnor_popcount_matmul(
-        a._packed_buf, b_t._packed_buf, K, _PACK_BITS[a._pack_dtype],
+        a._packed_buf, b_t._packed_buf, K, _PACK_WIDTH,
     )
 
 

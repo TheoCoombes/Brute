@@ -15,12 +15,6 @@ def truncate_packed_buf(t):
     return t
 
 
-def corrupt_pack_dtype(t):
-    """Replace pack_dtype with an unsupported dtype."""
-    t._pack_dtype = torch.float32
-    return t
-
-
 def clear_packed_buf(t):
     """Set the packed buffer to None (force lazy recompute)."""
     t._packed_buf = None

@@ -297,15 +297,30 @@ HWY_ATTR inline uint64_t TotalPopcountXor(const void* HWY_RESTRICT a_bytes,
 
 //  Per-element popcount: input is T-typed words, output is int32 counts
 //
-// We use scalar __builtin_popcountll per word. Hardware POPCNT / NEON CNT are
-// single-cycle and the compiler vectorizes well; Highway's PopulationCount
-// across mixed-width lanes (T-wide in, int32-wide out) needs PromoteTo/DemoteTo
-// for every type which loses more than it gains here.
+// Vectorised via Highway when T is a Highway-supported lane type (uint8,
+// uint32, uint64). `bool` is not a valid Highway lane type — we fall back to
+// the scalar path for the kBool dispatch case via `if constexpr`.
 template <typename T>
 HWY_ATTR void PopcountPerWord(const T* HWY_RESTRICT in, int32_t* HWY_RESTRICT out,
                               size_t n) {
-    for (size_t i = 0; i < n; ++i) {
-        out[i] = (int32_t)_brute_popcountll((uint64_t)in[i]);
+    if constexpr (std::is_same_v<T, bool>) {
+        for (size_t i = 0; i < n; ++i) out[i] = in[i] ? 1 : 0;
+    } else {
+        const hn::ScalableTag<T> d_in;
+        const size_t LANES_IN = hn::Lanes(d_in);
+        size_t i = 0;
+        for (; i + LANES_IN <= n; i += LANES_IN) {
+            auto v = hn::LoadU(d_in, in + i);
+            auto p = hn::PopulationCount(v);
+            // Lanewise extract → int32. Compiler folds into direct register
+            // reads on NEON/AVX2 for small lane counts.
+            for (size_t j = 0; j < LANES_IN; ++j) {
+                out[i + j] = (int32_t)hn::ExtractLane(p, j);
+            }
+        }
+        for (; i < n; ++i) {
+            out[i] = (int32_t)_brute_popcountll((uint64_t)in[i]);
+        }
     }
 }
 

@@ -99,20 +99,18 @@ def test_unpack_pm1_values(device):
 # invert correctness (pad-safe)
 
 @pytest.mark.parametrize("n", [1, 7, 8, 9, 31, 32, 33, 63, 64, 65, 1003, 4096])
-def test_invert_pad_safe(n, device, pack_dtype):
+def test_invert_pad_safe(n, device):
     """`~bit1` must zero pad bits so popcount(packed) == n - popcount(input)."""
-    # Keep torch.randint — src is the bool oracle for assert_bit1_matches_bool.
     src = torch.randint(0, 2, (n,), dtype=torch.bool, device=device)
-    a = bit1(src, pack_dtype=pack_dtype)
+    a = bit1(src)
     inv = ~a
     assert int(inv.popcount()) == n - int(a.popcount())
     assert_bit1_matches_bool(inv, ~src)
 
 
 @pytest.mark.parametrize("n", [1, 7, 8, 9, 31, 32, 33, 63, 64, 65, 1003])
-def test_invert_then_sum(n, device, pack_dtype):
-    # Keep torch.randint — src is the bool oracle for comparison.
+def test_invert_then_sum(n, device):
     src = torch.randint(0, 2, (n,), dtype=torch.bool, device=device)
-    a = bit1(src, pack_dtype=pack_dtype)
+    a = bit1(src)
     inv = ~a
     assert int(inv.sum()) == int((~src).long().sum())

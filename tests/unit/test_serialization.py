@@ -86,12 +86,3 @@ def test_cross_device_load_map_to_cpu(tmp_path):
     assert y.dtype == brute.bit1
 
 
-def test_pack_dtype_preserved_through_save(tmp_path, device):
-    x = brute.tensor(
-        [True, False, True, False, True, False, True, False],
-        dtype=brute.bit1, device=device, pack_dtype=torch.uint32,
-    )
-    path = tmp_path / "x.pt"
-    torch.save(x, path)
-    y = torch.load(path, weights_only=False)
-    assert y.pack_dtype == torch.uint32

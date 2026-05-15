@@ -10,10 +10,6 @@ benchmarks sharing the same `benchmark.group`:
 (bool / bit1). When `spec.bool_cant_run` is True (matmul, popcount, hamming,
 unpack_pm1, argmax, argmin) we benchmark `spec.oracle` on the bool side — i.e.
 "what a bool user would write" — so the report still pairs cleanly.
-
-Pack-width sweep: bitwise/logical/brute/matmul ops are timed at all three
-pack widths (uint8/uint32/uint64); other categories are timed once at the
-default uint8 (their throughput is pack-invariant by construction).
 """
 from __future__ import annotations
 
@@ -26,16 +22,6 @@ from tests.benchmarks._helpers import (
     VECTOR_SCALES, MATRIX_SCALES, MATMUL_SCALES, DIAG_VECTOR_SCALES,
     with_sync, set_throughput, scale_size,
 )
-
-
-# Same pack-sensitive set used by the parity driver.
-_PACK_SENSITIVE = frozenset({"bitwise", "logical", "brute", "matmul"})
-
-_PACK_DTYPES = [
-    pytest.param(torch.uint8,  id="pw_08"),
-    pytest.param(torch.uint32, id="pw_32"),
-    pytest.param(torch.uint64, id="pw_64"),
-]
 
 
 def _scales_for(scale: str):
@@ -68,14 +54,14 @@ def _rand_bool(shape, device, *, seed: int = 0):
     return cpu.to(device=device)
 
 
-def _build_pair(spec: ops_catalog.OpSpec, size_param, device, pack_dtype):
-    """Build (bit1_args, bool_args) for the given scale & pack width."""
+def _build_pair(spec: ops_catalog.OpSpec, size_param, device):
+    """Build (bit1_args, bool_args) for the given scale."""
     shapes = _input_shapes(spec.scale, size_param)
     arity = max(spec.arity, 1)
     bool_args = tuple(_rand_bool(shapes[i % len(shapes)], device, seed=i + 1)
                       for i in range(arity))
     bit1_args = tuple(
-        brute.tensor(b, dtype=brute.bit1, device=device, pack_dtype=pack_dtype)
+        brute.tensor(b, dtype=brute.bit1, device=device)
         for b in bool_args
     )
     return bit1_args, bool_args
@@ -95,62 +81,38 @@ def _throughput_elems(spec, size_param):
 def _matrix():
     rows = []
     for s in ops_catalog.CATALOG:
-        scales = _scales_for(s.scale)
-        if s.category in _PACK_SENSITIVE:
-            for pd in _PACK_DTYPES:
-                for sc in scales:
-                    rows.append((s, sc, pd))
-        else:
-            for sc in scales:
-                rows.append((s, sc, _PACK_DTYPES[0]))  # default pw_08
+        for sc in _scales_for(s.scale):
+            rows.append((s, sc))
     return rows
 
 
 _PARAMS = _matrix()
 
 
-def _id_for(spec, size_param_obj, pack_param):
-    """Compose a pytest parameter id."""
-    # size_param_obj is a pytest.param wrapping the size; its id is in .id
-    sid = size_param_obj.id if hasattr(size_param_obj, "id") else str(size_param_obj)
-    if spec.category in _PACK_SENSITIVE:
-        return f"{sid}-{pack_param.id}"
-    return sid
-
-
-# pytest can't natively parametrize across heterogeneous shape tuples in one
-# go without breaking the (device, scale, pack) cross-product; build the two
-# test functions manually, one per (bit1, bool) flavour, sharing the matrix.
-
-def _params_for(category_filter: str | None = None):
-    """Yield (spec, size_value, size_id, pack_dtype, pack_id) tuples."""
-    for spec, size_param, pack_param in _PARAMS:
-        if category_filter and spec.category != category_filter:
-            continue
+def _params_for():
+    """Yield (spec, size_value, size_id) tuples."""
+    for spec, size_param in _PARAMS:
         sv = size_param.values[0] if hasattr(size_param, "values") else size_param
         sid = size_param.id if hasattr(size_param, "id") else str(sv)
-        pdv = pack_param.values[0] if hasattr(pack_param, "values") else pack_param
-        pdid = pack_param.id if hasattr(pack_param, "id") else str(pdv)
-        yield spec, sv, sid, pdv, pdid
+        yield spec, sv, sid
 
 
 _ALL_PARAMS = list(_params_for())
 
 
-def _pytest_param(spec, size_value, size_id, pack_dtype, pack_id):
-    suffix = f"{size_id}-{pack_id}" if spec.category in _PACK_SENSITIVE else size_id
-    pid = f"{spec.name}-{suffix}"
-    return pytest.param(spec, size_value, pack_dtype, id=pid)
+def _pytest_param(spec, size_value, size_id):
+    pid = f"{spec.name}-{size_id}"
+    return pytest.param(spec, size_value, id=pid)
 
 
 _PARAMETRIZED = [_pytest_param(*p) for p in _ALL_PARAMS]
 
 
-@pytest.mark.parametrize("spec,size,pack_dtype", _PARAMETRIZED)
-def test_bit1(benchmark, device, spec, size, pack_dtype):
+@pytest.mark.parametrize("spec,size", _PARAMETRIZED)
+def test_bit1(benchmark, device, spec, size):
     """Time `spec.run(*bit1_inputs)` on `device`."""
     benchmark.group = spec.group
-    bit1_args, _ = _build_pair(spec, size, device, pack_dtype)
+    bit1_args, _ = _build_pair(spec, size, device)
     set_throughput(benchmark, _throughput_elems(spec, size), "bits")
     try:
         benchmark(with_sync(lambda: spec.run(*bit1_args), device))
@@ -160,8 +122,8 @@ def test_bit1(benchmark, device, spec, size, pack_dtype):
         raise
 
 
-@pytest.mark.parametrize("spec,size,pack_dtype", _PARAMETRIZED)
-def test_bool(benchmark, device, spec, size, pack_dtype):
+@pytest.mark.parametrize("spec,size", _PARAMETRIZED)
+def test_bool(benchmark, device, spec, size):
     """Time the bool oracle on `device`.
 
     When `spec.bool_cant_run` is True, the oracle is "what a bool user would
@@ -169,7 +131,7 @@ def test_bool(benchmark, device, spec, size, pack_dtype):
     `spec.run(*bool_inputs)`.
     """
     benchmark.group = spec.group
-    _, bool_args = _build_pair(spec, size, device, pack_dtype)
+    _, bool_args = _build_pair(spec, size, device)
     fn = spec.oracle if spec.oracle is not None else spec.run
     set_throughput(benchmark, _throughput_elems(spec, size), "bits")
     try:
