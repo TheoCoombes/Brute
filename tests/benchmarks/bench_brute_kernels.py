@@ -39,7 +39,7 @@ def test_bit1_pack_bool(benchmark, device, n_bits):
     benchmark.group = "kernels/pack_bool"
     src = _rand_bool((n_bits,), device)
     set_throughput(benchmark, n_bits, "bits")
-    benchmark(with_sync(lambda: torch.ops.brute.pack_bool(src, 64), device))
+    benchmark(with_sync(lambda: torch.ops.brute.pack_bool(src), device))
 
 
 @pytest.mark.parametrize("n_bits", VECTOR_SCALES)
@@ -80,7 +80,7 @@ def test_bit1_xnor_matmul_kernel(benchmark, device, MKN):
     b = brute.tensor(_rand_bool((N, K), device), dtype=brute.bit1)
     set_throughput(benchmark, 2 * M * N * K, "bit-ops")
     benchmark(with_sync(lambda: torch.ops.brute.xnor_popcount_matmul(
-        a._packed_buf, b._packed_buf, K, 64), device))
+        a._packed_buf, b._packed_buf, K), device))
 
 
 @pytest.mark.parametrize("MKN", MATMUL_SCALES)

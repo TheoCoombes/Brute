@@ -31,7 +31,7 @@ def test_large_xnor_matmul(M, K, N):
     a_bit = bit1(a_bool)
     b_bit = bit1(b_bool_T)
     out = torch.ops.brute.xnor_popcount_matmul(
-        a_bit._packed_buf, b_bit._packed_buf, K, 8
+        a_bit._packed_buf, b_bit._packed_buf, K
     ).to(torch.float32)
     a_pm1 = a_bool.float() * 2 - 1
     b_pm1 = b_bool_T.t().float() * 2 - 1
