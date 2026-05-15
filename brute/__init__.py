@@ -152,3 +152,6 @@ from brute import nn  # noqa: F401  (subpackage exposed as brute.nn)
 from brute import cuda_graphs  # noqa: F401
 from brute import streams       # noqa: F401
 parallel_streams = streams.parallel_streams
+
+# Direct-call shortcuts that bypass __torch_function__ for hot inference loops.
+from brute import fast  # noqa: F401
