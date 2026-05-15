@@ -5,27 +5,19 @@
 
 namespace cbrute { namespace cuda {
 
-//  Packing / unpacking 
-at::Tensor  pack_bits   (const at::Tensor& input,  int64_t pack_width);
-at::Tensor  pack_bool   (const at::Tensor& input,  int64_t pack_width);
-at::Tensor  unpack_bits (const at::Tensor& packed, at::IntArrayRef logical_shape, int64_t pw);
-at::Tensor  unpack_bool (const at::Tensor& packed, at::IntArrayRef logical_shape, int64_t pw);
+//  Packing / unpacking — bit1 is uint64-packed (64 bits per int64 word).
+at::Tensor  pack_bool   (const at::Tensor& input);
+at::Tensor  unpack_bits (const at::Tensor& packed, at::IntArrayRef logical_shape);
+at::Tensor  unpack_bool (const at::Tensor& packed, at::IntArrayRef logical_shape);
 
-//  Matmul (CUTLASS B1 XOR-popc on sm_80+, hand kernel otherwise) 
-at::Tensor  xnor_popcount_matmul(const at::Tensor& A, const at::Tensor& B,
-                                 int64_t K, int64_t pack_width);
+//  Matmul (CUTLASS B1 XOR-popc on sm_80+, hand kernel otherwise)
+at::Tensor  xnor_popcount_matmul(const at::Tensor& A, const at::Tensor& B, int64_t K);
 
-//  Popcount / hamming 
+//  Popcount / hamming
 at::Tensor  popcount         (const at::Tensor& x);
 at::Tensor  packed_popcount  (const at::Tensor& x);
 at::Tensor  hamming_distance (const at::Tensor& A, const at::Tensor& B);
 at::Tensor  bit1_hamming_total(const at::Tensor& A, const at::Tensor& B);
-
-//  Bitwise (delegate to at::, already SIMD-vectorized on device) 
-at::Tensor  bitwise_and(const at::Tensor& A, const at::Tensor& B);
-at::Tensor  bitwise_or (const at::Tensor& A, const at::Tensor& B);
-at::Tensor  bitwise_xor(const at::Tensor& A, const at::Tensor& B);
-at::Tensor  bitwise_not(const at::Tensor& A);
 
 at::Tensor& randomize_bits(at::Tensor& out);
 

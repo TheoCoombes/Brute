@@ -1,19 +1,14 @@
 // brute CUDA backend — driver layer.
 //
-// Public ops registered as TORCH_LIBRARY_IMPL handlers (see ext.cpp).
-// All heavy lifting is delegated to the kernels in `kernels/`. This file
-// only:
-//   * validates the at::Tensor inputs,
-//   * allocates outputs ONCE (before launching kernels),
-//   * picks the right kernel variant (pack-width / dtype / CUTLASS vs fallback),
-//   * launches with sensible grid/block dims on the current CUDA stream.
+// All bit1 packed buffers are uint64 (int64 storage, 64 bits per word).
+// Drivers do tensor validation, output allocation, and kernel launches on
+// the current CUDA stream; all heavy lifting lives in `kernels/`.
 //
 // Invariants:
 //   * Zero device-side allocations inside any kernel.
 //   * All kernels see contiguous, type-stable raw pointers.
-//   * Output is zero-initialized when pad-bytes must remain zero (pack ops,
-//     packed_popcount accumulator) — otherwise allocated with at::empty.
-//   * Bit-exact parity with the CPU implementation for every op.
+//   * Output is zero-initialised when pad bytes/bits must be 0; otherwise
+//     allocated with at::empty.
 
 #ifdef HAVE_CUDA
 #include "ops_cuda.h"
@@ -31,20 +26,12 @@ namespace cbrute { namespace cuda {
 
 namespace {
 
-at::ScalarType pack_scalar_type(int64_t pw) {
-    switch (pw) {
-        case 8:  return at::kByte;
-        case 32: return at::kInt;
-        case 64: return at::kLong;
-        default: TORCH_CHECK(false, "pack_width must be 8, 32, or 64; got ", pw);
-    }
-}
+constexpr int64_t PACK_WIDTH = 64;
 
 inline cudaStream_t cur_stream() {
     return at::cuda::getCurrentCUDAStream().stream();
 }
 
-// Compute capability of the current device, as cc = major*10 + minor.
 inline int compute_capability() {
     int dev = -1;
     cudaGetDevice(&dev);
@@ -54,55 +41,17 @@ inline int compute_capability() {
     return major * 10 + minor;
 }
 
-// Reinterpret a byte-aligned device pointer as a uint64*. Caller guarantees
-// at least 8-byte alignment (true for any at::Tensor data_ptr).
-inline const uint64_t* as_u64(const at::Tensor& t) { return reinterpret_cast<const uint64_t*>(t.data_ptr()); }
+inline const uint64_t* as_u64(const at::Tensor& t) {
+    return reinterpret_cast<const uint64_t*>(t.data_ptr());
+}
 inline uint8_t*        as_u8 (at::Tensor& t)       { return reinterpret_cast<uint8_t*>(t.data_ptr()); }
 inline const uint8_t*  as_u8 (const at::Tensor& t) { return reinterpret_cast<const uint8_t*>(t.data_ptr()); }
 
 }  // anon
 
-// 
-// pack_bits (float input → packed bits)
-// 
-at::Tensor pack_bits(const at::Tensor& input, int64_t pw) {
-    TORCH_CHECK(input.dim() >= 1, "pack_bits: input must have >= 1 dim");
-    TORCH_CHECK(pw == 8 || pw == 32 || pw == 64,
-                "pack_bits: pack_width must be 8, 32, or 64");
-
-    const auto inp = input.contiguous().to(at::kFloat);
-    const int64_t ld = inp.size(-1);
-
-    auto out_shape = inp.sizes().vec();
-    if (ld == 0) {
-        out_shape.back() = 0;
-        return at::zeros(out_shape, inp.options().dtype(pack_scalar_type(pw)));
-    }
-
-    const int64_t pd_words  = (ld + pw - 1) / pw;
-    const int64_t row_bytes = pd_words * (pw / 8);
-    const int64_t batch     = inp.numel() / ld;
-    out_shape.back() = pd_words;
-
-     auto output = at::zeros(out_shape, inp.options().dtype(pack_scalar_type(pw)));
-     const int chunks = (int)((ld + 31) / 32);
-     const bool aligned4 = (pw == 32 || pw == 64);
-     dim3 grid((unsigned)chunks, (unsigned)batch);
-     dim3 block(32);   // exactly one warp per block — matches __ballot_sync usage
-     kernels::k_pack_float_warp<<<grid, block, 0, cur_stream()>>>(
-         inp.data_ptr<float>(),
-         as_u8(output),
-         ld, row_bytes, aligned4);
-     return output;
- }
-
-// 
-// pack_bool (bool input → packed bits; fast path used by Python _pack_bool)
-// 
-at::Tensor pack_bool(const at::Tensor& input, int64_t pw) {
+//  pack_bool: bool input → int64 packed buffer.
+at::Tensor pack_bool(const at::Tensor& input) {
     TORCH_CHECK(input.dim() >= 1, "pack_bool: input must have >= 1 dim");
-    TORCH_CHECK(pw == 8 || pw == 32 || pw == 64,
-                "pack_bool: pack_width must be 8, 32, or 64");
     TORCH_CHECK(input.scalar_type() == at::kBool,
                 "pack_bool: input must be torch.bool");
 
@@ -112,187 +61,121 @@ at::Tensor pack_bool(const at::Tensor& input, int64_t pw) {
     auto out_shape = inp.sizes().vec();
     if (ld == 0) {
         out_shape.back() = 0;
-        return at::zeros(out_shape, inp.options().dtype(pack_scalar_type(pw)));
+        return at::zeros(out_shape, inp.options().dtype(at::kLong));
     }
 
-    const int64_t pd_words  = (ld + pw - 1) / pw;
-    const int64_t row_bytes = pd_words * (pw / 8);
+    const int64_t pd_words  = (ld + PACK_WIDTH - 1) / PACK_WIDTH;
+    const int64_t row_bytes = pd_words * (PACK_WIDTH / 8);
     const int64_t batch     = inp.numel() / ld;
     out_shape.back() = pd_words;
 
-    auto output = at::zeros(out_shape, inp.options().dtype(pack_scalar_type(pw)));
+    auto output = at::zeros(out_shape, inp.options().dtype(at::kLong));
     const int chunks = (int)((ld + 31) / 32);
-    const bool aligned4 = (pw == 32 || pw == 64);
 
-    // Persistent kernel for large inputs: ~256 blocks × 256 threads = 8 warps
-    // per block × 256 blocks = 2048 warps grid-strides over total work.
-    // Cuts launch overhead drastically for the huge-batch case while remaining
-    // correct (each warp handles disjoint chunks).
+    // Persistent kernel for large inputs amortises launch overhead.
+    constexpr int64_t PERSISTENT_THRESHOLD = 32 * 1024;
     const int64_t total_chunks = batch * (int64_t)chunks;
-    constexpr int64_t PERSISTENT_THRESHOLD = 32 * 1024;  // ≈ 1 MB of bool input
     if (total_chunks >= PERSISTENT_THRESHOLD) {
-        dim3 block(256);                   // 8 warps per block
-        dim3 grid(256);                    // saturate most consumer GPUs
-        kernels::k_pack_bool_persistent<<<grid, block, 0, cur_stream()>>>(
+        kernels::k_pack_bool_persistent<<<256, 256, 0, cur_stream()>>>(
             reinterpret_cast<const uint8_t*>(inp.data_ptr<bool>()),
-            as_u8(output),
-            ld, row_bytes, batch, chunks, aligned4);
+            as_u8(output), ld, row_bytes, batch, chunks);
     } else {
         dim3 grid((unsigned)chunks, (unsigned)batch);
-        dim3 block(32);
-        kernels::k_pack_bool_warp<<<grid, block, 0, cur_stream()>>>(
+        kernels::k_pack_bool_warp<<<grid, 32, 0, cur_stream()>>>(
             reinterpret_cast<const uint8_t*>(inp.data_ptr<bool>()),
-            as_u8(output),
-            ld, row_bytes, aligned4);
+            as_u8(output), ld, row_bytes);
     }
     return output;
 }
 
-// 
-// unpack_bits (packed → ±1 float32)
-// 
-at::Tensor unpack_bits(const at::Tensor& packed, at::IntArrayRef logical_shape, int64_t pw) {
-    TORCH_CHECK(pw == 8 || pw == 32 || pw == 64,
-                "unpack_bits: pack_width must be 8, 32, or 64");
-
+//  unpack_bits: packed → float32 ±1.0.
+at::Tensor unpack_bits(const at::Tensor& packed, at::IntArrayRef logical_shape) {
     const auto p = packed.contiguous();
     const int64_t ll = logical_shape.back();
-    if (ll == 0 || p.numel() == 0) {
+    if (ll == 0 || p.numel() == 0)
         return at::empty(logical_shape.vec(), p.options().dtype(at::kFloat));
-    }
 
-     const int64_t pl_words  = p.size(-1);
-     const int64_t row_bytes = pl_words * (pw / 8);
-     const int64_t batch     = p.numel() / pl_words;
-     const bool aligned4 = (pw == 32 || pw == 64);
+    const int64_t pl_words  = p.size(-1);
+    const int64_t row_bytes = pl_words * (PACK_WIDTH / 8);
+    const int64_t batch     = p.numel() / pl_words;
 
-     auto output = at::empty(logical_shape.vec(), p.options().dtype(at::kFloat));
-     const int chunks = (int)((ll + 31) / 32);
-     dim3 grid((unsigned)chunks, (unsigned)batch);
-     dim3 block(32);
-     kernels::k_unpack_pm1_warp<<<grid, block, 0, cur_stream()>>>(
-         as_u8(p),
-         output.data_ptr<float>(),
-         ll, row_bytes, aligned4);
-     return output;
- }
+    auto output = at::empty(logical_shape.vec(), p.options().dtype(at::kFloat));
+    const int chunks = (int)((ll + 31) / 32);
+    dim3 grid((unsigned)chunks, (unsigned)batch);
+    kernels::k_unpack_pm1_warp<<<grid, 32, 0, cur_stream()>>>(
+        as_u8(p), output.data_ptr<float>(), ll, row_bytes);
+    return output;
+}
 
-// 
-// unpack_bool (packed → bool)
-// 
-at::Tensor unpack_bool(const at::Tensor& packed, at::IntArrayRef logical_shape, int64_t pw) {
-    TORCH_CHECK(pw == 8 || pw == 32 || pw == 64,
-                "unpack_bool: pack_width must be 8, 32, or 64");
-
+//  unpack_bool: packed → bool.
+at::Tensor unpack_bool(const at::Tensor& packed, at::IntArrayRef logical_shape) {
     const auto p = packed.contiguous();
     const int64_t ll = logical_shape.back();
-    if (ll == 0 || p.numel() == 0) {
+    if (ll == 0 || p.numel() == 0)
         return at::empty(logical_shape.vec(), p.options().dtype(at::kBool));
-    }
 
-     const int64_t pl_words  = p.size(-1);
-     const int64_t row_bytes = pl_words * (pw / 8);
-     const int64_t batch     = p.numel() / pl_words;
-     const bool aligned4 = (pw == 32 || pw == 64);
+    const int64_t pl_words  = p.size(-1);
+    const int64_t row_bytes = pl_words * (PACK_WIDTH / 8);
+    const int64_t batch     = p.numel() / pl_words;
 
     auto output = at::empty(logical_shape.vec(), p.options().dtype(at::kBool));
     const int chunks = (int)((ll + 31) / 32);
-
-    // Persistent variant for huge inputs (same threshold as pack_bool).
     const int64_t total_chunks = batch * (int64_t)chunks;
     constexpr int64_t PERSISTENT_THRESHOLD = 32 * 1024;
     if (total_chunks >= PERSISTENT_THRESHOLD) {
-        dim3 block(256);
-        dim3 grid(256);
-        kernels::k_unpack_bool_persistent<<<grid, block, 0, cur_stream()>>>(
-            as_u8(p),
-            reinterpret_cast<uint8_t*>(output.data_ptr<bool>()),
-            ll, row_bytes, batch, chunks, aligned4);
+        kernels::k_unpack_bool_persistent<<<256, 256, 0, cur_stream()>>>(
+            as_u8(p), reinterpret_cast<uint8_t*>(output.data_ptr<bool>()),
+            ll, row_bytes, batch, chunks);
     } else {
         dim3 grid((unsigned)chunks, (unsigned)batch);
-        dim3 block(32);
-        kernels::k_unpack_bool_warp<<<grid, block, 0, cur_stream()>>>(
-            as_u8(p),
-            reinterpret_cast<uint8_t*>(output.data_ptr<bool>()),
-            ll, row_bytes, aligned4);
+        kernels::k_unpack_bool_warp<<<grid, 32, 0, cur_stream()>>>(
+            as_u8(p), reinterpret_cast<uint8_t*>(output.data_ptr<bool>()),
+            ll, row_bytes);
     }
     return output;
 }
 
-//
-// xnor_popcount_matmul — CUTLASS B1 GEMM with auto-padding for arbitrary
-// shapes; hand-tuned fallback only when CUTLASS truly cannot run.
-//
-// Output semantic: C = K − 2·popc_xor(A, B).
-//
-// Strategy:
-//   1. Always reinterpret packed buffer as uint32 storage (CUTLASS B1 requires
-//      it). pw==8 / pw==64 just changes the leading-dim arithmetic — bytes are
-//      identical regardless. As long as Kp_bits is a multiple of 32, we can
-//      view the storage as uint32 array.
-//   2. Pad M, N, K to CUTLASS tile alignment (M%8, N%8, K%256) by allocating
-//      padded views with zero padding bits. The pad rows/cols of the result
-//      are computed by the GEMM but discarded by slicing.
-//   3. Run CUTLASS, slice output, apply C = K − 2H epilogue.
-//   4. Fallback to the hand-tuned fallback kernel only when:
-//        * compute capability < 80 (no B1 tensor cores), OR
-//        * total padded K cost would exceed the actual K (i.e. K is so small
-//          that padding to 256 bits is mostly waste — the fallback is faster).
-//
-at::Tensor xnor_popcount_matmul(const at::Tensor& A, const at::Tensor& B,
-                                int64_t K, int64_t pw) {
+//  xnor_popcount_matmul: bit1 GEMM.
+//  Strategy:
+//    1. CUTLASS B1 GEMM with `OpXorPopc` + fused K-2H epilogue on sm_80+ when
+//       K_bits (= Kp * 64) ≥ 256. Pad M/N to 8 and K_bits to 256 with zeros.
+//    2. Hand-tuned XOR-popc fallback on sm_70 / sm_75 or when K_bits < 256.
+at::Tensor xnor_popcount_matmul(const at::Tensor& A, const at::Tensor& B, int64_t K) {
     TORCH_CHECK(A.dim() == 2 && B.dim() == 2,
                 "xnor_popcount_matmul: inputs must be 2-D");
-    TORCH_CHECK(pw == 8 || pw == 32 || pw == 64,
-                "pack_width must be 8, 32, or 64");
     const int64_t M = A.size(0), N = B.size(0), Kp = A.size(1);
     TORCH_CHECK(Kp == B.size(1), "xnor_popcount_matmul: packed K mismatch");
 
     auto Ac = A.contiguous();
     auto Bc = B.contiguous();
 
-    const int64_t Kp_bits = Kp * pw;
+    const int64_t Kp_bits = Kp * PACK_WIDTH;
     const int     cc      = compute_capability();
 
-    // Decide CUTLASS eligibility:
-    //   cc >= 80 (Ampere+, has B1 MMA)
-    //   Kp_bits % 32 == 0 (true for any pw≥32; for pw=8 requires Kp%4==0).
-    //   Kp_bits >= 256 (B1 MMA's K-tile is 256 bits — anything smaller forces
-    //                   so much padding that the fallback kernel wins).
-    const bool kp_bits_aligned32 = (Kp_bits % 32 == 0);
-    const bool cutlass_eligible  = (cc >= 80) && kp_bits_aligned32 && (Kp_bits >= 256);
-
-    if (cutlass_eligible) {
-        // CUTLASS tile alignment requirements.
+    if (cc >= 80 && Kp_bits >= 256) {
         constexpr int64_t M_ALIGN = 8;
         constexpr int64_t N_ALIGN = 8;
         constexpr int64_t K_BIT_ALIGN = 256;
-        const int64_t M_pad = (M + M_ALIGN - 1) / M_ALIGN * M_ALIGN;
-        const int64_t N_pad = (N + N_ALIGN - 1) / N_ALIGN * N_ALIGN;
+        const int64_t M_pad      = (M + M_ALIGN - 1) / M_ALIGN * M_ALIGN;
+        const int64_t N_pad      = (N + N_ALIGN - 1) / N_ALIGN * N_ALIGN;
         const int64_t Kp_bits_pad =
             (Kp_bits + K_BIT_ALIGN - 1) / K_BIT_ALIGN * K_BIT_ALIGN;
-        // Padded packed-uint32 leading dim. CUTLASS works in bits internally
-        // but our buffer is uint32-aligned; size it to an integral uint32 count
-        // so allocations and copies stay byte-aligned.
-        const int64_t Kp32_pad = Kp_bits_pad / 32;
+        const int64_t Kp32_pad   = Kp_bits_pad / 32;
 
         const bool needs_pad = (M_pad != M) || (N_pad != N)
-                            || (Kp_bits_pad != Kp_bits) || (pw != 32);
+                            || (Kp_bits_pad != Kp_bits);
 
-        // View / allocate uint32 working tensors.
+        // Allocate padded uint32-viewed working tensors when padding is needed.
         auto opts_u32 = A.options().dtype(at::kInt);
         at::Tensor A_u32, B_u32;
-        if (!needs_pad && pw == 32) {
-            // Zero-copy fast path.
-            A_u32 = Ac;
-            B_u32 = Bc;
+        if (!needs_pad) {
+            // Zero-copy reinterpret of the int64 packed buffer as int32 view.
+            A_u32 = Ac.view(at::kInt);
+            B_u32 = Bc.view(at::kInt);
         } else {
             A_u32 = at::zeros({M_pad, Kp32_pad}, opts_u32);
             B_u32 = at::zeros({N_pad, Kp32_pad}, opts_u32);
-            // Compute the unpadded uint32 leading dim, then memcpy each row.
             const int64_t Kp32_in = Kp_bits / 32;
-            // Per-row byte stride of source = Kp * pw/8 = Kp_bits/8 bytes.
-            // Per-row byte stride in uint32 dest = Kp32_pad * 4 bytes.
             cudaMemcpy2DAsync(
                 A_u32.data_ptr(), Kp32_pad * sizeof(uint32_t),
                 Ac.data_ptr(),    Kp32_in  * sizeof(uint32_t),
@@ -303,7 +186,6 @@ at::Tensor xnor_popcount_matmul(const at::Tensor& A, const at::Tensor& B,
                 Bc.data_ptr(),    Kp32_in  * sizeof(uint32_t),
                 Kp32_in * sizeof(uint32_t), N,
                 cudaMemcpyDeviceToDevice, cur_stream());
-            // Trailing M_pad - M, N_pad - N rows stay all-zero (already zeroed).
         }
 
         auto C_pad = at::empty({M_pad, N_pad}, opts_u32);
@@ -316,55 +198,28 @@ at::Tensor xnor_popcount_matmul(const at::Tensor& A, const at::Tensor& B,
             {reinterpret_cast<cutlass::uint1b_t const*>(B_u32.data_ptr()), (int)Kp_bits_pad},
             {C_pad.data_ptr<int32_t>(), (int)N_pad},
             {C_pad.data_ptr<int32_t>(), (int)N_pad},
-            {1, 0}    // alpha=1, beta=0 — accum is H directly.
+            // Epilogue params — pass K_logical so K-2H is fused into the GEMM.
+            {(int32_t)K},
         };
 
         cutlass::Status status = gemm_op(args, /*workspace=*/nullptr, cur_stream());
         TORCH_CHECK(status == cutlass::Status::kSuccess,
                     "CUTLASS B1 GEMM failed: ", int(status));
 
-        // Pad bits in A_u32 / B_u32 are zero, so they XOR to zero and contribute
-        // nothing to H — the slice [:M, :N] of C_pad is the correct H matrix
-        // for the unpadded inputs. Apply K - 2H epilogue in-place.
-        const int64_t n_elems_pad = M_pad * N_pad;
-        dim3 block(256);
-        dim3 grid((unsigned)((n_elems_pad + 255) / 256));
-        kernels::k_kminus2_inplace<<<grid, block, 0, cur_stream()>>>(
-            C_pad.data_ptr<int32_t>(), n_elems_pad, (int32_t)K);
-
         if (M_pad == M && N_pad == N) return C_pad;
         return C_pad.slice(0, 0, M).slice(1, 0, N).contiguous();
     }
 
-    // Fallback path: hand-tuned XOR-popc kernel. Used for sm_70/sm_75 or for
-    // tiny K where the CUTLASS pad cost outweighs its tensor-core win.
-    auto C = at::zeros({M, N}, A.options().dtype(at::kInt));
-    const int32_t K_eff = (int32_t)(2LL * Kp * pw - K);
+    // Fallback: hand-tuned XOR-popc kernel for sm_70/sm_75 or tiny K.
+    auto C = at::empty({M, N}, A.options().dtype(at::kInt));
     dim3 block(16, 16);
     dim3 grid((unsigned)((N + 15) / 16), (unsigned)((M + 15) / 16));
-
-    if (pw == 64) {
-        kernels::k_xnor_popcount_matmul<uint64_t><<<grid, block, 0, cur_stream()>>>(
-            reinterpret_cast<const uint64_t*>(Ac.data_ptr<int64_t>()),
-            reinterpret_cast<const uint64_t*>(Bc.data_ptr<int64_t>()),
-            C.data_ptr<int32_t>(), M, N, Kp, K_eff);
-    } else if (pw == 32) {
-        kernels::k_xnor_popcount_matmul<uint32_t><<<grid, block, 0, cur_stream()>>>(
-            reinterpret_cast<const uint32_t*>(Ac.data_ptr<int32_t>()),
-            reinterpret_cast<const uint32_t*>(Bc.data_ptr<int32_t>()),
-            C.data_ptr<int32_t>(), M, N, Kp, K_eff);
-    } else { // pw == 8
-        kernels::k_xnor_popcount_matmul<uint8_t><<<grid, block, 0, cur_stream()>>>(
-            Ac.data_ptr<uint8_t>(),
-            Bc.data_ptr<uint8_t>(),
-            C.data_ptr<int32_t>(), M, N, Kp, K_eff);
-    }
+    kernels::k_xnor_popcount_matmul<<<grid, block, 0, cur_stream()>>>(
+        as_u64(Ac), as_u64(Bc), C.data_ptr<int32_t>(), M, N, Kp, (int32_t)K);
     return C;
 }
 
-// 
-// popcount — per-element, output int32. Supports all integer dtypes (+ bool).
-// 
+//  popcount — per-element int32, supports any integer dtype + bool.
 at::Tensor popcount(const at::Tensor& x) {
     const auto p = x.contiguous();
     auto out = at::empty(p.sizes(), p.options().dtype(at::kInt));
@@ -403,9 +258,7 @@ at::Tensor popcount(const at::Tensor& x) {
     return out;
 }
 
-// 
-// packed_popcount — total bit count across the buffer (int64 scalar).
-// 
+//  packed_popcount — total 1-bit count across the buffer (int64 scalar).
 at::Tensor packed_popcount(const at::Tensor& x) {
     const auto p = x.contiguous();
     auto out = at::zeros({}, p.options().dtype(at::kLong));
@@ -429,18 +282,12 @@ at::Tensor packed_popcount(const at::Tensor& x) {
     return out;
 }
 
-// 
-// hamming_distance — per-element popcount(A^B), output int32.
-// Broadcasting handled by torch's TensorIterator on the XOR.
-// 
+//  hamming_distance — per-element popcount(A^B). Broadcasting via TensorIterator.
 at::Tensor hamming_distance(const at::Tensor& A, const at::Tensor& B) {
     return popcount(at::bitwise_xor(A, B));
 }
 
-// 
-// bit1_hamming_total — fused XOR + popcount over equal-shape packed buffers
-// (int64 scalar). No XOR temporary.
-// 
+//  bit1_hamming_total — fused total popcount(A^B), int64 scalar.
 at::Tensor bit1_hamming_total(const at::Tensor& A, const at::Tensor& B) {
     TORCH_CHECK(A.sizes()       == B.sizes(),       "bit1_hamming_total: shape mismatch");
     TORCH_CHECK(A.scalar_type() == B.scalar_type(), "bit1_hamming_total: dtype mismatch");
@@ -468,14 +315,6 @@ at::Tensor bit1_hamming_total(const at::Tensor& A, const at::Tensor& B) {
     }
     return out;
 }
-
-// 
-// Bitwise pass-throughs.
-// 
-at::Tensor bitwise_and(const at::Tensor& A, const at::Tensor& B) { return at::bitwise_and(A, B); }
-at::Tensor bitwise_or (const at::Tensor& A, const at::Tensor& B) { return at::bitwise_or (A, B); }
-at::Tensor bitwise_xor(const at::Tensor& A, const at::Tensor& B) { return at::bitwise_xor(A, B); }
-at::Tensor bitwise_not(const at::Tensor& A)                       { return at::bitwise_not(A);    }
 
 at::Tensor& randomize_bits(at::Tensor& out) { out.random_(); return out; }
 

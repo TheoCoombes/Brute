@@ -127,43 +127,6 @@ HWY_ATTR inline void PackBoolBytesToBits(const uint8_t* HWY_RESTRICT in_bool,
     }
 }
 
-//  Pack float32 (>0) → packed bytes
-// Bit = 1 iff input > 0.0f.
-HWY_ATTR inline void PackFloatToBits(const float* HWY_RESTRICT in_f,
-                                     uint8_t* HWY_RESTRICT out_bytes,
-                                     size_t n_bits) {
-    const hn::CappedTag<float, 8> df;
-    const size_t N = hn::Lanes(df);
-    const auto zero = hn::Zero(df);
-    const size_t n_full = n_bits / 8;
-
-    if (N == 8) {
-        for (size_t j = 0; j < n_full; ++j) {
-            auto v = hn::LoadU(df, in_f + j * 8);
-            auto m = hn::Gt(v, zero);
-            out_bytes[j] = (uint8_t)hn::BitsFromMask(df, m);
-        }
-    } else {
-        for (size_t j = 0; j < n_full; ++j) {
-            uint8_t byte = 0;
-            for (size_t s = 0; s < 8; s += N) {
-                auto v = hn::LoadU(df, in_f + j * 8 + s);
-                auto m = hn::Gt(v, zero);
-                byte |= (uint8_t)(hn::BitsFromMask(df, m) << s);
-            }
-            out_bytes[j] = byte;
-        }
-    }
-    const size_t leftover = n_bits - n_full * 8;
-    if (leftover) {
-        uint8_t byte = 0;
-        for (size_t b = 0; b < leftover; ++b) {
-            if (in_f[n_full * 8 + b] > 0.f) byte |= (uint8_t)(1u << b);
-        }
-        out_bytes[n_full] = byte;
-    }
-}
-
 //  Unpack packed bytes → float32 (+1.0 / −1.0)
 // 256-entry LUT: each input byte indexes 8 pre-computed float bit-patterns.
 // Compiler emits a single 32-byte aligned load per byte. The LUT is 8 KB so

@@ -1,42 +1,88 @@
-// CUTLASS-backed B1 XOR-popcount GEMM.
+// CUTLASS-backed B1 XOR-popcount GEMM with fused (K − 2H) epilogue.
 //
-//   A: (M, K_bits)  RowMajor    uint1b_t   — reinterpret of our packed buffer
+//   A: (M, K_bits)  RowMajor    uint1b_t   — reinterpret of our int64 packed buffer
 //   B: (K_bits, N)  ColumnMajor uint1b_t   — same memory as (N, K_bits) RowMajor,
 //                                            which is how our B is stored.
-//   C: (M, N)       RowMajor    int32      — Hamming distance per (m, n) pair.
+//   C: (M, N)       RowMajor    int32      — final output: K_logical − 2·H[m,n].
 //
-// CUTLASS computes H[m,n] = Σ_k popc(A[m,k] ⊕ B[k,n]) over the bit-K dim.
-// Mapping to our existing semantic:
-//
-//     C_brute[m,n] = K_logical − 2 * H[m,n]
-//
-// (Pad bits in both operands are zero, so they XOR to zero and contribute
-// nothing — popc_xor over the padded buffer equals popc_xor over the logical
-// bits.) The (K − 2·) transform is applied by a tiny epilogue kernel
-// `k_kminus2_inplace` below.
+// CUTLASS naturally computes H[m,n] = Σ_k popc(A[m,k] ⊕ B[k,n]). The custom
+// epilogue thread op below maps H → K_logical − 2·H *in-register*, eliminating
+// the separate post-pass kernel the old design needed. Pad bits in both
+// operands are zero by construction, so they XOR to zero and don't perturb H.
 //
 // Requirements for this path:
 //   * Device compute capability ≥ 8.0 (Ampere).
-//   * K (in bits) must be a multiple of 256 — the B1 MMA instruction's K tile.
-//     Caller is responsible for falling back otherwise.
+//   * K (in bits) must be a multiple of 256 — the B1 MMA K-tile. Caller pads.
 
 #pragma once
 
 #include <cstdint>
 #include <cuda_runtime.h>
 
-// Only enable when CUTLASS is being compiled (host-driver gate selects per call).
-#if defined(CUTLASS_ARCH_MMA_B1_XOR_SM80_ENABLED) || 1
-// We always include the GEMM template — selection happens at runtime in the
-// driver. If the executing device lacks the instruction the kernel will assert
-// at launch time, but we never reach that point because the driver checks cc.
 #include "cutlass/cutlass.h"
-#include "cutlass/gemm/device/gemm.h"
+#include "cutlass/array.h"
 #include "cutlass/numeric_types.h"
 #include "cutlass/layout/matrix.h"
-#endif
+#include "cutlass/gemm/device/gemm.h"
+#include "cutlass/epilogue/thread/scale_type.h"
 
 namespace cbrute { namespace cuda { namespace kernels {
+
+// Custom epilogue thread op: D[i] = K_logical − 2·accumulator[i].
+//
+// `is_source_needed()` and `kScale = ScaleType::Nothing` together tell CUTLASS
+// to skip the source-tensor load entirely — we never read the prior C value.
+// API surface is a drop-in replacement for `LinearCombination`.
+template <typename ElementOutput_, int Count_,
+          typename ElementAccumulator_ = ElementOutput_,
+          typename ElementCompute_     = ElementAccumulator_>
+struct KMinusTwoH {
+    using ElementOutput      = ElementOutput_;
+    using ElementAccumulator = ElementAccumulator_;
+    using ElementCompute     = ElementCompute_;
+    using FragmentOutput      = cutlass::Array<ElementOutput, Count_>;
+    using FragmentAccumulator = cutlass::Array<ElementAccumulator, Count_>;
+    using FragmentCompute     = cutlass::Array<ElementCompute, Count_>;
+
+    static int const kCount = Count_;
+    static cutlass::epilogue::thread::ScaleType::Kind const kScale =
+        cutlass::epilogue::thread::ScaleType::Nothing;
+    static cutlass::FloatRoundStyle const kRound =
+        cutlass::FloatRoundStyle::round_to_nearest;
+
+    struct Params {
+        ElementCompute K_logical;
+        CUTLASS_HOST_DEVICE Params() : K_logical(0) {}
+        CUTLASS_HOST_DEVICE Params(ElementCompute K) : K_logical(K) {}
+    };
+
+    ElementCompute K_logical;
+
+    CUTLASS_HOST_DEVICE
+    KMinusTwoH(Params const& p) : K_logical(p.K_logical) {}
+
+    CUTLASS_HOST_DEVICE bool is_source_needed() const { return false; }
+    CUTLASS_HOST_DEVICE void set_k_partition(int /*k*/, int /*kpc*/) {}
+
+    CUTLASS_HOST_DEVICE
+    FragmentOutput operator()(FragmentAccumulator const& accum) const {
+        FragmentOutput out;
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < Count_; ++i) {
+            ElementCompute h = ElementCompute(accum[i]);
+            out[i] = ElementOutput(K_logical - ElementCompute(2) * h);
+        }
+        return out;
+    }
+
+    // source-needed variant — unused (kScale = Nothing), but the CUTLASS
+    // epilogue interface requires it to compile.
+    CUTLASS_HOST_DEVICE
+    FragmentOutput operator()(FragmentAccumulator const& accum,
+                              FragmentOutput const&) const {
+        return (*this)(accum);
+    }
+};
 
 // Threadblock / warp / instruction tile choices — match the standard B1 sm_80
 // configuration used in cutlass/test/unit/gemm/device/...sm80.cu.
@@ -50,22 +96,12 @@ using CutlassB1XorGemm = cutlass::gemm::device::Gemm<
     cutlass::gemm::GemmShape<128, 128, 1024>,            // ThreadBlock
     cutlass::gemm::GemmShape<64, 64, 1024>,              // Warp
     cutlass::gemm::GemmShape<16, 8, 256>,                // Instruction
-    cutlass::epilogue::thread::LinearCombination<
-        int32_t,
-        128 / cutlass::sizeof_bits<int32_t>::value,      // = 4 ints / vector
-        int32_t, int32_t>,
+    KMinusTwoH<int32_t, 128 / cutlass::sizeof_bits<int32_t>::value,
+               int32_t, int32_t>,                        // Fused K-2H epilogue
     cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
     3,                                                   // Stages
     128, 128,                                            // AlignmentA, B (bits)
     false,                                               // SplitKSerial
     cutlass::arch::OpXorPopc>;
-
-// Tiny epilogue: C[i] = K - 2*C[i]  (turns Hamming distance into our bipolar
-// dot-product output). Memory bandwidth bound — single pass over M*N int32.
-__global__ inline void k_kminus2_inplace(int32_t* __restrict__ C,
-                                         int64_t n_elems, int32_t K) {
-    const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n_elems) C[i] = K - 2 * C[i];
-}
 
 }}}  // namespace cbrute::cuda::kernels

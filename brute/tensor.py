@@ -27,23 +27,24 @@ _ALL_FUNCS   = frozenset([torch.all, torch.Tensor.all])
 _ANY_FUNCS   = frozenset([torch.any, torch.Tensor.any])
 _EQUAL_FUNCS = frozenset([torch.equal])
 
-# Functional/method forms of binary bitwise & logical ops — `__and__`/etc. dunders
-# are dispatched directly to our `Tensor.__and__` override, but the functional
+# Functional/method forms of binary bitwise & logical ops — `__and__`/etc.
+# dunders dispatch to our `Tensor.__and__` overrides directly, but functional
 # forms (`torch.bitwise_and`, `torch.logical_and`, `tensor.bitwise_and(...)`)
-# come through `__torch_function__` and need their own packed fast path.
+# come through `__torch_function__`. We dispatch them to the torch native
+# bitwise op on the packed int64 buffer — already SIMD-vectorised everywhere.
 _BITWISE_BIN_FAST = {
-    torch.bitwise_and:        'bitwise_and',
-    torch.bitwise_or:         'bitwise_or',
-    torch.bitwise_xor:        'bitwise_xor',
-    torch.logical_and:        'bitwise_and',
-    torch.logical_or:         'bitwise_or',
-    torch.logical_xor:        'bitwise_xor',
-    torch.Tensor.bitwise_and: 'bitwise_and',
-    torch.Tensor.bitwise_or:  'bitwise_or',
-    torch.Tensor.bitwise_xor: 'bitwise_xor',
-    torch.Tensor.logical_and: 'bitwise_and',
-    torch.Tensor.logical_or:  'bitwise_or',
-    torch.Tensor.logical_xor: 'bitwise_xor',
+    torch.bitwise_and:        torch.bitwise_and,
+    torch.bitwise_or:         torch.bitwise_or,
+    torch.bitwise_xor:        torch.bitwise_xor,
+    torch.logical_and:        torch.bitwise_and,
+    torch.logical_or:         torch.bitwise_or,
+    torch.logical_xor:        torch.bitwise_xor,
+    torch.Tensor.bitwise_and: torch.bitwise_and,
+    torch.Tensor.bitwise_or:  torch.bitwise_or,
+    torch.Tensor.bitwise_xor: torch.bitwise_xor,
+    torch.Tensor.logical_and: torch.bitwise_and,
+    torch.Tensor.logical_or:  torch.bitwise_or,
+    torch.Tensor.logical_xor: torch.bitwise_xor,
 }
 _BITWISE_NOT_FAST = frozenset([
     torch.bitwise_not, torch.logical_not,
@@ -173,15 +174,14 @@ def _pack_bool(bool_t: torch.Tensor) -> torch.Tensor:
         bool_t = bool_t.bool()
     if bool_t.dim() == 0:
         bool_t = bool_t.unsqueeze(0)
-    return torch.ops.brute.pack_bool(bool_t.contiguous(), _PACK_WIDTH)
+    return torch.ops.brute.pack_bool(bool_t.contiguous())
 
 
 def _unpack_pm1(packed: torch.Tensor, logical_shape: list) -> torch.Tensor:
     """Unpack packed buffer → float32 (+1.0 = True, −1.0 = False)."""
     if len(logical_shape) == 0:
-        out = torch.ops.brute.unpack_bits(packed, [1], _PACK_WIDTH)
-        return out.squeeze(0)
-    return torch.ops.brute.unpack_bits(packed, logical_shape, _PACK_WIDTH)
+        return torch.ops.brute.unpack_bits(packed, [1]).squeeze(0)
+    return torch.ops.brute.unpack_bits(packed, logical_shape)
 
 def _rebuild_brute_tensor(plain_tensor: torch.Tensor, is_bit1: bool = False):
     """Reconstructs a brute.Tensor from a pickled base tensor."""
@@ -343,8 +343,7 @@ class Tensor(torch.Tensor):
             return
         with torch._C.DisableTorchFunctionSubclass():
             shape = list(self.shape)
-            unpacked = torch.ops.brute.unpack_bool(
-                packed, shape, _PACK_WIDTH)
+            unpacked = torch.ops.brute.unpack_bool(packed, shape)
             # `copy_` bumps the storage version; immediately re-pin `_packed_ver`
             # to the new version so the packed cache stays valid in the getter.
             self.as_subclass(torch.Tensor).copy_(unpacked)
@@ -569,7 +568,7 @@ class Tensor(torch.Tensor):
                 and self.shape == other.shape
                 and self.dim() >= 1):
             return Tensor._make_bit1_from_packed(
-                torch.ops.brute.bitwise_and(self._packed_buf, other._packed_buf),
+                torch.bitwise_and(self._packed_buf, other._packed_buf),
                 list(self.shape),
             )
         return super().__and__(other)
@@ -581,7 +580,7 @@ class Tensor(torch.Tensor):
                 and self.shape == other.shape
                 and self.dim() >= 1):
             return Tensor._make_bit1_from_packed(
-                torch.ops.brute.bitwise_or(self._packed_buf, other._packed_buf),
+                torch.bitwise_or(self._packed_buf, other._packed_buf),
                 list(self.shape),
             )
         return super().__or__(other)
@@ -593,7 +592,7 @@ class Tensor(torch.Tensor):
                 and self.shape == other.shape
                 and self.dim() >= 1):
             return Tensor._make_bit1_from_packed(
-                torch.ops.brute.bitwise_xor(self._packed_buf, other._packed_buf),
+                torch.bitwise_xor(self._packed_buf, other._packed_buf),
                 list(self.shape),
             )
         return super().__xor__(other)
@@ -601,9 +600,7 @@ class Tensor(torch.Tensor):
     def __invert__(self):
         if getattr(self, '_is_bit1', False) and self.dim() >= 1:
             new_packed = torch.ops.brute.bit1_not_packed(
-                self._packed_buf, int(self.shape[-1]),
-                _PACK_WIDTH,
-            )
+                self._packed_buf, int(self.shape[-1]))
             return Tensor._make_bit1_from_packed(
                 new_packed, list(self.shape),
             )
@@ -631,7 +628,7 @@ class Tensor(torch.Tensor):
                 and getattr(other, '_is_bit1', False)
                 and self.shape == other.shape
                 and self.dim() >= 1):
-            return self._iop_packed(other, torch.ops.brute.bitwise_and)
+            return self._iop_packed(other, torch.bitwise_and)
         return super().__iand__(other)
 
     def __ior__(self, other):
@@ -640,7 +637,7 @@ class Tensor(torch.Tensor):
                 and getattr(other, '_is_bit1', False)
                 and self.shape == other.shape
                 and self.dim() >= 1):
-            return self._iop_packed(other, torch.ops.brute.bitwise_or)
+            return self._iop_packed(other, torch.bitwise_or)
         return super().__ior__(other)
 
     def __ixor__(self, other):
@@ -649,7 +646,7 @@ class Tensor(torch.Tensor):
                 and getattr(other, '_is_bit1', False)
                 and self.shape == other.shape
                 and self.dim() >= 1):
-            return self._iop_packed(other, torch.ops.brute.bitwise_xor)
+            return self._iop_packed(other, torch.bitwise_xor)
         return super().__ixor__(other)
 
     # Indexing fast paths (leading-axis only) 
@@ -1251,8 +1248,7 @@ class Tensor(torch.Tensor):
                     and self._packed_buf.shape[-1] == other._packed_buf.shape[-1]):
                 return torch.ops.brute.xnor_popcount_matmul(
                     self._packed_buf, other._packed_buf,
-                    K, _PACK_WIDTH,
-                )
+                    K)
 
             # A (M×K) @ B.t() (K×N) — standard matmul shape.
             # B.t() carries _t_source = B (N×K), so we use B's packed buffer
@@ -1265,8 +1261,7 @@ class Tensor(torch.Tensor):
                     and self._packed_buf.shape[-1] == t_src._packed_buf.shape[-1]):
                 return torch.ops.brute.xnor_popcount_matmul(
                     self._packed_buf, t_src._packed_buf,
-                    K, _PACK_WIDTH,
-                )
+                    K)
 
         return super().__matmul__(other)
 
@@ -1358,8 +1353,7 @@ class Tensor(torch.Tensor):
                         and a._packed_buf.shape[-1] == b._packed_buf.shape[-1]):
                     return torch.ops.brute.xnor_popcount_matmul(
                         a._packed_buf, b._packed_buf,
-                        K, _PACK_WIDTH,
-                    )
+                        K)
                 # A (M×K) @ B.t() (K×N) via _t_source
                 b_src = b.__dict__.get('_t_source')
                 if (b_src is not None
@@ -1369,8 +1363,7 @@ class Tensor(torch.Tensor):
                         and a._packed_buf.shape[-1] == b_src._packed_buf.shape[-1]):
                     return torch.ops.brute.xnor_popcount_matmul(
                         a._packed_buf, b_src._packed_buf,
-                        K, _PACK_WIDTH,
-                    )
+                        K)
 
         # Fast path: full-tensor reductions on bit1 driven by packed_popcount.
         # Pad bits in the packed buffer are zero, so the total popcount equals
@@ -1450,16 +1443,16 @@ class Tensor(torch.Tensor):
                             left  = packed[:half]
                             right = packed[half:half + half]
                             if func in _ANY_FUNCS:
-                                merged = torch.ops.brute.bitwise_or(left, right)
+                                merged = torch.bitwise_or(left, right)
                             else:
-                                merged = torch.ops.brute.bitwise_and(left, right)
+                                merged = torch.bitwise_and(left, right)
                             if m & 1:
                                 tail = packed[m - 1:m]
                                 if func in _ANY_FUNCS:
-                                    merged[0:1] = torch.ops.brute.bitwise_or(
+                                    merged[0:1] = torch.bitwise_or(
                                         merged[0:1], tail)
                                 else:
-                                    merged[0:1] = torch.ops.brute.bitwise_and(
+                                    merged[0:1] = torch.bitwise_and(
                                         merged[0:1], tail)
                             packed = merged
                         result_packed = packed[0]
@@ -1496,13 +1489,13 @@ class Tensor(torch.Tensor):
                     return torch.equal(a._packed_buf, b._packed_buf)
 
             # torch.bitwise_*(a, b) / torch.logical_*(a, b) and the equivalent
-            # Tensor methods. Identical shape → operate on packed.
+            # Tensor methods. Identical shape → operate on packed via torch
+            # native int64 bitwise (already SIMD-vectorised on every backend).
             if func in _BITWISE_BIN_FAST and len(bit1_ins) >= 2:
                 a, b = bit1_ins[0], bit1_ins[1]
                 if (a.shape == b.shape
                         and a.dim() >= 1):
-                    op_name = _BITWISE_BIN_FAST[func]
-                    op_fn = getattr(torch.ops.brute, op_name)
+                    op_fn = _BITWISE_BIN_FAST[func]
                     return Tensor._make_bit1_from_packed(
                         op_fn(a._packed_buf, b._packed_buf),
                         list(a.shape),
@@ -1516,9 +1509,7 @@ class Tensor(torch.Tensor):
                 a = bit1_ins[0]
                 return Tensor._make_bit1_from_packed(
                     torch.ops.brute.bit1_not_packed(
-                        a._packed_buf, int(a.shape[-1]),
-                        _PACK_WIDTH,
-                    ),
+                        a._packed_buf, int(a.shape[-1])),
                     list(a.shape),
                 )
 
@@ -1528,10 +1519,9 @@ class Tensor(torch.Tensor):
                     and len(bit1_ins) >= 2:
                 a, b = bit1_ins[0], bit1_ins[1]
                 if (a.shape == b.shape and a.dim() >= 1):
-                    xored = torch.ops.brute.bitwise_xor(a._packed_buf, b._packed_buf)
+                    xored = torch.bitwise_xor(a._packed_buf, b._packed_buf)
                     inverted = torch.ops.brute.bit1_not_packed(
-                        xored, int(a.shape[-1]), _PACK_WIDTH,
-                    )
+                        xored, int(a.shape[-1]))
                     return Tensor._make_bit1_from_packed(
                         inverted, list(a.shape),
                     )
@@ -1542,7 +1532,7 @@ class Tensor(torch.Tensor):
                 a, b = bit1_ins[0], bit1_ins[1]
                 if (a.shape == b.shape and a.dim() >= 1):
                     return Tensor._make_bit1_from_packed(
-                        torch.ops.brute.bitwise_xor(a._packed_buf, b._packed_buf),
+                        torch.bitwise_xor(a._packed_buf, b._packed_buf),
                         list(a.shape),
                     )
 
@@ -1883,12 +1873,11 @@ class Tensor(torch.Tensor):
                     pa = a._packed_buf_contig()
                     pb_ = b._packed_buf_contig()
                     # (a & cond) | (b & ~cond)
-                    pa_masked = torch.ops.brute.bitwise_and(pa, pc)
+                    pa_masked = torch.bitwise_and(pa, pc)
                     not_cond  = torch.ops.brute.bit1_not_packed(
-                        pc, int(cond.shape[-1]), _PACK_WIDTH,
-                    )
-                    pb_masked = torch.ops.brute.bitwise_and(pb_, not_cond)
-                    out_packed = torch.ops.brute.bitwise_or(pa_masked, pb_masked)
+                        pc, int(cond.shape[-1]))
+                    pb_masked = torch.bitwise_and(pb_, not_cond)
+                    out_packed = torch.bitwise_or(pa_masked, pb_masked)
                     return Tensor._make_bit1_from_packed(
                         out_packed, list(a.shape),
                     )

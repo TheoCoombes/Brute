@@ -38,27 +38,17 @@ def ref_xnor_popcount_matmul(
     A_packed: torch.Tensor,
     B_packed: torch.Tensor,
     K: int,
-    pack_width: int,
 ) -> torch.Tensor:
-    """Reference: 2 * popcount(XNOR(A_row, B_row)) - K.
+    """Reference: K_logical − 2·popcount(A_row XOR B_row).
 
-    Both A and B are (rows, Kp) packed.
+    Both A and B are (rows, Kp) int64-packed (pack_width = 64).
     """
     assert A_packed.dim() == 2 and B_packed.dim() == 2
     Kp = A_packed.size(1)
     assert Kp == B_packed.size(1)
     M = A_packed.size(0)
     N = B_packed.size(0)
-    if pack_width == 8:
-        mask = 0xFF
-    elif pack_width == 32:
-        mask = 0xFFFFFFFF
-    elif pack_width == 64:
-        mask = 0xFFFFFFFFFFFFFFFF
-    else:
-        raise ValueError(pack_width)
-    K_eff = 2 * Kp * pack_width - K
-
+    mask = 0xFFFFFFFFFFFFFFFF
     A = A_packed.cpu().tolist()
     B = B_packed.cpu().tolist()
     out = torch.zeros((M, N), dtype=torch.int32)
@@ -66,11 +56,9 @@ def ref_xnor_popcount_matmul(
         for n in range(N):
             acc = 0
             for k in range(Kp):
-                a = int(A[m][k]) & mask
-                b = int(B[n][k]) & mask
-                xnor = (~(a ^ b)) & mask
-                acc += bin(xnor).count("1")
-            out[m, n] = 2 * acc - K_eff
+                xor = (int(A[m][k]) ^ int(B[n][k])) & mask
+                acc += bin(xor).count("1")
+            out[m, n] = K - 2 * acc
     return out
 
 

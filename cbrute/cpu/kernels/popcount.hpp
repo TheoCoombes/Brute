@@ -324,25 +324,5 @@ HWY_ATTR void PopcountPerWord(const T* HWY_RESTRICT in, int32_t* HWY_RESTRICT ou
     }
 }
 
-//  Hamming weight check: returns true iff buffer has any set bit
-HWY_ATTR inline bool AnyBitsSetBytes(const void* HWY_RESTRICT bytes, size_t n_bytes) {
-    if (n_bytes == 0) return false;
-    const hn::ScalableTag<uint64_t> d;
-    const size_t LANES = hn::Lanes(d);
-    const uint64_t* in = reinterpret_cast<const uint64_t*>(bytes);
-    const size_t n_words = n_bytes / sizeof(uint64_t);
-    size_t i = 0;
-    auto acc = hn::Zero(d);
-    for (; i + LANES <= n_words; i += LANES) {
-        acc = hn::Or(acc, hn::LoadU(d, in + i));
-    }
-    if (!hn::AllTrue(d, hn::Eq(acc, hn::Zero(d)))) return true;
-    for (; i < n_words; ++i) if (in[i]) return true;
-    const size_t tail = n_bytes - n_words * sizeof(uint64_t);
-    const uint8_t* tail_p = reinterpret_cast<const uint8_t*>(bytes) + n_words * sizeof(uint64_t);
-    for (size_t b = 0; b < tail; ++b) if (tail_p[b]) return true;
-    return false;
-}
-
 }}}  // namespace cbrute::cpu::HWY_NAMESPACE
 HWY_AFTER_NAMESPACE();

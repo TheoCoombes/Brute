@@ -115,8 +115,7 @@ class BruteLinear(nn.Module):
             packed_in = _pack_bool(bool_in.reshape(-1, self.in_features).contiguous())
 
         out = torch.ops.brute.xnor_popcount_matmul(
-            packed_in, self.weight_packed, self.in_features, _PACK_WIDTH,
-        )
+            packed_in, self.weight_packed, self.in_features)
         if self.bias is not None:
             out = out + self.bias
         return out.reshape(*leading, self.out_features)

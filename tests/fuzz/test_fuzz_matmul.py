@@ -25,7 +25,7 @@ def test_fuzz_xnor_matmul(M, K, N):
     a_bit = bit1(a_bool)
     b_bit = bit1(b_bool_T)
     out = torch.ops.brute.xnor_popcount_matmul(
-        a_bit._packed_buf, b_bit._packed_buf, K, 64
+        a_bit._packed_buf, b_bit._packed_buf, K
     ).to(torch.float32)
 
     ref = ref_matmul_pm1(a_bool, b_bool_T.t())

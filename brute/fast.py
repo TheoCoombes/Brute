@@ -25,7 +25,6 @@ from __future__ import annotations
 from typing import Any
 import torch
 
-from brute.dtype import _PACK_WIDTH
 from brute.tensor import Tensor
 
 
@@ -38,21 +37,21 @@ def _is_bit1(x) -> bool:
 def bitwise_xor(a: Tensor, b: Tensor) -> Tensor:
     """``a ^ b`` on two same-shape bit1 tensors. Returns lazy bit1."""
     return Tensor._make_bit1_from_packed(
-        torch.ops.brute.bitwise_xor(a._packed_buf, b._packed_buf),
+        torch.bitwise_xor(a._packed_buf, b._packed_buf),
         list(a.shape),
     )
 
 
 def bitwise_and(a: Tensor, b: Tensor) -> Tensor:
     return Tensor._make_bit1_from_packed(
-        torch.ops.brute.bitwise_and(a._packed_buf, b._packed_buf),
+        torch.bitwise_and(a._packed_buf, b._packed_buf),
         list(a.shape),
     )
 
 
 def bitwise_or(a: Tensor, b: Tensor) -> Tensor:
     return Tensor._make_bit1_from_packed(
-        torch.ops.brute.bitwise_or(a._packed_buf, b._packed_buf),
+        torch.bitwise_or(a._packed_buf, b._packed_buf),
         list(a.shape),
     )
 
@@ -61,8 +60,7 @@ def bitwise_not(a: Tensor) -> Tensor:
     """Pad-safe ``~a`` — the trailing word's pad bits stay 0."""
     return Tensor._make_bit1_from_packed(
         torch.ops.brute.bit1_not_packed(
-            a._packed_buf, int(a.shape[-1]), _PACK_WIDTH,
-        ),
+            a._packed_buf, int(a.shape[-1])),
         list(a.shape),
     )
 
@@ -71,17 +69,16 @@ def bitwise_not(a: Tensor) -> Tensor:
 
 def eq(a: Tensor, b: Tensor) -> Tensor:
     """``a == b`` — pad-safe XNOR."""
-    xored = torch.ops.brute.bitwise_xor(a._packed_buf, b._packed_buf)
+    xored = torch.bitwise_xor(a._packed_buf, b._packed_buf)
     inverted = torch.ops.brute.bit1_not_packed(
-        xored, int(a.shape[-1]), _PACK_WIDTH,
-    )
+        xored, int(a.shape[-1]))
     return Tensor._make_bit1_from_packed(inverted, list(a.shape))
 
 
 def ne(a: Tensor, b: Tensor) -> Tensor:
     """``a != b`` — pure XOR."""
     return Tensor._make_bit1_from_packed(
-        torch.ops.brute.bitwise_xor(a._packed_buf, b._packed_buf),
+        torch.bitwise_xor(a._packed_buf, b._packed_buf),
         list(a.shape),
     )
 
@@ -111,33 +108,31 @@ def matmul(a: Tensor, b_t: Tensor) -> torch.Tensor:
     """
     K = int(a.shape[-1])
     return torch.ops.brute.xnor_popcount_matmul(
-        a._packed_buf, b_t._packed_buf, K, _PACK_WIDTH,
-    )
+        a._packed_buf, b_t._packed_buf, K)
 
 
 # ── Packed-buffer arithmetic for the truly performance-paranoid ─────────
 
 def xor_packed(a_buf: torch.Tensor, b_buf: torch.Tensor) -> torch.Tensor:
     """Raw packed XOR — operates on `_packed_buf` directly. No bit1 wrapping."""
-    return torch.ops.brute.bitwise_xor(a_buf, b_buf)
+    return torch.bitwise_xor(a_buf, b_buf)
 
 
 def and_packed(a_buf: torch.Tensor, b_buf: torch.Tensor) -> torch.Tensor:
-    return torch.ops.brute.bitwise_and(a_buf, b_buf)
+    return torch.bitwise_and(a_buf, b_buf)
 
 
 def or_packed(a_buf: torch.Tensor, b_buf: torch.Tensor) -> torch.Tensor:
-    return torch.ops.brute.bitwise_or(a_buf, b_buf)
+    return torch.bitwise_or(a_buf, b_buf)
 
 
-def matmul_packed(a_buf: torch.Tensor, b_buf: torch.Tensor,
-                   K: int, pack_width: int) -> torch.Tensor:
+def matmul_packed(a_buf: torch.Tensor, b_buf: torch.Tensor, K: int) -> torch.Tensor:
     """Raw packed matmul — operates on `_packed_buf` directly.
 
     Use this in CUDA Graph captures where you've extracted the packed buffers
     once and want to launch the kernel with absolute minimum Python overhead.
     """
-    return torch.ops.brute.xnor_popcount_matmul(a_buf, b_buf, K, pack_width)
+    return torch.ops.brute.xnor_popcount_matmul(a_buf, b_buf, K)
 
 
 __all__ = [
