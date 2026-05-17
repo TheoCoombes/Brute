@@ -1,13 +1,12 @@
 # Brute
 
-A PyTorch extension implementing native 1-bit tensors for extremely fast binary neural networks.
+Native 1-bit tensors for extremely fast binary neural networks in PyTorch.
 
 ### Features
 
 - Extremely optimised 1-bit tensor CPU / CUDA / Apple Silicon kernels, written in C++.
-- Complete PyTorch backwards compatibility, keeping all existing torch data types and device support.
-- Native binary Linear module implementation.
-- Extremely comprehensive test & benchmark suite, ensuring `brute.bit1` has a 1:1 compatibility with `torch.bool`.
+- Backwards compatible with PyTorch, keeping all existing torch data types and device support.
+- Extremely comprehensive test suite, ensuring `brute.bit1` and `torch.bool` have the same behaviour.
 
 ## Installation
 
@@ -26,10 +25,10 @@ pip install --no-build-isolation -ve .
 ## Tests
 
 A single op catalog (`tests/ops_catalog.py`) drives three parity test
-files and the benchmark suite. Adding a new op means adding one `OpSpec`.
+files and the benchmark suite.
 
 ```bash
-# Unit parity (fast, every op × device × pack-dtype)
+# Unit parity (fast, every op × device)
 pytest tests/unit/test_parity_catalog.py
 
 # Edge cases (empty / 0-dim / non-contig / broadcast / tail-misalign)

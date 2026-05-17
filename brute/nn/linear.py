@@ -19,8 +19,8 @@ from typing import Optional
 import torch
 from torch import nn
 
-from brute.dtype import _PACK_WIDTH, _PACK_STORAGE_DTYPE
 from brute.tensor import Tensor, _pack_bool
+from brute.dtype import _PACK_WIDTH
 
 
 class BruteLinear(nn.Module):
