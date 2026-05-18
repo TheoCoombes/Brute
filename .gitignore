@@ -9,3 +9,5 @@ build/
 .benchmarks/
 .hypothesis/
 .DS_Store
+**/.cache/
+**/.runs/

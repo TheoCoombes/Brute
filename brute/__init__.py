@@ -32,6 +32,7 @@ from brute.functional import (
 from brute.fast import *
 
 from brute import nn
+from brute import optim
 from brute import cuda_graphs
 from brute import streams
 from brute import fast
@@ -39,9 +40,9 @@ from brute import fast
 parallel_streams = streams.parallel_streams
 
 # Re-export torch submodules not covered by `from torch import *`.
-# These are accessible as brute.optim, brute.linalg, brute.cuda, etc.
+# These are accessible as brute.linalg, brute.cuda, etc. brute.optim was
+# imported above; we don't shadow it here.
 from torch import (  # noqa: F401, E402
-    optim,
     linalg,
     fft,
     special,

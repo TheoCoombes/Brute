@@ -1,47 +1,47 @@
-"""Neural-network building blocks for bit1 weights.
+"""Binary linear layers.
 
-`BruteLinear` is the killer use case: a fully-binary linear layer where the
-weight is packed once at module-construction time and the matmul calls
-`torch.ops.brute.xnor_popcount_matmul` directly. This skips:
+``BruteLinear`` — the low-level binary matmul wrapper. Returns the int32
+bipolar dot-product (``K − 2·Hamming``) for downstream non-linearities.
+Weight is a ``brute.Tensor`` of dtype ``brute.bit1`` stored under
+``self.weight``.
 
-  * Per-call `_pack_bool` of a fresh weight tensor.
-  * The `__torch_function__` matmul-detection branch.
-  * Any conversion between bit1 and bool when the weight is stored bit1.
-
-Inputs may be plain bool/uint8/float tensors; they're packed transparently on
-the forward call. For inference loops where the input is also a bit1 result,
-no Python-level packing happens.
+``BinaryLinear`` — convenience wrapper that fuses ``BruteLinear`` with a
+``BitBalancedNorm`` for the canonical "binary linear → bit-balanced sign"
+sub-block used in the BGPT-1 FFN and QKV/output projections.
 """
 
 from __future__ import annotations
 
-from typing import Optional
-import torch
-from torch import nn
+from typing import Optional, Tuple
 
-from brute.tensor import Tensor, _pack_bool
-from brute.dtype import _PACK_WIDTH
+import brute
+from brute import nn
+from brute.tensor import Tensor
+from brute.nn.binary_norm import BitBalancedNorm
 
 
 class BruteLinear(nn.Module):
-    """Binary linear layer: y = K - 2 * popc_xor(x_packed, w_packed).
+    """Binary linear layer: ``y = x @ W`` with bit1 weight stored as ``(N, K)``.
 
-    Matches the semantic of a (-1/+1) bipolar dot-product (the same as a
-    BitNet/XNOR-Net inference layer). Bias is optional and applied as a
-    plain int32 add.
+    Both ``x`` and ``W`` are bit1; the kernel computes
+    ``popcount(XNOR(x, W)) − K/2 = (1/2)·(K − 2·Hamming)``. We return the raw
+    ``K − 2·Hamming`` int32 — i.e. twice the spec's pre-activation. Halving
+    that just shifts the gate threshold by a constant, so we keep the kernel
+    output directly.
 
     Args:
-      in_features: Input bit count K.
-      out_features: Output feature count N.
-      bias: Whether to add a learned int32 bias to the output.
+      in_features: K (input bit width).
+      out_features: N (output unit count).
+      bias: If True, add a learned int32 bias.
       device: Device for the weight buffer.
 
-    The weight is stored as a packed `(N, ceil(K/64))` int64 buffer so the
-    matmul kernel can be invoked directly. Use `set_weight_from_bool(...)` to
-    initialise from a bool / uint8 / +-1 float tensor.
+    Storage: ``self.weight`` is a ``brute.Tensor`` of dtype ``brute.bit1``
+    and shape ``(N, K)``. The bit1 matmul convention does
+    ``x @ W = x_(M×K) @ W_(N×K)`` mapping to a ``(M, N)`` int32 output (rows
+    of ``W`` are output features), so no transpose is needed.
     """
 
-    in_features:  int
+    in_features: int
     out_features: int
 
     def __init__(
@@ -49,76 +49,52 @@ class BruteLinear(nn.Module):
         in_features: int,
         out_features: int,
         bias: bool = False,
-        device: Optional[torch.device] = None,
+        device=None,
     ):
         super().__init__()
         self.in_features  = int(in_features)
         self.out_features = int(out_features)
-        self._k_words    = (self.in_features + _PACK_WIDTH - 1) // _PACK_WIDTH
-
-        init_bool = torch.empty(
-            (self.out_features, self.in_features), dtype=torch.bool, device=device,
-        ).bernoulli_(0.5)
-        packed = _pack_bool(init_bool)
-        # Register as a buffer so .to(device) / state_dict serialisation works.
-        self.register_buffer('weight_packed', packed)
+        weight = brute.randint(
+            0, 2, (self.out_features, self.in_features),
+            dtype=brute.bit1, device=device,
+        )
+        self.register_buffer("weight", weight)
         if bias:
-            self.bias = nn.Parameter(torch.zeros(out_features,
-                                                 dtype=torch.int32, device=device))
-        else:
-            self.register_parameter('bias', None)
-
-    def set_weight_from_bool(self, bool_w: torch.Tensor) -> None:
-        """Replace `weight_packed` from a bool tensor of shape (N, K)."""
-        if bool_w.shape != (self.out_features, self.in_features):
-            raise ValueError(
-                f"weight shape mismatch: got {tuple(bool_w.shape)}, "
-                f"expected {(self.out_features, self.in_features)}"
+            # int32 buffer (not nn.Parameter — gradient-less training).
+            self.register_buffer(
+                "bias",
+                brute.zeros(out_features, dtype=brute.int32, device=device),
             )
-        if bool_w.dtype != torch.bool:
-            bool_w = bool_w.bool()
-        self.weight_packed = _pack_bool(bool_w.contiguous()).to(self.weight_packed.device)
-
-    def set_weight_from_pm1(self, pm1_w: torch.Tensor) -> None:
-        """Replace `weight_packed` from a +1/-1 float tensor of shape (N, K)."""
-        self.set_weight_from_bool(pm1_w > 0)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward: returns a plain int32 tensor of shape (..., out_features).
-
-        Input x:
-          * brute.Tensor (bit1) with shape (..., K) — used directly.
-          * torch.bool / torch.uint8 / float (treated as +/- via >0)
-            with shape (..., K) — packed transparently.
-
-        The output is int32 (the dot-product C = K - 2*H), suitable as input
-        to a non-linearity (sign, tanh, popcount-cmp). It is *not* re-packed
-        to bit1 — callers that want a binary activation should do
-        `(out > 0).to(brute.bit1)` themselves.
-        """
-        if isinstance(x, Tensor) and getattr(x, '_is_bit1', False):
-            leading = list(x.shape[:-1])
-            packed_in = x._packed_buf.reshape(-1, self._k_words).contiguous()
         else:
-            xt = x if isinstance(x, torch.Tensor) else torch.as_tensor(x)
-            if xt.shape[-1] != self.in_features:
-                raise ValueError(
-                    f"input last dim {xt.shape[-1]} != in_features {self.in_features}"
-                )
-            leading = list(xt.shape[:-1])
-            if xt.dtype == torch.bool:
-                bool_in = xt
-            elif xt.is_floating_point():
-                bool_in = xt > 0
-            else:
-                bool_in = xt != 0
-            packed_in = _pack_bool(bool_in.reshape(-1, self.in_features).contiguous())
+            self.register_buffer("bias", None)
 
-        out = torch.ops.brute.xnor_popcount_matmul(
-            packed_in, self.weight_packed, self.in_features)
+    def forward(self, x: Tensor) -> Tensor:
+        """Compute ``y = x @ W``.
+
+        Args:
+          x: bit1 brute.Tensor of shape ``(..., K)`` (or any tensor whose
+            last dim is K; non-bit1 inputs are converted via ``> 0``).
+
+        Returns:
+          int32 brute.Tensor of shape ``(..., N)`` carrying ``K − 2H``.
+          Caller decides how to binarize (e.g. via ``BitBalancedNorm``).
+        """
+        if not isinstance(x, Tensor) or not getattr(x, "_is_bit1", False):
+            # Coerce non-bit1 input to bit1 (last dim must be K).
+            if x.shape[-1] != self.in_features:
+                raise ValueError(
+                    f"input last dim {x.shape[-1]} != in_features {self.in_features}"
+                )
+            x = brute.as_tensor(x, dtype=brute.bit1, device=self.weight.device)
+
+        leading = list(x.shape[:-1])
+        x_flat = x.reshape(-1, self.in_features)
+        # The bit1 @ bit1 fast path dispatches xnor_popcount_matmul: rows of
+        # W are output features, so `x @ W` gives the (M, N) bipolar score.
+        out_flat = x_flat @ self.weight
         if self.bias is not None:
-            out = out + self.bias
-        return out.reshape(*leading, self.out_features)
+            out_flat = out_flat + self.bias
+        return out_flat.reshape(*leading, self.out_features)
 
     def extra_repr(self) -> str:
         return (f"in_features={self.in_features}, "
@@ -126,4 +102,68 @@ class BruteLinear(nn.Module):
                 f"bias={self.bias is not None}")
 
 
-__all__ = ["BruteLinear"]
+class BinaryLinear(nn.Module):
+    """Binary linear followed by bit-balanced sign.
+
+    The canonical BGPT-1 sub-block: ``y = sign(x @ W − median(x @ W))`` with
+    an optional 1-bit gate flag indicating which output neurons sit near the
+    decision boundary (needed by the BGPT-1 backward pass).
+
+    Args:
+      in_features: K.
+      out_features: N.
+      nu: Gate threshold as fraction of N. Set to 0 to disable gate output
+        and the per-neuron magnitude comparator at inference.
+      device: Device for the weight buffer.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        nu: float = 0.05,
+        device=None,
+    ):
+        super().__init__()
+        self.linear = BruteLinear(in_features, out_features, bias=False, device=device)
+        self.norm = BitBalancedNorm(nu=nu, dim=-1)
+
+    @property
+    def in_features(self) -> int:
+        return self.linear.in_features
+
+    @property
+    def out_features(self) -> int:
+        return self.linear.out_features
+
+    @property
+    def weight(self) -> Tensor:
+        return self.linear.weight
+
+    def forward(
+        self,
+        x: Tensor,
+        return_gate: bool = False,
+        return_pre: bool = False,
+    ) -> Tuple[Tensor, Optional[Tensor], Optional[Tensor]]:
+        """Compute ``(out, gate, pre)``.
+
+        Args:
+          x: bit1 brute.Tensor input, shape ``(..., K)``.
+          return_gate: If True, also return per-element gate flags (bit1).
+          return_pre: If True, also return the integer pre-activation
+            tensor. Useful for diagnostics (``pre_median``, ``pre_variance``)
+            and for the backward pass (gate recomputation).
+
+        Returns:
+          out: bit1 brute.Tensor of shape ``(..., N)``.
+          gate: bit1 brute.Tensor or ``None``.
+          pre: int32 torch.Tensor (or None).
+        """
+        pre = self.linear(x)
+        out, gate = self.norm(pre, return_gate=return_gate)
+        pre_out = pre if return_pre else None
+        return out, gate, pre_out
+
+
+__all__ = ["BruteLinear", "BinaryLinear"]
