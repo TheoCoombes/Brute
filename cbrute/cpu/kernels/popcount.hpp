@@ -306,14 +306,17 @@ HWY_ATTR void PopcountPerWord(const T* HWY_RESTRICT in, int32_t* HWY_RESTRICT ou
     if constexpr (std::is_same_v<T, bool>) {
         for (size_t i = 0; i < n; ++i) out[i] = in[i] ? 1 : 0;
     } else {
-        const hn::ScalableTag<T> d_in;
+        // Highway PopulationCount requires unsigned lane types. Reinterpret
+        // signed types (int8, int16, int32, int64) to their unsigned equivalents;
+        // the bit pattern is identical and popcount is sign-agnostic.
+        using U = hwy::MakeUnsigned<T>;
+        const hn::ScalableTag<U> d_in;
         const size_t LANES_IN = hn::Lanes(d_in);
+        const U* in_u = reinterpret_cast<const U*>(in);
         size_t i = 0;
         for (; i + LANES_IN <= n; i += LANES_IN) {
-            auto v = hn::LoadU(d_in, in + i);
+            auto v = hn::LoadU(d_in, in_u + i);
             auto p = hn::PopulationCount(v);
-            // Lanewise extract → int32. Compiler folds into direct register
-            // reads on NEON/AVX2 for small lane counts.
             for (size_t j = 0; j < LANES_IN; ++j) {
                 out[i + j] = (int32_t)hn::ExtractLane(p, j);
             }

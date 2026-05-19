@@ -55,10 +55,6 @@ def inference_bytes(model, lm_head=None) -> Dict[str, int]:
     """
     counts: Dict[str, int] = {}
     for name, buf in model.named_buffers():
-        # The LM-head bias accumulator is training-only; everything else
-        # (incl. bias, weights, tau, alibi, causal mask) is inference.
-        if name.endswith("bias_accumulator"):
-            continue
         counts[name] = buf.nbytes if not getattr(buf, "_is_bit1", False) else (
             buf._packed_buf.nbytes if buf._packed_buf is not None else 0
         )
@@ -103,11 +99,14 @@ def training_extra_bytes(
         counts["tape.logits"] = _bytes(tape.get("logits"))
     if trainer is not None:
         cstate = 0
+        acc_state = 0
         for ls in trainer.layers.values():
             cstate += _bytes(ls.confidence)
-        counts["flip_rule_state"] = cstate
-    if model is not None and hasattr(model, "lm_head"):
-        counts["lm_head_bias_accumulator"] = _bytes(model.lm_head.bias_accumulator)
+            acc_state += _bytes(ls.accumulator)
+        counts["flip_rule_confidence"] = cstate
+        counts["flip_rule_accumulator"] = acc_state
+    # LM-head bias accumulator removed in v2; the lm_head no longer holds
+    # a non-binary buffer, so nothing to account for here.
     if err_signed is not None:
         counts["err_signed"] = _bytes(err_signed)
     return counts

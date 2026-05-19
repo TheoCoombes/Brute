@@ -59,10 +59,12 @@ class BGPT1Config:
     hidden_mult:  int   = 4
     nu:           float = 0.05            # gate threshold (fraction of d)
     p_drop_max:   float = 0.1             # max LayerDrop probability
-    bias_clip:    int   = 127
-    bias_accum:   int   = 32
     err_clip:     int   = 7               # 4-bit signed
     err_k:        int   = 8               # top-k distractors in err signal
+    # Legacy fields retained for back-compat with older configs / training
+    # scripts. The INT8 LM-head bias has been removed; these are ignored.
+    bias_clip:    int   = 0
+    bias_accum:   int   = 0
 
 
 class BGPT1(bn.Module):
@@ -100,12 +102,7 @@ class BGPT1(bn.Module):
                 device=device,
             )
             self.blocks.append(blk)
-        self.lm_head = bn.BinaryLMHead(
-            self.embedding,
-            bias_init=0,
-            bias_clip=config.bias_clip,
-            device=device,
-        )
+        self.lm_head = bn.BinaryLMHead(self.embedding, device=device)
 
     @property
     def vocab_size(self) -> int:
@@ -256,14 +253,8 @@ class BGPT1(bn.Module):
         del logits
         tape["logits"] = None
 
-        # LM-head bias update.
-        n_bias_updates = lm_head_bias_step(
-            self.lm_head.bias,
-            self.lm_head.bias_accumulator,
-            err_signed,
-            accum_threshold=cfg.bias_accum,
-            bias_clip=cfg.bias_clip,
-        )
+        # LM-head bias removed in v2 (purely binary LM head).
+        n_bias_updates = 0
 
         # Vote + flip on the embedding (= LM-head weight): x is the final
         # block output reshaped to (M, dim). err is signed int8.

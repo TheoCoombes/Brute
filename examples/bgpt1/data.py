@@ -54,6 +54,7 @@ def load_corpus_text(path: Path = _TINY_SHAKESPEARE_PATH) -> str:
 def load_wikitext(
     name: str = "wikitext-2-raw-v1",
     split: str = "train",
+    english_only: bool = False,
 ) -> str:
     """Load a WikiText split via HuggingFace ``datasets`` and concatenate
     all rows into a single string. Cached at first call.
@@ -61,20 +62,35 @@ def load_wikitext(
     ``name`` is one of:
       ``wikitext-2-raw-v1`` (~10 MB, ~2 M tokens after GPT-2 BPE)
       ``wikitext-103-raw-v1`` (~500 MB, ~100 M tokens)
+
+    ``english_only``: if True, drop rows that contain non-ASCII characters
+    (headlines in Japanese/Chinese/Arabic etc.) so the model trains on
+    clean English text only.
     """
     from datasets import load_dataset
-    cache_path = _CACHE_DIR / f"{name}.{split}.txt"
+    suffix = ".en" if english_only else ""
+    cache_path = _CACHE_DIR / f"{name}.{split}{suffix}.txt"
     if cache_path.exists():
         with open(cache_path, "r", encoding="utf-8") as f:
             return f.read()
     print(f"  loading wikitext '{name}' [{split}] via HuggingFace datasets …")
     ds = load_dataset("wikitext", name, split=split)
-    # Join all non-empty rows. WikiText is pre-tokenized at the article
-    # level — each row is a paragraph or section header.
-    text = "\n".join(row["text"] for row in ds if row["text"].strip())
+    rows = []
+    for row in ds:
+        t = row["text"]
+        if not t.strip():
+            continue
+        if english_only:
+            try:
+                t.encode("ascii")
+            except UnicodeEncodeError:
+                continue
+        rows.append(t)
+    text = "\n".join(rows)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     with open(cache_path, "w", encoding="utf-8") as f:
         f.write(text)
+    print(f"  kept {len(rows):,} rows, {len(text):,} chars")
     return text
 
 
