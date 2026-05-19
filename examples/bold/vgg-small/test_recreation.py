@@ -22,10 +22,9 @@ import sys
 import torch
 import torch.nn.functional as F
 
-import brute.nn as bnn
-import brute.optim as bopt
-from brute.nn.bit_linear import _BitLinearFunction
-from brute.nn.bit_conv import _BitConv2dFunction
+from bit_linear import BitLinear, _BitLinearFunction
+from bit_conv import BitConv2d, _BitConv2dFunction
+from boolean_optimizer import BooleanOptimizer, split_parameters
 
 from vgg_small import VGGSmall, count_parameters
 
@@ -54,7 +53,7 @@ def test_bitlinear_forward() -> None:
         + b - n / 2
     )
 
-    layer = bnn.BitLinear(n, m, bias=True, center=True)
+    layer = BitLinear(n, m, bias=True, center=True)
     with torch.no_grad():
         layer.weight.copy_(W)
         layer.bias.copy_(b)
@@ -109,7 +108,7 @@ def test_bitconv2d_forward() -> None:
     X = torch.randint(0, 2, (B, Cin, H, Wd)).float()
     W = torch.randint(0, 2, (Cout, Cin, K, K)).float()
 
-    layer = bnn.BitConv2d(Cin, Cout, K, padding=0, bias=False, center=True)
+    layer = BitConv2d(Cin, Cout, K, padding=0, bias=False, center=True)
     with torch.no_grad():
         layer.weight.copy_(W)
     S = layer(X)
@@ -152,7 +151,7 @@ def test_boolean_optimizer_step() -> None:
     W0 = torch.randint(0, 2, (m_, n_)).float()
 
     W_ours = torch.nn.Parameter(W0.clone())
-    opt = bopt.BooleanOptimizer([W_ours], lr=0.5)
+    opt = BooleanOptimizer([W_ours], lr=0.5)
     W_ours.grad = torch.randn(m_, n_)
     opt.step()
 
@@ -173,8 +172,8 @@ def test_end_to_end_step() -> None:
     device = torch.device("cpu")
     for use_bn in (True, False):
         model = VGGSmall(use_bn=use_bn).to(device)
-        bool_params, real_params = bopt.split_parameters(model)
-        bool_opt = bopt.BooleanOptimizer(bool_params, lr=12.0)
+        bool_params, real_params = split_parameters(model)
+        bool_opt = BooleanOptimizer(bool_params, lr=12.0)
         real_opt = torch.optim.Adam(real_params, lr=1e-3)
 
         x = torch.randn(4, 3, 32, 32, device=device)

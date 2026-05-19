@@ -50,7 +50,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 
-import brute.optim as bopt
+from boolean_optimizer import BooleanOptimizer, split_parameters
 from vgg_small import VGGSmall, count_parameters
 
 
@@ -139,7 +139,7 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> tupl
 def train_one_epoch(
     model: nn.Module,
     loader: DataLoader,
-    bool_opt: bopt.BooleanOptimizer,
+    bool_opt: BooleanOptimizer,
     real_opt: torch.optim.Optimizer,
     device: torch.device,
     epoch: int,
@@ -241,8 +241,8 @@ def main():
     print(f"params: {n_b:,} boolean + {n_r:,} real = {n_b + n_r:,} total")
 
     # Split parameters into boolean (tagged by BitLinear/BitConv2d) and real.
-    bool_params, real_params = bopt.split_parameters(model)
-    bool_opt = bopt.BooleanOptimizer(bool_params, lr=args.lr_bool)
+    bool_params, real_params = split_parameters(model)
+    bool_opt = BooleanOptimizer(bool_params, lr=args.lr_bool)
     real_opt = torch.optim.Adam(real_params, lr=args.lr_real)
 
     bool_sched = torch.optim.lr_scheduler.CosineAnnealingLR(bool_opt, T_max=args.epochs)

@@ -11,8 +11,8 @@ Van Minh Nguyen, Cristian Ocampo, Aymen Askri, Louis Leconte, Ba-Hien Tran.
 Design
 ------
 A drop-in ``torch.optim.Optimizer`` for parameters that live in the Boolean
-domain ``{0, 1}`` (typically the weight / bias of :class:`brute.nn.BitLinear`
-or :class:`brute.nn.BitConv2d`). The update is BOLD's deterministic
+domain ``{0, 1}`` (typically the weight / bias of :class:`BitLinear`
+or :class:`BitConv2d`). The update is BOLD's deterministic
 single-bit flip rule with per-weight accumulation and a per-layer plasticity
 factor ``β``.
 
@@ -113,9 +113,9 @@ class BooleanOptimizer(torch.optim.Optimizer):
 
 # Convenience: parameter splitting helpers
 #
-# Models built from :class:`brute.nn.BitLinear` / :class:`brute.nn.BitConv2d`
-# carry a ``_bold_boolean`` attribute on their boolean Parameters. This makes
-# it trivial to split a model's parameters into "boolean" and "real" groups
+# Models built from :class:`BitLinear` / :class:`BitConv2d` carry a
+# ``_bold_boolean`` attribute on their boolean Parameters. This makes it
+# trivial to split a model's parameters into "boolean" and "real" groups
 # without hard-coding layer names.
 
 def iter_boolean_parameters(model: torch.nn.Module) -> Iterable[Tensor]:
@@ -128,8 +128,8 @@ def iter_boolean_parameters(model: torch.nn.Module) -> Iterable[Tensor]:
 def split_parameters(model: torch.nn.Module):
     """Return ``(boolean_params, real_params)`` lists for a model.
 
-    Boolean parameters are the ones tagged by :class:`~brute.nn.BitLinear`
-    / :class:`~brute.nn.BitConv2d`; real parameters are everything else
+    Boolean parameters are the ones tagged by :class:`BitLinear`
+    / :class:`BitConv2d`; real parameters are everything else
     (including BatchNorm scales / biases, FP first / last layers, etc.).
     """
     boolean, real = [], []

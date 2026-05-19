@@ -31,8 +31,14 @@ from brute.functional import (
 # versions of the same name (bitwise_xor, bitwise_and, eq, ne, matmul, …).
 from brute.fast import *
 
-from brute import nn
-from brute import optim
+try:
+    from brute import nn  # noqa: F401
+except (ImportError, FileNotFoundError):
+    nn = None
+try:
+    from brute import optim  # noqa: F401
+except (ImportError, FileNotFoundError):
+    optim = None
 from brute import cuda_graphs
 from brute import streams
 from brute import fast

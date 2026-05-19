@@ -187,7 +187,7 @@ class BitLinear(nn.Linear):
     ``{0.0, 1.0}`` (the "T/F as 0/1" embedding from Appendix A.1).
     Forward dispatches to the bit1 XNOR-popcount matmul via brute's
     ``brute.as_tensor(..., dtype=brute.bit1)`` + ``@`` high-level API.
-    They MUST be optimised by :class:`brute.optim.BooleanOptimizer`.
+    They MUST be optimised by :class:`BooleanOptimizer`.
     """
 
     def __init__(
@@ -208,7 +208,7 @@ class BitLinear(nn.Linear):
         # through the layer (m = out_features). Pass ``bp_scale=1.0`` to
         # disable, or any other float to override.
         self.bp_scale = math.sqrt(2.0 / out_features) if bp_scale is None else float(bp_scale)
-        # Tag for the BooleanOptimizer auto-discovery (see brute.optim).
+        # Tag for the BooleanOptimizer auto-discovery (see boolean_optimizer.py).
         self.weight._bold_boolean = True
         if self.bias is not None:
             self.bias._bold_boolean = True

@@ -36,7 +36,8 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-import brute.nn as bnn
+from bit_conv import BitConv2d
+from bit_activation import BitActivation
 
 
 __all__ = ["VGGSmall"]
@@ -75,7 +76,7 @@ class VGGSmall(nn.Module):
                     # Boolean conv. The BOLD bp_scale assumes ``maxpool_after``
                     # iff this conv is the last of its block.
                     layers.append(
-                        bnn.BitConv2d(
+                        BitConv2d(
                             in_ch, ch, 3, padding=1, bias=not use_bn,
                             maxpool_after=is_block_end,
                         )
@@ -89,7 +90,7 @@ class VGGSmall(nn.Module):
                 # channels that's ``in_ch · 9``. Threshold is 0 because the
                 # XOR-count is 0-centred by BitConv2d.
                 m_receptive = in_ch * 9
-                layers.append(bnn.BitActivation(threshold=threshold, m=m_receptive))
+                layers.append(BitActivation(threshold=threshold, m=m_receptive))
                 in_ch = ch
 
         self.features = nn.Sequential(*layers)

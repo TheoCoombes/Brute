@@ -204,7 +204,7 @@ class BitConv2d(nn.Conv2d):
     directly downstream.
 
     Weights / bias are stored as floats in ``{0, 1}`` and MUST be optimised
-    by :class:`brute.optim.BooleanOptimizer`. Forward dispatches to brute's
+    by :class:`BooleanOptimizer`. Forward dispatches to brute's
     bit1 XNOR-popcount matmul via ``F.unfold`` + ``brute.as_tensor(..., dtype=brute.bit1)``.
 
     Notes
