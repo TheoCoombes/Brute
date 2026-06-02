@@ -23,7 +23,25 @@ import brute
 from brute.tensor import Tensor as _BT
 
 from bold import BoldParam, random_bit_param, signal_scale
-from vsa import bind, sign_to_bit1, to_bit1, to_pm1
+from vsa import bind, sign_to_bit1, to_pm1
+
+
+class _LazyPM1Cache(dict):
+    """Forward cache that delays bit1 -> +/-1 unpacking until backward."""
+
+    def __init__(self, *args, pm1_sources=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._pm1_sources = pm1_sources or {}
+
+    def __getitem__(self, key):
+        if key not in self and key in self._pm1_sources:
+            bit_key, shape = self._pm1_sources[key]
+            value = to_pm1(super().__getitem__(bit_key))
+            if shape is not None:
+                value = value.reshape(*shape)
+            super().__setitem__(key, value)
+            return value
+        return super().__getitem__(key)
 
 
 # ── packed broadcast binding (c ⊗ mask) ───────────────────────────────────────
@@ -33,23 +51,29 @@ def bind_mask(c_bit: brute.Tensor, mask_bit: brute.Tensor) -> brute.Tensor:
 
     Broadcasts on the packed buffers — no unpack to bool.
     """
-    pc = c_bit._packed_buf
-    pm = mask_bit._packed_buf
-    xored = torch.bitwise_xor(pc, pm).contiguous()
-    inv = torch.ops.brute.bit1_not_packed(xored, int(c_bit.shape[-1]))
-    return _BT._make_bit1_from_packed(inv, list(c_bit.shape))
+    return brute.fast.eq(c_bit, mask_bit)
 
 
 # ── Boolean linear (XNOR matmul + sign) ────────────────────────────────────────
 
 class BooleanLinear:
-    """``z = a · Wᵀ`` (XNOR/popcount), ``out = sign(z)``.  Weight ``W`` is (out, in)."""
+    """``z = a · Wᵀ`` (XNOR/popcount), ``out = sign(z)``.  Weight ``W`` is (out, in).
+
+    ``boundary_nu`` (BEP Eq. 5, HÆMMR v2 §D-b) optionally gates the backward
+    signal through the *eligibility mask* ``|z| ≤ ν·in_dim`` — only units whose
+    pre-activation is near the decision boundary (i.e. a weight flip could
+    actually change their sign) propagate a signal.  This focuses flips where
+    they matter and is a partial remedy for BOLD's error floor.  ``None`` (the
+    default) leaves the signal ungated.
+    """
 
     def __init__(self, in_dim: int, out_dim: int, *, name: str,
-                 generator: Optional[torch.Generator] = None, device=None):
+                 generator: Optional[torch.Generator] = None, device=None,
+                 boundary_nu: Optional[float] = None):
         self.in_dim, self.out_dim = in_dim, out_dim
         self.W = random_bit_param((out_dim, in_dim), f"{name}.W",
                                   generator=generator, device=device)
+        self.boundary_nu = boundary_nu
         self._cache: dict = {}
 
     def params(self) -> List[BoldParam]:
@@ -57,12 +81,19 @@ class BooleanLinear:
 
     def forward(self, a_bit: brute.Tensor) -> Tuple[brute.Tensor, torch.Tensor]:
         z = brute.fast.matmul(a_bit, self.W.bit)     # (M, out) int32, signed ±1 dot
-        self._cache = {"a_pm1": to_pm1(a_bit)}       # (M, in)
+        self._cache = _LazyPM1Cache(
+            {"a_bit": a_bit, "z": z},
+            pm1_sources={"a_pm1": ("a_bit", tuple(a_bit.shape))},
+        )
         return sign_to_bit1(z), z
 
     def backward(self, S: torch.Tensor) -> torch.Tensor:
         """``S``: (M, out) signal at the output activation. Returns (M, in)."""
         a_pm1 = self._cache["a_pm1"]
+        if self.boundary_nu is not None:
+            z = self._cache["z"].reshape(S.shape)
+            elig = (z.abs() <= self.boundary_nu * self.in_dim).to(S.dtype)   # BEP Eq. 5
+            S = S * elig
         # Eq. 7 — weight flip-signal q_W = Sᵀ · a_pm1   (out, in)
         self.W.add_signal(S.transpose(0, 1) @ a_pm1)
         # Eq. 8 — upstream signal g = S · W_pm1, variance-scaled.
@@ -86,7 +117,10 @@ class DiagBind:
 
     def forward(self, c_bit: brute.Tensor) -> brute.Tensor:
         out = bind_mask(c_bit, self.m.bit)
-        self._cache = {"c_pm1": to_pm1(c_bit)}
+        self._cache = _LazyPM1Cache(
+            {"c_bit": c_bit},
+            pm1_sources={"c_pm1": ("c_bit", tuple(c_bit.shape))},
+        )
         return out
 
     def backward(self, S: torch.Tensor) -> torch.Tensor:
@@ -126,11 +160,21 @@ class ResidualMerge:
         return [self.g]
 
     def forward(self, skip_bit: brute.Tensor, trans_bit: brute.Tensor) -> brute.Tensor:
-        g_bit = _broadcast_like(self.g.bit, skip_bit)
-        closed = brute.fast.bitwise_and(skip_bit, brute.fast.bitwise_not(g_bit))
-        open_ = brute.fast.bitwise_and(trans_bit, g_bit)
-        out = brute.fast.bitwise_or(closed, open_)
-        self._cache = {"skip_pm1": to_pm1(skip_bit), "trans_pm1": to_pm1(trans_bit)}
+        pg = self.g.bit._packed_buf
+        not_pg = torch.ops.brute.bit1_not_packed(pg, self.D)
+        closed = torch.bitwise_and(skip_bit._packed_buf, not_pg)
+        open_ = torch.bitwise_and(trans_bit._packed_buf, pg)
+        out = _BT._make_bit1_from_packed(
+            torch.bitwise_or(closed, open_),
+            list(skip_bit.shape),
+        )
+        self._cache = _LazyPM1Cache(
+            {"skip_bit": skip_bit, "trans_bit": trans_bit},
+            pm1_sources={
+                "skip_pm1": ("skip_bit", tuple(skip_bit.shape)),
+                "trans_pm1": ("trans_bit", tuple(trans_bit.shape)),
+            },
+        )
         return out
 
     def backward(self, S: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -152,22 +196,39 @@ def _broadcast_like(vec_bit: brute.Tensor, ref_bit: brute.Tensor) -> brute.Tenso
     """Broadcast a (D,) bit1 vector to ref's logical shape on the packed buffer."""
     pv = vec_bit._packed_buf
     target = list(ref_bit.shape[:-1]) + [pv.shape[-1]]
-    pv_b = pv.expand(target).contiguous()
+    pv_b = pv.expand(target)
     return _BT._make_bit1_from_packed(pv_b, list(ref_bit.shape))
 
 
 # ── Token codebook (shared input embedding + output decoder) ───────────────────
 
 class TokenCodebook:
-    """One learned binary codebook ``E`` (V, D): row lookup *and* min-Hamming decode."""
+    """One learned binary codebook ``E`` (V, D): row lookup *and* min-Hamming decode.
+
+    ``structured`` initialises ``E`` from a Binary Equiangular Frame (BEP App. C)
+    instead of random codes — maximally and uniformly separated rows, which
+    removes the anomalously-close pairs that drive decode collisions (v2 §C1).
+    The decode is *stateless* (the caller passes ``chat_pm1`` back into
+    :meth:`decode_backward`) so the head can decode several projections of the
+    concept (lexical + semantic) against the one shared codebook.
+    """
 
     def __init__(self, vocab_size: int, D: int, *, name: str = "E", flip_scale: float = 0.3,
+                 structured: bool = False, bef_alpha: float = 1.0, bef_sweeps: int = 30,
                  generator: Optional[torch.Generator] = None, device=None):
         self.V, self.D = vocab_size, D
-        self.E = random_bit_param((vocab_size, D), name, generator=generator, device=device)
+        if structured:
+            from vsa import binary_equiangular_frame
+            frame = binary_equiangular_frame(vocab_size, D, alpha=bef_alpha,
+                                             n_sweeps=bef_sweeps, generator=generator)
+            bit = brute.as_tensor(frame > 0, dtype=brute.bit1)
+            if device is not None:
+                bit = bit.to(device)
+            self.E = BoldParam(bit, name=name)
+        else:
+            self.E = random_bit_param((vocab_size, D), name, generator=generator, device=device)
         self.E.flip_scale = flip_scale  # the tied codebook is fragile → flip it slowly
         self._embed_cache: dict = {}
-        self._decode_cache: dict = {}
 
     def params(self) -> List[BoldParam]:
         return [self.E]
@@ -191,15 +252,11 @@ class TokenCodebook:
 
     # output side ------------------------------------------------------------
     def decode(self, chat_bit: brute.Tensor) -> torch.Tensor:
-        """``chat`` (M, D) bit1 → logits (M, V) int32 = ``<chat, E(t)>``."""
-        logits = brute.fast.matmul(chat_bit, self.E.bit)   # (M, V) int32
-        self._decode_cache = {"chat_pm1": to_pm1(chat_bit)}
-        return logits
+        """``chat`` (M, D) bit1 → logits (M, V) int32 = ``<chat, E(t)>`` (stateless)."""
+        return brute.fast.matmul(chat_bit, self.E.bit)     # (M, V) int32
 
-    def backward_decode(self, S_logits: torch.Tensor) -> torch.Tensor:
-        """``S_logits`` (M, V). Returns signal at ``chat`` (M, D); updates ``E``."""
-        chat_pm1 = self._decode_cache["chat_pm1"]
-        # q_E from the output head:  (V, D) = S_logitsᵀ · chat_pm1
+    def decode_backward(self, S_logits: torch.Tensor, chat_pm1: torch.Tensor) -> torch.Tensor:
+        """``S_logits`` (M, V), ``chat_pm1`` (M, D). Returns signal at ``chat``; updates ``E``."""
         self.E.add_signal(S_logits.transpose(0, 1) @ chat_pm1)
         return (S_logits @ self.E.pm1) * signal_scale(self.V)
 
@@ -227,7 +284,10 @@ class HopfieldBank:
         U_pm1 = self.U.pm1                                 # (M, D)
         sel = U_pm1[idx]                                   # (M_tok, k, D)
         read = sel.sum(dim=1)                              # (M_tok, D) integer vote
-        self._cache = {"idx": idx, "q_pm1": to_pm1(q_bit)}
+        self._cache = _LazyPM1Cache(
+            {"idx": idx, "q_bit": q_bit},
+            pm1_sources={"q_pm1": ("q_bit", tuple(q_bit.shape))},
+        )
         return sign_to_bit1(read)
 
     def backward(self, S_read: torch.Tensor) -> torch.Tensor:
@@ -254,36 +314,313 @@ class HopfieldBank:
         return torch.zeros_like(S_read)
 
 
+# ── Binary Episodic Slot Memory (exact in-window recall) ───────────────────────
+
+class EpisodicSlotMemory:
+    """Addressable binary slots for *exact* context-local recall (HÆMMR v2 §B1).
+
+    This is the decisive fix for the benchmark's marker (≈0.50) / copy (≈0.126)
+    failures.  v1 tried to recover exact payloads from a *bundle* — information-
+    theoretically hopeless at load.  Here every token writes its own slot and a
+    later query retrieves a specific one by **Hamming address**, so copy-within-
+    window becomes a lookup, not a bundle decode.
+
+    Addressing is two-component (content + position), the binary analogue of
+    content + positional attention:
+
+        score[t,m] = ⟨q^c_t, k^c_m⟩ + ⟨q^p_t, POS_m⟩,   for m < t  (read-before-write)
+
+    where ``k^c = Kc(c)``, ``q^c = Qc(c)``, ``q^p = Qp(c)`` are dense Boolean
+    projections (the address lane — never decoded) and ``POS_m`` are the absolute
+    position codes.  Content addressing solves induction/marker; the positional
+    query lets a trigger retrieve "the token at position p" (copy).  The payload
+    is the source **concept verbatim** (position-free, so it returns already in
+    the clean decode frame, §A — no unbind needed).
+
+    Forward read is **hard top-1** (exact).  The backward pass is a
+    straight-through *soft-attention* surrogate so the address projections get a
+    real LM-loss gradient — the missing ingredient that made v1's learned keys
+    collapse while hand-set keys worked.  :meth:`margin_loss` adds the §F local
+    Hamming-margin objective for the retrieval curriculum.
+    """
+
+    def __init__(self, D: int, *, name: str = "epi", read_k: int = 1,
+                 n_slots: Optional[int] = None, attn_inv_temp: Optional[float] = None,
+                 generator: Optional[torch.Generator] = None, device=None,
+                 boundary_nu: Optional[float] = None):
+        self.D = D
+        self.k = read_k
+        self.N = n_slots                       # ring-buffer cap (None ⇒ one slot / token)
+        self.inv_temp = attn_inv_temp if attn_inv_temp is not None else D ** -0.5
+        self.Kc = BooleanLinear(D, D, name=f"{name}.Kc", generator=generator, device=device, boundary_nu=boundary_nu)
+        self.Qc = BooleanLinear(D, D, name=f"{name}.Qc", generator=generator, device=device, boundary_nu=boundary_nu)
+        self.Qp = BooleanLinear(D, D, name=f"{name}.Qp", generator=generator, device=device, boundary_nu=boundary_nu)
+        self._cache: dict = {}
+        # streaming (inference) ring-buffer state
+        self._s_kc = self._s_pos = self._s_pay = None
+        self._s_ptr = 0
+        self._s_cnt = 0
+
+    def params(self) -> List[BoldParam]:
+        return self.Kc.params() + self.Qc.params() + self.Qp.params()
+
+    # ── batched (parallel-training) form ──────────────────────────────────────
+    def forward(self, c_bit: brute.Tensor, pos_bit: brute.Tensor | None) -> brute.Tensor:
+        """``c`` (B,n,D) bit1, ``pos`` (n,D) bit1 position codes → read (B,n,D) bit1."""
+        B, n, D = c_bit.shape
+        c_flat = c_bit.reshape(B * n, D)
+        kc_bit, _ = self.Kc.forward(c_flat)
+        qc_bit, _ = self.Qc.forward(c_flat)
+        qp_bit, _ = self.Qp.forward(c_flat)
+        kc = to_pm1(kc_bit).reshape(B, n, D)
+        qc = to_pm1(qc_bit).reshape(B, n, D)
+        qp = to_pm1(qp_bit).reshape(B, n, D)
+        c_pm1 = to_pm1(c_bit)                                   # payload (verbatim concept)
+        if pos_bit is None:
+            pos = torch.ones(n, D, dtype=torch.float32, device=c_bit.device)
+        else:
+            pos = to_pm1(pos_bit)                               # (n,D) positional keys
+
+        # two-component score (content + position), causal read-before-write
+        content = torch.einsum("btd,bmd->btm", qc, kc)         # (B,n,n)
+        position = torch.einsum("btd,md->btm", qp, pos)        # (B,n,n)
+        score = content + position
+        t = torch.arange(n, device=c_bit.device).unsqueeze(1)
+        m = torch.arange(n, device=c_bit.device).unsqueeze(0)
+        causal = m < t
+        if self.N is not None:
+            causal = causal & ((t - m) <= self.N)
+        neg = torch.finfo(score.dtype).min / 4
+        score = score.masked_fill(~causal.unsqueeze(0), neg)
+
+        kk = min(self.k, n, self.N or n)
+        if kk == 1:
+            topv, topi = score.max(dim=2, keepdim=True)       # argmax tie-breaks like streaming
+        else:
+            topv, topi = torch.topk(score, k=kk, dim=2)        # (B,n,kk)
+        # bundle the top-k source concepts (k=1 ⇒ exact single-slot read)
+        sel_pay = torch.gather(
+            c_pm1.unsqueeze(1).expand(B, n, n, D), 2,
+            topi.unsqueeze(-1).expand(B, n, kk, D))            # (B,n,kk,D)
+        valid_top = topv > (neg / 2)
+        sel_pay = sel_pay * valid_top.unsqueeze(-1)
+        read = sel_pay.sum(dim=2)                              # integer vote
+        # position 0 (and any all-masked row) has no valid slot → identity read
+        no_slot = ~valid_top.any(dim=2)                        # (B,n)
+        read = torch.where(no_slot.unsqueeze(-1), c_pm1, read)
+        read_bit = sign_to_bit1(read)
+
+        self._cache = {
+            "shape": (B, n, D), "kc": kc, "qc": qc, "qp": qp, "pos": pos,
+            "c_pm1": c_pm1, "score": score, "topi": topi, "no_slot": no_slot,
+            "causal": causal,
+        }
+        return read_bit
+
+    def _attn(self):
+        """Softmax attention weights over the causal score (for the ST backward)."""
+        score = self._cache["score"]
+        return torch.softmax(score * self.inv_temp, dim=2)     # (B,n,n)
+
+    def backward(self, S_read: torch.Tensor) -> torch.Tensor:
+        """``S_read`` (B,n,D) signal at the read. Returns signal at ``c`` (B,n,D).
+
+        Forward selection is hard (argmax); the backward uses the soft-attention
+        surrogate ``a = softmax(score)`` (straight-through) so the address
+        projections receive a gradient.  Three signal paths feed back into ``c``:
+        the payload (value) path, and the query/key (address) paths.
+        """
+        B, n, D = self._cache["shape"]
+        kc, qc, qp = self._cache["kc"], self._cache["qc"], self._cache["qp"]
+        c_pm1, pos = self._cache["c_pm1"], self._cache["pos"]
+        no_slot = self._cache["no_slot"]
+        a = self._attn()                                       # (B,n,n)
+
+        # value path: read_t = Σ_m a[t,m]·c_m  ⇒  dL/dc_m = Σ_t a[t,m]·S_read[t]
+        g_val = torch.einsum("btm,btd->bmd", a, S_read)        # (B,n,D)
+
+        # score path through softmax: dL/da[t,m] = ⟨S_read[t], c_m⟩
+        dA = torch.einsum("btd,bmd->btm", S_read, c_pm1)       # (B,n,n)
+        dscore = a * (dA - (a * dA).sum(dim=2, keepdim=True))  # softmax jacobian
+        dscore = dscore * self.inv_temp
+        # score = ⟨qc_t,kc_m⟩ + ⟨qp_t,pos_m⟩
+        g_qc = torch.einsum("btm,bmd->btd", dscore, kc)
+        g_kc = torch.einsum("btm,btd->bmd", dscore, qc)
+        g_qp = torch.einsum("btm,md->btd", dscore, pos)
+
+        # where a row had no valid slot the read was the identity c_t
+        g_val = g_val + no_slot.unsqueeze(-1) * S_read
+
+        g_c = g_val
+        g_c = g_c + self.Kc.backward(g_kc.reshape(B * n, D)).reshape(B, n, D)
+        g_c = g_c + self.Qc.backward(g_qc.reshape(B * n, D)).reshape(B, n, D)
+        g_c = g_c + self.Qp.backward(g_qp.reshape(B * n, D)).reshape(B, n, D)
+        return g_c
+
+    # ── §F local Hamming-margin objective for the address lane ─────────────────
+    def margin_loss(self, matched: torch.Tensor, *, theta_pos: float = 0.5,
+                    theta_neg: float = 0.0, weight: float = 1.0) -> float:
+        """Push the matched query/key pair above ``θ⁺`` and the best distractor
+        below ``θ⁻`` (margins as a fraction of ``D``), and accumulate the
+        resulting flip-signal onto the address projections (HÆMMR v2 §F).
+
+        ``matched`` is ``(B,n)`` long: for each query position ``t`` the slot id
+        ``m`` it *should* retrieve, or ``-1`` if there is no supervised target.
+        Must be called after :meth:`forward` (uses its cache); returns the scalar
+        margin loss for logging.  Trains the addresses with a *local discrete
+        target*, the ingredient that makes B1 actually learn (vs. hand-set keys).
+        """
+        B, n, D = self._cache["shape"]
+        kc, qc, qp = self._cache["kc"], self._cache["qc"], self._cache["qp"]
+        pos, score = self._cache["pos"], self._cache["score"]
+        tp, tn = theta_pos * D, theta_neg * D
+        causal = self._cache["causal"].unsqueeze(0).expand(B, n, n)
+        in_range = (matched >= 0) & (matched < n)
+        safe_idx = matched.clamp(0, max(n - 1, 0))
+        valid = in_range & torch.gather(causal, 2, safe_idx.unsqueeze(-1)).squeeze(-1)
+        if int(valid.sum()) == 0:
+            return 0.0
+        m_idx = safe_idx                                      # (B,n)
+        pos_score = torch.gather(score, 2, m_idx.unsqueeze(-1)).squeeze(-1)  # (B,n)
+        # hardest distractor = best non-matched valid slot
+        distract = score.clone()
+        distract.scatter_(2, m_idx.unsqueeze(-1), torch.finfo(score.dtype).min / 4)
+        neg_score, neg_idx = distract.max(dim=2)              # (B,n)
+
+        # hinge: want pos_score ≥ tp and neg_score ≤ tn
+        pos_viol = (pos_score < tp) & valid                   # push matched up
+        neg_viol = (neg_score > tn) & valid                   # push distractor down
+        loss = (((tp - pos_score).clamp_min(0) + (neg_score - tn).clamp_min(0)) * valid).sum()
+        n_valid = int(valid.sum())
+        loss_val = float(loss.item()) / max(n_valid, 1)
+
+        # flip-signal: raise ⟨q,k⟩ for matched (−1 on score gradient sense), lower for distractor
+        g_qc = torch.zeros(B, n, D, device=qc.device)
+        g_kc = torch.zeros(B, n, D, device=kc.device)
+        g_qp = torch.zeros(B, n, D, device=qp.device)
+        scale = weight / max(n_valid, 1)
+        # raise matched score: dScore>0 ⇒ signal pushes ⟨q,k⟩ up  (use −kc as the
+        # "increase similarity" direction in BOLD's minimise-loss convention)
+        pm = (pos_viol.float() * scale).unsqueeze(-1)         # (B,n,1)
+        k_match = torch.gather(kc, 1, m_idx.unsqueeze(-1).expand(B, n, D))   # (B,n,D)
+        pos_match = torch.gather(pos.unsqueeze(0).expand(B, n, D), 1,
+                                 m_idx.unsqueeze(-1).expand(B, n, D))
+        g_qc -= pm * k_match
+        g_qp -= pm * pos_match
+        g_kc.scatter_add_(1, m_idx.unsqueeze(-1).expand(B, n, D), -pm * qc)
+        # lower distractor score
+        nm = (neg_viol.float() * scale).unsqueeze(-1)
+        k_neg = torch.gather(kc, 1, neg_idx.unsqueeze(-1).expand(B, n, D))
+        pos_neg = torch.gather(pos.unsqueeze(0).expand(B, n, D), 1,
+                               neg_idx.unsqueeze(-1).expand(B, n, D))
+        g_qc += nm * k_neg
+        g_qp += nm * pos_neg
+        g_kc.scatter_add_(1, neg_idx.unsqueeze(-1).expand(B, n, D), nm * qc)
+
+        self.Qc.backward(g_qc.reshape(B * n, D))
+        self.Kc.backward(g_kc.reshape(B * n, D))
+        self.Qp.backward(g_qp.reshape(B * n, D))
+        return loss_val
+
+    # ── streaming (inference) ring-buffer form ────────────────────────────────
+    @torch.no_grad()
+    def reset_stream(self, batch_size: int, n_slots: int, *, device=None) -> None:
+        dev = device if device is not None else self.Kc.W.device
+        self._s_kc = torch.zeros(batch_size, n_slots, self.D, dtype=torch.float32, device=dev)
+        self._s_pos = torch.zeros(batch_size, n_slots, self.D, dtype=torch.float32, device=dev)
+        self._s_pay = torch.zeros(batch_size, n_slots, self.D, dtype=torch.float32, device=dev)
+        self._s_ptr = 0
+        self._s_cnt = 0
+
+    @torch.no_grad()
+    def step(self, c_bit: brute.Tensor, pos_bit: brute.Tensor, n_slots: int) -> brute.Tensor:
+        """One causal step (ring buffer of ``n_slots``). ``c`` (B,D), ``pos`` (D,)."""
+        if c_bit.dim() == 1:
+            c_bit = c_bit.reshape(1, self.D)
+        B, D = c_bit.shape
+        if self._s_kc is None or self._s_kc.shape[0] != B or self._s_kc.shape[1] != n_slots:
+            self.reset_stream(B, n_slots, device=c_bit.device)
+        qc = to_pm1(self.Qc.forward(c_bit)[0])
+        qp = to_pm1(self.Qp.forward(c_bit)[0])
+        c_pm1 = to_pm1(c_bit)
+        if self._s_cnt == 0:
+            read = c_pm1                                       # nothing to retrieve yet
+        else:
+            cnt = self._s_cnt
+            content = torch.einsum("bd,bsd->bs", qc, self._s_kc[:, :cnt])
+            position = torch.einsum("bd,bsd->bs", qp, self._s_pos[:, :cnt])
+            score = content + position                        # (B,cnt)
+            sel = score.argmax(dim=1)                         # (B,)
+            read = torch.gather(self._s_pay[:, :cnt], 1,
+                                sel.view(B, 1, 1).expand(B, 1, D)).squeeze(1)
+        # write current token into the ring buffer (after the read)
+        kc = to_pm1(self.Kc.forward(c_bit)[0])
+        pos_pm1 = to_pm1(pos_bit) if getattr(pos_bit, "_is_bit1", False) else pos_bit
+        p = self._s_ptr
+        self._s_kc[:, p] = kc
+        self._s_pos[:, p] = pos_pm1.reshape(1, D).expand(B, D)
+        self._s_pay[:, p] = c_pm1
+        self._s_ptr = (p + 1) % n_slots
+        self._s_cnt = min(self._s_cnt + 1, n_slots)
+        return sign_to_bit1(read)
+
+
 # ── Bundling State Recurrence (BSR) — linear-time binary sequence mixer ─────────
 
+def pow2_decay_palette(D: int, shifts=(1, 2, 3, 4, 0), device=None) -> torch.Tensor:
+    """Per-coordinate decay multiplier from a small power-of-two palette (v2 §B2).
+
+    Each coordinate is assigned a shift ``s`` from ``shifts`` (channel groups,
+    RetNet-style multi-timescale retention); its decay multiplier is
+    ``1 − 2^{−s}`` (a single arithmetic right-shift of a bit-sliced counter,
+    ``A ← A − (A >> s)``).  ``s = 0`` means *permanent* (no decay, multiplier 1).
+    This replaces v1's per-coordinate floating-point ``γ`` — the last non-1-bit
+    concession — with a tiny shift palette that is simultaneously bit-sliceable
+    (§E) and multi-timescale.
+    """
+    groups = len(shifts)
+    idx = (torch.arange(D, device=device) * groups) // D            # (D,) group id
+    mult = torch.empty(D, dtype=torch.float32, device=device)
+    for g, s in enumerate(shifts):
+        m = 1.0 if s == 0 else (1.0 - 2.0 ** (-s))
+        mult[idx == g] = m
+    return mult
+
+
 class BSR:
-    """Binary linear-recurrence context mixer (HÆMMR §5.1).
+    """Binary delta-corrected linear-recurrence context mixer (HÆMMR v2 §B2).
 
     Per position: key/value/query are dense 1-bit Boolean projections of the
-    concept.  The query reads the prior causal state, then the current
-    key/value association is written for later positions::
+    *position-free* concept (content addressing — BSR is the discourse mixer; all
+    positional/exact recall is handled by the episodic slot memory, §B1).  The
+    query reads the prior causal state, then the current association is written
+    by an **erase-before-write delta rule**::
 
-        S_i = sign(A_i),   r_i = q_i ⊗ S_i,
-        A_{i+1} = γ·A_i + (k_i ⊗ v_i)
+        S_i = sign(A_i),   r_i = q_i ⊗ S_i
+        pred_i = k_i ⊗ sign(A_i)               # what the bundle already predicts for k_i
+        g_i = 1[ pred_i ≠ v_i ]                 # disagreement gate (pure XOR)
+        A_{i+1} = decay ⊙ A_i + g_i ⊙ (k_i ⊗ v_i)
 
-    Forward is an O(n) scan; backward is the exact O(n) reverse-scan adjoint of
-    the linear recurrence (sign/decay treated as pass-through).  ``γ`` is a fixed
-    per-coordinate decay (the paper's single low-precision concession).
+    Writing *only the error* (where the bundle already disagrees) prevents the
+    over-counting/saturation of v1's blind add — the binary image of the
+    DeltaNet/Gated-DeltaNet residual write.  ``decay`` is the power-of-two
+    palette (:func:`pow2_decay_palette`).  Forward is an O(n) scan; backward is
+    the O(n) reverse-scan adjoint (sign and the hard gate treated as
+    pass-through, decay linear).
     """
 
     def __init__(self, D: int, *, name: str = "bsr",
-                 gamma_min: float = 0.90, gamma_max: float = 0.999,
-                 generator: Optional[torch.Generator] = None, device=None):
+                 decay_shifts=(1, 2, 3, 4, 0),
+                 generator: Optional[torch.Generator] = None, device=None,
+                 boundary_nu: Optional[float] = None):
         self.D = D
         # K/V/Q must be genuine Boolean projections, not diagonal bindings:
         # (c⊗W_K)⊗(c⊗W_V) cancels c exactly. Dense bitwise projections preserve
         # content in the association while staying in the packed XNOR path.
-        self.K = BooleanLinear(D, D, name=f"{name}.K", generator=generator, device=device)
-        self.V = BooleanLinear(D, D, name=f"{name}.V", generator=generator, device=device)
-        self.Q = BooleanLinear(D, D, name=f"{name}.Q", generator=generator, device=device)
-        # Multi-timescale fixed decay spread geometrically across coordinates.
-        frac = torch.linspace(0, 1, D, device=device)
-        self.gamma = (gamma_min * (gamma_max / gamma_min) ** frac).to(torch.float32)  # (D,)
+        self.K = BooleanLinear(D, D, name=f"{name}.K", generator=generator, device=device, boundary_nu=boundary_nu)
+        self.V = BooleanLinear(D, D, name=f"{name}.V", generator=generator, device=device, boundary_nu=boundary_nu)
+        self.Q = BooleanLinear(D, D, name=f"{name}.Q", generator=generator, device=device, boundary_nu=boundary_nu)
+        self.decay = pow2_decay_palette(D, decay_shifts, device=device)        # (D,)
         self._cache: dict = {}
         self._stream_A: Optional[torch.Tensor] = None
 
@@ -297,42 +634,54 @@ class BSR:
         k_bit, _ = self.K.forward(c_flat)
         v_bit, _ = self.V.forward(c_flat)
         q_bit, _ = self.Q.forward(c_flat)
-        k_pm1 = to_pm1(k_bit).reshape(B, n, D)
-        v_pm1 = to_pm1(v_bit).reshape(B, n, D)
-        q_pm1 = to_pm1(q_bit).reshape(B, n, D)
-        assoc_pm1 = k_pm1 * v_pm1                           # (B, n, D) bound association
+        k_bit = k_bit.reshape(B, n, D)
+        v_bit = v_bit.reshape(B, n, D)
+        q_bit = q_bit.reshape(B, n, D)
+        k_pm1 = to_pm1(k_bit)
+        v_pm1 = to_pm1(v_bit)
+        assoc_pm1 = k_pm1 * v_pm1                             # (B, n, D) bound association
 
-        gamma = self.gamma
+        decay = self.decay
         A = torch.zeros(B, D, dtype=torch.float32, device=c_bit.device)
         S_state_pm1 = torch.empty(B, n, D, dtype=torch.float32, device=c_bit.device)
+        gate = torch.empty(B, n, D, dtype=torch.float32, device=c_bit.device)
         for i in range(n):
-            S_state_pm1[:, i, :] = torch.where(A >= 0, 1.0, -1.0)
-            A = gamma * A + assoc_pm1[:, i, :]
-        r_pm1 = q_pm1 * S_state_pm1                          # r_i = q_i ⊗ S_i
-        self._cache = {
-            "k_pm1": k_pm1, "v_pm1": v_pm1, "q_pm1": q_pm1,
-            "S_state_pm1": S_state_pm1, "shape": (B, n, D),
-        }
-        return to_bit1(r_pm1)
+            Ssign = torch.where(A >= 0, 1.0, -1.0)
+            S_state_pm1[:, i, :] = Ssign
+            pred = k_pm1[:, i, :] * Ssign                     # bundle's prediction for k_i
+            g_i = (pred != v_pm1[:, i, :]).to(torch.float32)  # disagreement gate
+            gate[:, i, :] = g_i
+            A = decay * A + g_i * assoc_pm1[:, i, :]
+        S_state_bit = sign_to_bit1(S_state_pm1)
+        self._cache = _LazyPM1Cache(
+            {
+                "k_bit": k_bit, "v_bit": v_bit, "q_bit": q_bit,
+                "k_pm1": k_pm1, "v_pm1": v_pm1,
+                "S_state_pm1": S_state_pm1, "gate": gate, "shape": (B, n, D),
+            },
+            pm1_sources={"q_pm1": ("q_bit", (B, n, D))},
+        )
+        return bind(q_bit, S_state_bit)
 
     def backward(self, S_r: torch.Tensor) -> torch.Tensor:
         """``S_r`` (B, n, D) signal at the read. Returns signal at ``c`` (B, n, D)."""
         B, n, D = self._cache["shape"]
         k_pm1, v_pm1, q_pm1 = self._cache["k_pm1"], self._cache["v_pm1"], self._cache["q_pm1"]
         S_state_pm1 = self._cache["S_state_pm1"]
-        gamma = self.gamma
+        gate = self._cache["gate"]
+        decay = self.decay
 
         # r_i = q_i ⊗ S_i  →  signal to q_i and to the state S_i
         g_q = S_r * S_state_pm1                              # (B,n,D)
         gS = S_r * q_pm1                                     # signal entering sign(A_i)
 
-        # reverse-scan adjoint of causal read-before-write:
-        #   read_i = sign(A_i),  A_{i+1} = γ·A_i + assoc_i
+        # reverse-scan adjoint of the delta recurrence:
+        #   S_i = sign(A_i),  A_{i+1} = decay·A_i + gate_i ⊙ assoc_i
         g_assoc = torch.empty_like(gS)
-        Abar_next = torch.zeros(B, D, dtype=torch.float32, device=S_r.device)
+        Abar = torch.zeros(B, D, dtype=torch.float32, device=S_r.device)
         for i in range(n - 1, -1, -1):
-            g_assoc[:, i, :] = Abar_next
-            Abar_next = gS[:, i, :] + gamma * Abar_next
+            g_assoc[:, i, :] = gate[:, i, :] * Abar          # dL/dassoc_i (gate is pass-through)
+            Abar = gS[:, i, :] + decay * Abar                # dL/dA_i
 
         # assoc_i = k_i ⊗ v_i
         g_k = g_assoc * v_pm1
@@ -348,7 +697,7 @@ class BSR:
     @torch.no_grad()
     def reset_stream(self, batch_size: int, *, device=None) -> None:
         """Reset the recurrent inference state for streaming BSR reads."""
-        dev = device if device is not None else self.gamma.device
+        dev = device if device is not None else self.decay.device
         self._stream_A = torch.zeros(batch_size, self.D, dtype=torch.float32, device=dev)
 
     @torch.no_grad()
@@ -364,8 +713,10 @@ class BSR:
         q_bit, _ = self.Q.forward(c_bit)
         k_pm1 = to_pm1(k_bit)
         v_pm1 = to_pm1(v_bit)
-        q_pm1 = to_pm1(q_bit)
-        S_state_pm1 = torch.where(self._stream_A >= 0, 1.0, -1.0)
-        r = to_bit1(q_pm1 * S_state_pm1)
-        self._stream_A = self.gamma * self._stream_A + (k_pm1 * v_pm1)
+        assoc_pm1 = k_pm1 * v_pm1
+        Ssign = torch.where(self._stream_A >= 0, 1.0, -1.0)
+        r = bind(q_bit, sign_to_bit1(Ssign))
+        pred = k_pm1 * Ssign
+        g_i = (pred != v_pm1).to(torch.float32)
+        self._stream_A = self.decay * self._stream_A + g_i * assoc_pm1
         return r

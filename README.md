@@ -1,12 +1,12 @@
 # Brute
 
-Native 1-bit tensors for extremely fast binary neural networks in PyTorch.
+Packed 1-bit tensors for extremely fast binary neural network modelling in PyTorch.
 
 ### Features
 
-- Extremely optimised 1-bit tensor CPU / CUDA / Apple Silicon kernels, written in C++.
-- Backwards compatible with PyTorch, keeping all existing torch data types and device support.
-- Extremely comprehensive test suite, ensuring `brute.bit1` and `torch.bool` have the same behaviour.
+- Extremely optimised uint64 packed binary tensor CPU / CUDA / Apple Silicon kernels written in C++.
+- Fully backwards compatible with PyTorch, retaining all existing torch data types and device support.
+- Comprehensive test suite to ensure `brute.bit1` and `torch.bool` act equivalent.
 
 ## Installation
 
@@ -21,6 +21,10 @@ git clone --recurse-submodules -j8 https://github.com/TheoCoombes/Brute.git
 cd Brute
 pip install --no-build-isolation -ve .
 ```
+
+## Benchmarks
+
+TODO
 
 ## Tests
 

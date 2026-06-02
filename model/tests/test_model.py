@@ -17,17 +17,35 @@ def tiny_model(**over):
 
 
 class TestForward:
-    def test_position_decode_defaults_to_safe_mode(self):
-        assert HaemmrConfig(use_position=True).position_decode == "next_unbind"
-        assert HaemmrConfig(use_position=False).position_decode == "none"
+    def test_v2_has_position_free_decode_path(self):
+        m = tiny_model(use_position=True)
+        ids = torch.randint(0, 16, (2, 6))
+        m.forward(ids)
+        assert "decode_pos_pm1" not in m._fwd_cache
+        assert "pos_pm1" not in m._fwd_cache
+        assert m._fwd_cache["ell_pm1"].shape == (12, m.cfg.D)
+
+    def test_content_only_mode_keeps_neutral_episodic_position_lane(self):
+        m = tiny_model(use_position=False)
+        pos = m._position_lane(5)
+        assert torch.equal(pos.unpack_pm1(), torch.ones(5, m.cfg.D))
 
     def test_shapes_and_dtype(self):
         m = tiny_model()
         ids = torch.randint(0, 16, (3, 10))
         logits = m.forward(ids)
         assert logits.shape == (30, 16)
-        assert logits.dtype == torch.int32
-        assert -m.cfg.D <= int(logits.min()) and int(logits.max()) <= m.cfg.D
+        assert logits.dtype == torch.float32
+        bound = m.cfg.D * (1.0 + m.cfg.sem_weight)
+        assert -bound <= float(logits.min()) and float(logits.max()) <= bound
+
+    def test_config_validation(self):
+        with pytest.raises(ValueError):
+            HaemmrConfig(D=0)
+        with pytest.raises(ValueError):
+            HaemmrConfig(epi_read_k=0)
+        with pytest.raises(ValueError):
+            HaemmrConfig(label_smoothing=1.0)
 
     def test_all_params_are_bit1(self):
         m = tiny_model()
@@ -59,6 +77,15 @@ class TestBackward:
         info = m.loss_and_backward(m.forward(ids), tgt)
         assert info["n_valid"] == 0
         assert info["loss"] == 0.0
+
+    def test_label_smoothing_and_margin_supervision_run(self):
+        m = tiny_model(label_smoothing=0.1, margin_weight=0.5)
+        ids = torch.randint(0, 16, (2, 6))
+        tgt = torch.randint(0, 16, (2, 6))
+        matched = torch.tensor([[-1, 0, 1, 2, 3, 4], [-1, 0, 1, 2, 3, 4]])
+        info = m.loss_and_backward(m.forward(ids), tgt, matched=matched)
+        assert torch.isfinite(torch.tensor(info["loss"]))
+        assert info["margin"] >= 0.0
 
     def test_optimizer_step_flips_bits(self):
         m = tiny_model()

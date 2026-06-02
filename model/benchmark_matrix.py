@@ -128,6 +128,7 @@ def run_synthetic(args):
         seed=args.seed, D=args.synthetic_D, layers=1, d_ff=2 * args.synthetic_D,
         slots=32, top_k=3, device="cpu", eta=3.0, threshold=8.0,
         gate_open=0.05, codebook_flip_scale=0.5, steps=args.haemmr_steps,
+        use_position=True, margin_supervision=True,
         batch_size=64, baseline_steps=args.transformer_steps, baseline_dim=64,
         baseline_layers=2, baseline_lr=3e-3,
     )

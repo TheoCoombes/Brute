@@ -1,155 +1,141 @@
-# HÆMMR — a binary-first, concept-native language model on `brute`
+# HÆMMR v2 — binary-first, concept-native LM on `brute`
 
-A self-contained implementation of the **HÆMMR** architecture (the attached
-whitepaper) — *Hyperdimensional Autoregressive Memory with Majority-vote
-Reasoning* — trained natively in the Boolean domain with **BOLD** (Boolean Logic
-Deep Learning, NeurIPS 2024). Every weight and activation is a single bit; the
-forward pass is XNOR / popcount / majority-vote / Hamming-distance, stored and
-computed on packed `brute.bit1` (uint64) tensors. No floating-point latent
-weights anywhere — training is a logic test and a bit flip.
+This directory is a self-contained reference implementation of the HÆMMR v2
+single-model architecture. It keeps the original mission constraints:
+packed 1-bit weights and activations, CPU-first XNOR/popcount kernels, O(n)
+sequence mixing, autoregressive training, latent attention rather than a
+growing KV cache, and BOLD bit-flip optimization.
 
-This is the paper's **Stage 1** target: *"build a single small binary expert
-(BOLD reference implementation) … train on CPU."* The distributed
-tracker / federated-MoE machinery (whitepaper §8) is intentionally **out of
-scope**, as requested.
+The v2 change is separation of concerns:
 
-> Note on the dtype name: the request said `brute.int1`; the library's packed
-> 1-bit dtype is actually `brute.bit1` — that is what is used throughout.
+* the decoded stream is a position-free concept vector;
+* positions live only in the memory address lane;
+* exact in-window recall uses a runtime episodic slot memory;
+* BSR is narrowed to compressed discourse state;
+* the Hopfield bank is narrowed to learned static priors;
+* decode is concept -> lexical projection -> Hamming codebook match, with an
+  optional semantic rerank.
 
----
+Federated/MoE/swarm machinery remains out of scope here.
 
-## What's faithful, and what stays bitwise
-
-The whole point is to **never round-trip a 1-bit tensor through a byte
-bool-tensor**. The hot path operates directly on the packed uint64 buffers:
-
-| HÆMMR op | math | `brute` realisation | stays packed? |
-|---|---|---|---|
-| binding `a ⊗ b` | XNOR = bipolar `·` | `brute.fast.eq` / packed XOR+NOT | ✅ |
-| residual merge | per-coord MUX | packed `&`, `\|`, `~` | ✅ |
-| `<u,v> = D − 2·Ham` | signed dot | `xnor_popcount_matmul` (`a @ w`) | ✅ |
-| threshold `sign(z)` | activation | int32 `z ≥ 0` → pack | ✅ (int→bit) |
-| min-Hamming decode | argmax `<ĉ,E(t)>` | one `bit1 @ E` sweep | ✅ |
-
-Integers appear **only** where the architecture itself is integer-valued, exactly
-as the paper says ("the only non-bitwise element is the transient integer
-accumulator"): the signed matmul pre-activations, the BSR vote accumulator
-`A_i`, and the BOLD optimiser signals. **All stored parameters are
-`brute.bit1`.** The ±1 *float views* used by the backward-pass signal matmuls are
-transient caches recomputed after each flip — they are never the source of
-truth (BOLD's signals are inherently real, so this is faithful, not a shortcut).
-
-## Architecture (whitepaper §3–§6)
+## Architecture
 
 ```
-token t_i ──▶ E(t_i)              # 1-bit codebook lookup (V×D bits)
-          ⊗ ρ^i(POS)             # cyclic-shift position binding
-          ── input-bind (⊗ W) ──▶ concept c_i⁰
-   ┌──────────────────────────────────────────────────┐   ×L blocks
-   │  r = BSR(c)            # linear-time binary mixer  │
-   │  c ← residual-merge(c, r)                          │
-   │  h = HopfieldBank(c)   # binary latent attention   │
-   │  c ← residual-merge(c, h)                          │
-   │  m = channel-mix(c)    # binary MLP (XNOR matmuls) │
-   │  c ← residual-merge(c, m)                          │
-   └──────────────────────────────────────────────────┘
-          ── out-bind (⊗ W) ──▶ next-token concept ĉ
-          ── argmax_t <ĉ, E(t)> ──▶ token        # min-Hamming / Boltzmann decode
+token ids
+  -> E_lex(t)                              # packed 1-bit lexical codebook
+  -> input bind                            # position-free concept c_i
+  -> [ delta BSR
+       episodic slot memory
+       latent Hopfield priors
+       binary channel mix ] x L
+  -> output bind                           # next-token concept c_hat
+  -> lexical Boolean projection
+  -> Hamming decode against E_lex
+  -> optional semantic rerank
 ```
 
-* **Concept ≠ embedding** (§4): `E` is the context-free 1-bit identity; the
-  concept `ĉ` is a *computed* hypervector that may lie between codebook rows.
-  Decoding projects it to the nearest realisable token.
-* **BSR** (§5.1): `A_i = γ·A_{i-1} + (k_i⊗v_i)`, `S_i = sign(A_i)`, `r_i = q_i⊗S_i`
-  with dense 1-bit Boolean projections for `k`, `v`, and `q`. This is a
-  linear-time (O(n)) binary reimagining of linear attention / RetNet. Trained by
-  the **exact O(n) reverse-scan adjoint** of the recurrence.
-* **Latent Hopfield Bank** (§5.2): `M` learned key/payload slots; read =
-  `sign(Σ_topk U_m)` over the top-k most similar keys (winner-take-all, not
-  softmax) — softmax-free latent attention.
-* **Decode** (§6): `argmax_t <ĉ,E(t)>`; to sample, `P(t) ∝ exp(<ĉ,E(t)>/T)`.
+Key v2 components:
 
-## Training — BOLD (§7)
+| Component | File | Role |
+|---|---|---|
+| `TokenCodebook` | `layers.py` | shared packed lexical embeddings and Hamming decoder; small models can initialize with an inline BEF codebook |
+| `EpisodicSlotMemory` | `layers.py` | causal direct Hamming slot lookup for exact marker/copy-style recall |
+| `BSR` | `layers.py` | delta-corrected recurrent bundle with a power-of-two decay palette |
+| `HopfieldBank` | `layers.py` | static learned key/payload priors, no runtime copy writes |
+| `BooleanLinear`, `DiagBind`, `ResidualMerge` | `layers.py` | bitwise projections, binding masks, and gated binary residual paths |
+| `HaemmrLM` | `model.py` | v2 block stack, decode split, BOLD loss/backward, generation |
 
-Pure Boolean variation calculus, no gradients:
+Positions are generated by `hierarchical_position_codes` in `vsa.py`. They are
+never bound into the decoded concept. If `use_position=False`, the episodic lane
+uses a neutral all-ones role, so memory remains content-addressed.
 
-* signals `q` (weights) and `g` (backprop) via the XNOR chain rule (Eqs. 5–8),
-  variance-scaled by `√(2/fan_out)`;
-* flip rule (Eq. 9): flip `w` iff the accumulated signal **agrees in sign** with
-  it;
-* accumulator + auto-regularising β-plasticity (Eqs. 10–11) with reset-on-flip
-  error feedback.
+## Training
 
-**One practical stabiliser:** from a random init the literal sign-only flip rule
-can thrash, so the optimiser integrates signal in a small integer accumulator
-and flips only after the agreeing evidence crosses `--threshold`. This preserves
-BOLD's bit-flip update while letting small, consistent signals build over
-ordinary single-machine batches.
+Training uses BOLD (`bold.py`):
 
-## Files
+* parameters are canonical `brute.bit1` tensors;
+* each parameter has a small integer accumulator for flip evidence;
+* a bit flips when accumulated evidence agrees with the current bit and crosses
+  the threshold;
+* BOLD signals are real-valued backward signals, but there are no floating-point
+  latent weights.
 
-```
-model/
-  vsa.py      bind / bundle / permute + bit1↔±1 helpers (packed)
-  bold.py     BoldParam (1-bit weight + accumulator) and the flip-rule optimiser
-  layers.py   BooleanLinear, DiagBind, gated ResidualMerge, TokenCodebook,
-              HopfieldBank, BSR  — each with bitwise forward + BOLD backward
-  model.py    HaemmrConfig / HaemmrLM — block stack, CE loss + backward, sampling
-  data.py     WikiText + GPT-2 tokenizer, capped vocabulary, LM batches
-  train.py    training CLI
-  sample.py   sampling CLI (loads a checkpoint)
-  tests/      pytest suite (forward-vs-reference, BOLD correctness, learning)
-```
+v2 training options implemented here:
+
+* label smoothing on decode loss;
+* activation flip-dropout during training;
+* BEP-style boundary eligibility gating for Boolean linears;
+* local Hamming-margin supervision for episodic addresses via
+  `loss_and_backward(..., matched=...)`.
 
 ## Run
 
-Assumes `brute` is importable (installed system-wide). Needs `transformers` and
-`datasets` for the GPT-2 tokenizer and WikiText.
+Use the workspace venv from the repo root:
 
 ```bash
-# train a small demo on WikiText-2 (CPU, a few minutes)
-python train.py --steps 1500 --D 1024 --layers 2 --vocab-cap 2048 --seq-len 64
+cd "/Users/theocoombes/Documents/Programming Projects/Binary LLM/Implementation"
 
-# faster smoke run
-python train.py --steps 500 --D 512 --layers 2 --vocab-cap 1024 \
-                --max-train-tokens 500000 --seq-len 48
+# test the model package
+./.venv/bin/python -m pytest model/tests -q
 
-# sample from the checkpoint
-python sample.py --ckpt haemmr.pt --prompt "The history of" --n 60 --temperature 0.8
+# train a small WikiText demo
+./.venv/bin/python model/train.py \
+  --steps 500 --D 512 --layers 2 --vocab-cap 1024 \
+  --max-train-tokens 500000 --seq-len 48
 
-# tests (≈2 s)
-python -m pytest tests/ -q
+# sample from a checkpoint
+./.venv/bin/python model/sample.py \
+  --ckpt haemmr.pt --prompt "The history of" --n 60 --temperature 0.8
+
+# inspect packed-forward operation counts
+./.venv/bin/python model/profile_bitwise.py --D 512 --layers 2 --iters 20
 ```
 
-Key flags: `--D` (concept dim — bigger ⇒ better VSA geometry, the paper uses
-8k–16k), `--layers`, `--d-ff`, `--slots`/`--top-k` (Hopfield), `--eta` /
-`--threshold` (BOLD), `--device {cpu,mps,cuda}`.
+Useful flags:
 
-## What to expect
+* `--D`: concept hypervector dimension.
+* `--layers`, `--d-ff`: block depth and channel-mix width.
+* `--slots`, `--top-k`: static Hopfield prior bank.
+* `--epi-slots`, `--epi-read-k`: exact-recall window and read width.
+* `--no-position`: disables hierarchical position codes in the address lane.
+* `--no-structured-codebook`: use random token codes instead of inline BEF.
+* `--sem-weight`: semantic rerank weight.
+* `--boundary-nu`, `--label-smoothing`, `--flip-dropout`: v2 training
+  mitigations.
+* `--eta`, `--threshold`, `--m-clip`: BOLD flip accumulator controls.
 
-This is a **small local demo of a speculative architecture**, not a strong LM.
-On a ~3 M-bit (≈0.36 MB) model, 500 CPU steps on WikiText-2 takes it from
-perplexity ~1700 → ~260 and accuracy 0.0015 → ~0.07 — i.e. it decisively beats
-the uniform baseline (≈70×) and reaches the unigram baseline, generating the
-corpus's high-frequency tokens. Coherent text needs what the whitepaper itself
-flags as the open empirical questions: larger `D` (the quasi-orthogonality
-geometry), more blocks/slots, and much more training. The deliverable here is a
-**correct, fully bitwise, end-to-end-trainable** reference — verified by the
-test suite (forward bit-exact against a ±1 reference; BOLD provably reduces loss;
-the stack learns a deterministic next-token map to 100 %).
+The inline BEF initializer is intentionally capped for interactive startup; for
+large vocabularies it falls back to random balanced codes. A production-scale
+BEF should be precomputed offline and loaded as the codebook.
 
-## Deliberate simplifications
+## Tests
 
-* No federated tracker / Mixture-of-Experts / ternary voting (§8) — out of scope.
-* BSR decay `γ` is a **fixed** multi-timescale spread (the paper's one
-  low-precision concession; §11 lists its bit-width as open). Not learned.
-* Residual merges are **gated MUXes** (zero-init-style identity at start) rather
-  than raw 3-way majority — this is what makes a deep binary residual stack
-  trainable from scratch.
-* Hopfield **keys** train by a Hebbian rule and **payloads** by the loss signal;
-  the top-k selection is hard (zero query gradient a.e.), so the query path
-  learns through the other branches. Dynamic Hopfield writes (§5.2) are omitted
-  (the paper flags them as a stability risk; static slots are the safe default).
-* The input concept uses `E(t)⊗ρ^i(POS)`; the running-state binding `⊗ S_{i-1}`
-  from §4 is provided functionally by the BSR read + residual rather than as a
-  mutual recurrence (keeps the graph clean and acyclic).
+The pytest suite covers:
+
+* VSA binding, unbinding, Hamming similarity, hierarchical positions, and BEF
+  initialization;
+* Boolean layer forward/backward wiring;
+* delta-BSR recurrence and streaming parity;
+* episodic slot read causality, configured window limits, streaming parity, and
+  address-margin signals;
+* v2 model forward/loss/generation/checkpoint behavior;
+* BOLD flip-rule and optimizer behavior;
+* source-level packed-kernel contracts.
+
+Current verification command:
+
+```bash
+./.venv/bin/python -m pytest model/tests -q
+```
+
+## Deliberate Simplifications
+
+* No federated tracker, MoE routing, or swarm accumulator.
+* The BSR accumulator is still represented as a transient float tensor in this
+  Python reference; the architecture uses a shift-friendly decay palette so it
+  can be replaced by a bit-sliced packed counter kernel.
+* Episodic memory uses direct Hamming search. Product-key addressing is not
+  implemented because direct search is simpler and robust at the tested window
+  sizes.
+* Decode rerank is a full-vocabulary semantic score in this reference rather
+  than a fused shortlist kernel.

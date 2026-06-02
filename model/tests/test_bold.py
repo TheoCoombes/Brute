@@ -72,7 +72,7 @@ def test_bold_learns_classifier_teacher():
         logits = cb.decode(chat).float() * inv
         p = logits.softmax(1)
         oh = torch.zeros_like(p); oh.scatter_(1, y.unsqueeze(1), 1.0)
-        cb.backward_decode((p - oh) * (inv / N))
+        cb.decode_backward((p - oh) * (inv / N), to_pm1(chat))
         opt.step()
     a1 = acc()
     assert a1 > a0 + 0.4, f"BOLD failed to learn: {a0:.3f} → {a1:.3f}"

@@ -21,13 +21,15 @@ def test_no_local_megabatch_or_old_flip_cap_api():
 def test_hot_forward_uses_brute_fast_matmul():
     layers = _text("layers.py")
     assert "z = brute.fast.matmul(a_bit, self.W.bit)" in layers
-    assert "logits = brute.fast.matmul(chat_bit, self.E.bit)" in layers
+    assert "return brute.fast.matmul(chat_bit, self.E.bit)" in layers
     assert "sim = brute.fast.matmul(q_bit, self.P.bit)" in layers
 
 
-def test_positioned_models_default_to_next_unbind_decode():
+def test_v2_removed_position_bound_decode_mode():
+    model_py = _text("model.py")
+    train_py = _text("train.py")
     cfg = HaemmrConfig(use_position=True)
-    assert cfg.position_decode == "next_unbind"
-    cfg = HaemmrConfig(use_position=False)
-    assert cfg.position_decode == "none"
-
+    assert not hasattr(cfg, "position_decode")
+    assert "position_decode" not in model_py
+    assert "--position-decode" not in train_py
+    assert "decode_pos" not in model_py

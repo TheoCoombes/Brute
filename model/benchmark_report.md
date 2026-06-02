@@ -1,4 +1,10 @@
-# HÆMMR Benchmark Matrix Report
+# HÆMMR v1 Benchmark Matrix Report (Historical)
+
+> This report is retained as the v1 failure baseline that motivated the v2
+> architecture now implemented in `model.py`/`layers.py`. It describes the old
+> position-bound decode path, BSR-only exact-recall attempt, and static Hopfield
+> role before episodic slot memory, delta-BSR writes, hierarchical address-lane
+> positions, and concept-to-lexical decode were added.
 
 Generated from:
 
@@ -21,9 +27,9 @@ recovery, small VSA records, BSR streaming, and controlled Hopfield lookup all
 pass cleanly. The architecture also solves a transformer-style induction task at
 length 64.
 
-The major gap is selective content retrieval. HÆMMR fails marker/copy tasks that
+The major gap is selective content retrieval. HÆMMR v1 fails marker/copy tasks that
 a tiny causal Transformer solves exactly. This is the clearest evidence that the
-current BSR + static Hopfield path is not yet equivalent to transformer
+old BSR + static Hopfield path is not equivalent to transformer
 attention. It can learn associative sequence patterns, but not robust arbitrary
 key-value retrieval under distractors.
 
@@ -90,8 +96,9 @@ Best small run available:
 | Validation perplexity | 244.67 | 250.92 |
 | Validation accuracy | 0.0106 | 0.0073 |
 
-Config: D=256, one block, vocab cap 512, `position_decode=next_unbind`,
-normal batches, no local megabatching.
+Config: D=256, one block, vocab cap 512, v1 `position_decode=next_unbind`,
+normal batches, no local megabatching. v2 removed this decode mode by keeping
+the decoded concept stream position-free.
 
 Qualitative sample is phrase-fragment level: it contains local word patterns
 such as "on the", "a city", "first", "in that", but not coherent sentences.
@@ -101,7 +108,7 @@ such as "on the", "a city", "first", "in that", but not coherent sentences.
 These deviations were made because the paper formula either failed in code or
 created a testable pathology.
 
-| Area | Paper | Current implementation | Reason |
+| Area | Paper | v1 implementation measured here | Reason |
 |---|---|---|---|
 | BSR K/V/Q | Diagonal binding masks `c⊗W_K`, `c⊗W_V`, `c⊗W_Q` | Dense 1-bit Boolean projections via XNOR/popcount/sign | Diagonal K/V cancels content: `(c⊗W_K)⊗(c⊗W_V)=W_K⊗W_V`. |
 | BSR timing | Write current association then read `S_i` | Read prior causal state, then write current association | Prevents current token from dominating the context branch. |
@@ -141,6 +148,11 @@ Subsequent work in this iteration:
 - Replaced hot forward matmuls with `brute.fast.matmul`.
 - Added component tests, efficiency contracts, synthetic probes, WikiText probes,
   and this benchmark matrix.
+
+Later v2 work supersedes the retrieval/decode items above: it adds
+`EpisodicSlotMemory`, delta-corrected BSR writes, hierarchical position codes in
+the address lane only, concept-to-lexical decode, optional semantic rerank, BEF
+codebook initialization for small models, and address-margin supervision.
 
 ## Where HÆMMR Excels
 
@@ -195,4 +207,3 @@ selective content-addressed retrieval. Until marker/copy retrieval reaches
 transformer-like accuracy, scaling the language model will mostly improve
 frequency modeling and induction-like patterns, not robust sentence-level
 context use.
-

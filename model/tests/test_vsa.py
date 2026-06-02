@@ -3,7 +3,8 @@ import torch
 import pytest
 
 import brute
-from vsa import (bind, bind_pm1, bundle3, hamming_similarity, position_codes,
+from vsa import (binary_equiangular_frame, bind, bind_pm1, bundle3,
+                 hamming_similarity, hierarchical_position_codes, position_codes,
                  random_hypervectors, sign_to_bit1, to_bit1, to_pm1)
 
 
@@ -84,6 +85,19 @@ def test_position_codes_are_rolls():
         assert torch.equal(cp[i], torch.roll(base, i))
 
 
+def test_hierarchical_position_codes_factor_chunk_and_offset():
+    D, n, chunk = 64, 10, 4
+    g = torch.Generator().manual_seed(36)
+    chunk_base = (torch.randint(0, 2, (D,), generator=g) * 2 - 1).float()
+    offset_base = (torch.randint(0, 2, (D,), generator=g) * 2 - 1).float()
+    codes = hierarchical_position_codes(chunk_base, offset_base, n, chunk=chunk)
+    cp = to_pm1(codes)
+    for i in range(n):
+        b, o = divmod(i, chunk)
+        ref = torch.roll(chunk_base, b) * torch.roll(offset_base, o)
+        assert torch.equal(cp[i], ref)
+
+
 def test_position_bind_unbind_is_exact():
     D = 512
     g = torch.Generator().manual_seed(34)
@@ -93,6 +107,24 @@ def test_position_bind_unbind_is_exact():
     dressed = bind(token, pos[5:6])
     recovered = bind(dressed, pos[5:6])
     assert torch.equal(to_pm1(recovered), to_pm1(token))
+
+
+def test_binary_equiangular_frame_shape_and_balance():
+    frame = binary_equiangular_frame(
+        12, 64, n_sweeps=3, generator=torch.Generator().manual_seed(37))
+    assert frame.shape == (12, 64)
+    assert set(frame.unique().tolist()) <= {-1.0, 1.0}
+    sim = frame @ frame.t()
+    assert torch.equal(torch.diag(sim), torch.full((12,), 64.0))
+    off = sim[~torch.eye(12, dtype=torch.bool)]
+    assert off.abs().max() < 64
+
+
+def test_binary_equiangular_frame_large_inline_fallback():
+    frame = binary_equiangular_frame(
+        16, 32, generator=torch.Generator().manual_seed(38), max_optimized_codes=4)
+    assert frame.shape == (16, 32)
+    assert set(frame.unique().tolist()) <= {-1.0, 1.0}
 
 
 def test_crosstalk_noise_shrinks_with_dimension():

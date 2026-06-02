@@ -54,6 +54,19 @@ def make_batch(task: str, batch_size: int, seq_len: int, *, device="cpu"):
     return X, Y
 
 
+def matched_slots(task: str, X: torch.Tensor) -> torch.Tensor:
+    """Local slot targets for the v2 episodic address-margin objective."""
+    B, n = X.shape
+    matched = torch.full((B, n), -1, dtype=torch.long, device=X.device)
+    if task in ("marker", "copy"):
+        matched[:, -2] = 0
+    elif task == "induction":
+        matched[:, -2] = 1
+    else:
+        raise ValueError(f"unknown task {task!r}")
+    return matched
+
+
 def eval_model(model, task: str, seq_len: int, *, device="cpu", batches=4, batch_size=256):
     tot_acc = tot_loss = tot = 0.0
     with torch.no_grad():
@@ -71,14 +84,15 @@ def run_haemmr(task: str, seq_len: int, args):
     cfg = HaemmrConfig(
         vocab_size=16, D=args.D, n_layers=args.layers, d_ff=args.d_ff,
         n_slots=args.slots, top_k=args.top_k, seed=args.seed,
-        use_position=False, gate_open=args.gate_open,
+        use_position=args.use_position, gate_open=args.gate_open,
         codebook_flip_scale=args.codebook_flip_scale,
     )
     model = HaemmrLM(cfg, device=args.device)
     opt = BoldOptimizer(model.parameters(), BoldConfig(eta=args.eta, threshold=args.threshold))
     for _ in range(args.steps):
         X, Y = make_batch(task, args.batch_size, seq_len, device=args.device)
-        model.loss_and_backward(model.forward(X), Y)
+        matched = matched_slots(task, X) if args.margin_supervision else None
+        model.loss_and_backward(model.forward(X), Y, matched=matched)
         opt.step()
     return eval_model(model, task, seq_len, device=args.device)
 
@@ -139,6 +153,11 @@ def main():
     p.add_argument("--threshold", type=float, default=8.0)
     p.add_argument("--gate-open", type=float, default=0.05)
     p.add_argument("--codebook-flip-scale", type=float, default=0.5)
+    p.add_argument("--no-position", dest="use_position", action="store_false", default=True,
+                   help="disable hierarchical positions in the episodic address lane")
+    p.add_argument("--no-margin-supervision", dest="margin_supervision",
+                   action="store_false", default=True,
+                   help="disable local matched-slot supervision for synthetic retrieval probes")
     p.add_argument("--baseline", action="store_true")
     p.add_argument("--baseline-steps", type=int, default=300)
     p.add_argument("--baseline-dim", type=int, default=64)
@@ -169,4 +188,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

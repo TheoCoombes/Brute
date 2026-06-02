@@ -86,10 +86,9 @@ def main():
     print(f"tokens_per_s={n_tok / max(dt, 1e-9):.1f}")
     for k, v in counts.items():
         print(f"{k}={v}")
-    print("known_unpack_hotspots=Boolean backward caches, BSR vote state, Hopfield majority")
-    print("next_fusion_target=packed association-to-int accumulator / packed majority")
+    print("known_unpack_hotspots=BSR and episodic score/vote accumulators")
+    print("next_fusion_target=fused packed recurrence and episodic top-k kernels")
 
 
 if __name__ == "__main__":
     main()
-

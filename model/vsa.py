@@ -72,6 +72,13 @@ def bind(a: brute.Tensor, b: brute.Tensor) -> brute.Tensor:
     return brute.fast.eq(a, b)
 
 
+def unbind(a: brute.Tensor, b: brute.Tensor) -> brute.Tensor:
+    """``a ⊘ b`` — the inverse of binding.  XNOR is its own inverse, so this is
+    literally :func:`bind`; the alias exists so call-sites that *recover* a
+    position-free value from a bound key (HÆMMR v2 §A) read clearly."""
+    return brute.fast.eq(a, b)
+
+
 def bind_pm1(a_pm1: torch.Tensor, b_pm1: torch.Tensor) -> torch.Tensor:
     """Binding in the ±1 domain — plain elementwise product."""
     return a_pm1 * b_pm1
@@ -119,6 +126,32 @@ def position_codes(base_pm1: torch.Tensor, n: int) -> brute.Tensor:
     return to_bit1(rolled)
 
 
+def hierarchical_position_codes(chunk_base_pm1: torch.Tensor, offset_base_pm1: torch.Tensor,
+                                n: int, *, chunk: int = 256) -> brute.Tensor:
+    """Gemini's hierarchical positional binding (HÆMMR v2 §A).
+
+    Factor ``i = b·C + o`` (chunk ``b``, offset ``o``) over two *orthogonal*
+    bases and bind::
+
+        POS_i = ρ^b(P_chunk) ⊗ ρ^o(P_offset)
+
+    A single cyclic shift ``ρ^i`` develops harmonics/wrap-around over long
+    contexts (so ``POS_10000`` can spuriously correlate with ``POS_10``); the
+    two-level factorisation gives non-overlapping positional codes over ``C·D``
+    tokens while living entirely in the address lane (never decoded).  Returns
+    ``(n, D)`` bit1.
+    """
+    D = chunk_base_pm1.shape[-1]
+    dev = chunk_base_pm1.device
+    i = torch.arange(n, device=dev)
+    b = (i // chunk).unsqueeze(1)                                           # (n,1)
+    o = (i % chunk).unsqueeze(1)                                            # (n,1)
+    didx = torch.arange(D, device=dev).unsqueeze(0)                         # (1,D)
+    chunk_rolled = chunk_base_pm1[(didx - b) % D]                           # (n,D) ρ^b
+    offset_rolled = offset_base_pm1[(didx - o) % D]                         # (n,D) ρ^o
+    return to_bit1(chunk_rolled * offset_rolled)                            # bind in ±1
+
+
 def random_hypervectors(num: int, D: int, *, generator: torch.Generator | None = None,
                         device=None) -> brute.Tensor:
     """``num`` independent uniform-random ±1 hypervectors as a bit1 tensor."""
@@ -134,3 +167,79 @@ def hamming_similarity(q_bit: brute.Tensor, keys_bit: brute.Tensor) -> torch.Ten
     Returns an int32 ``(M, N)`` similarity matrix via the fused bit1 matmul.
     """
     return brute.fast.matmul(q_bit, keys_bit)
+
+
+# ── Binary Equiangular Frame (structured codebook) ─────────────────────────────
+
+def binary_equiangular_frame(C: int, D: int, *, alpha: float = 1.0, n_sweeps: int = 30,
+                             generator: torch.Generator | None = None,
+                             tol: float = 1e-6, max_cells: int = 80_000_000,
+                             max_optimized_codes: int = 512,
+                             verbose: bool = False) -> torch.Tensor:
+    """Build ``C`` maximally- and uniformly-separated ±1 codes in ``H_D`` (BEP App. C).
+
+    Minimises ``J = Σ_{i<j}⟨ρ_i,ρ_j⟩ + α·Var_{i<j}(⟨ρ_i,ρ_j⟩)`` (BEP Eq. 13) by
+    greedy coordinate flips: the first term pushes every pair toward maximal
+    Hamming separation (negative inner product), the second makes the spacing
+    *uniform* (equiangular).  Replacing HÆMMR's random token codebook with a BEF
+    removes the anomalously-close pairs that drive decode collisions (v2 §C1).
+
+    Returns a ``(C, D)`` float ±1 tensor.  This inline implementation is meant
+    for tests and small local models; production-scale vocabularies should use
+    an offline precompute.  It falls back to a random balanced frame when the
+    greedy optimiser would be too expensive for interactive startup.
+    """
+    if C < 2 or C * D > max_cells or C > max_optimized_codes:
+        bits = torch.randint(0, 2, (C, D), generator=generator)
+        return bits.float() * 2 - 1
+
+    rho = (torch.randint(0, 2, (C, D), generator=generator).float() * 2 - 1)    # (C,D)
+    G = rho @ rho.t()                                                           # (C,C)
+    P = C * (C - 1) / 2.0
+    off = ~torch.eye(C, dtype=torch.bool)
+    Ssum = G[off].sum() / 2.0                                                   # Σ_{i<j} G_ij
+    Q = (G[off] ** 2).sum() / 2.0                                              # Σ_{i<j} G_ij²
+
+    def cost(Ssum, Q):
+        mu = Ssum / P
+        var = Q / P - mu * mu
+        return Ssum + alpha * var
+
+    order_gen = generator
+    for sweep in range(n_sweeps):
+        flips = 0
+        perm = torch.randperm(C, generator=order_gen)
+        for i in perm.tolist():
+            s = rho[i]                                                          # (D,) ±1
+            mask = off[i]                                                       # (C,) j≠i
+            rho_rest = rho[mask]                                                # (C-1,D)
+            w = G[i][mask]                                                      # (C-1,)
+            colsum = rho_rest.sum(dim=0)                                        # (D,)  Σ_{j≠i} ρ_j[k]
+            wrho = w @ rho_rest                                                 # (D,)  Σ_{j≠i} G_ij ρ_j[k]
+            dSsum = -2.0 * s * colsum                                           # (D,)
+            dQ = -4.0 * s * wrho + 4.0 * (C - 1)                               # (D,)
+            new_Ssum = Ssum + dSsum
+            new_Q = Q + dQ
+            mu = new_Ssum / P
+            new_cost = new_Ssum + alpha * (new_Q / P - mu * mu)
+            base = cost(Ssum, Q)
+            gain = new_cost - base                                             # (D,)
+            k = int(torch.argmin(gain).item())
+            if gain[k] < -tol:
+                # apply flip of coordinate k of code i
+                sk = s[k].item()
+                delta = (-2.0 * sk) * rho[:, k]                                 # (C,) change to G[i,:]
+                delta[i] = 0.0
+                G[i] += delta
+                G[:, i] += delta
+                rho[i, k] = -sk
+                Ssum = Ssum + dSsum[k]
+                Q = Q + dQ[k]
+                flips += 1
+        if verbose:
+            mu = (Ssum / P).item()
+            var = (Q / P - mu * mu)
+            print(f"  BEF sweep {sweep}: flips={flips} mean_sim={mu:.2f} std_sim={var**0.5:.2f}")
+        if flips == 0:
+            break
+    return rho

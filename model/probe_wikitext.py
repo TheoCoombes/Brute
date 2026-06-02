@@ -2,8 +2,8 @@
 
 This script wraps train.py so probes use the same training code as normal runs.
 By default it runs two short probes:
-  1. no position binding
-  2. position binding with next-position unbind decode
+  1. content-only episodic addressing
+  2. hierarchical position codes in the episodic address lane
 
 Use --final to run a longer final model with the better probe setting.
 """
@@ -66,8 +66,6 @@ def train_cmd(args, name: str, *, positioned: bool, steps: int, D: int, layers: 
     ]
     if not positioned:
         cmd.append("--no-position")
-    else:
-        cmd.extend(["--position-decode", "next_unbind"])
     return cmd, csv_path, ckpt_path
 
 
@@ -102,7 +100,7 @@ def main():
     args = p.parse_args()
 
     probes = []
-    for name, positioned in [("probe_no_position", False), ("probe_position_next_unbind", True)]:
+    for name, positioned in [("probe_content_only", False), ("probe_positioned_address", True)]:
         cmd, csv_path, ckpt_path = train_cmd(
             args, name, positioned=positioned, steps=args.probe_steps,
             D=args.D, layers=args.layers,
@@ -126,4 +124,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

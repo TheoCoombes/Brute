@@ -4,8 +4,9 @@ import pytest
 
 import brute
 from bold import BoldConfig, BoldOptimizer
-from layers import (BSR, BooleanLinear, DiagBind, HopfieldBank, ResidualMerge,
-                    TokenCodebook, bind_mask)
+from layers import (BSR, BooleanLinear, DiagBind, EpisodicSlotMemory,
+                    HopfieldBank, ResidualMerge, TokenCodebook, bind_mask,
+                    pow2_decay_palette)
 from vsa import bind, hamming_similarity, random_hypervectors, to_bit1, to_pm1
 
 
@@ -115,6 +116,12 @@ class TestResidualMerge:
 
 
 class TestBSR:
+    def test_pow2_decay_palette_uses_shift_multipliers(self):
+        decay = pow2_decay_palette(10, shifts=(1, 2, 0))
+        assert torch.equal(decay[:4], torch.full((4,), 0.5))
+        assert torch.equal(decay[4:7], torch.full((3,), 0.75))
+        assert torch.equal(decay[7:], torch.ones(3))
+
     def test_forward_matches_recurrence_reference(self):
         bsr = BSR(128, name="bsr", generator=torch.Generator().manual_seed(10))
         c = random_hypervectors(2 * 12, 128,
@@ -127,10 +134,14 @@ class TestBSR:
         assoc = k * v
         A = torch.zeros(2, 128)
         S = torch.empty(2, 12, 128)
+        gate = torch.empty(2, 12, 128)
         for i in range(12):
             S[:, i, :] = torch.where(A >= 0, 1.0, -1.0)
-            A = bsr.gamma * A + assoc[:, i, :]
+            pred = k[:, i, :] * S[:, i, :]
+            gate[:, i, :] = (pred != v[:, i, :]).float()
+            A = bsr.decay * A + gate[:, i, :] * assoc[:, i, :]
         r_ref = q * S
+        assert torch.equal(bsr._cache["gate"], gate)
         assert torch.equal(to_pm1(r), r_ref)
 
     def test_recurrence_is_sensitive_to_prefix_content(self):
@@ -179,6 +190,94 @@ class TestBSR:
         assert g.shape == (2, 8, 64)
         for p in bsr.params():
             assert torch.any(p.q != 0)
+
+
+class _FixedProjection:
+    def __init__(self, out_bit):
+        self.out_bit = out_bit
+
+    def forward(self, a_bit):
+        flat = self.out_bit.reshape(a_bit.shape[0], a_bit.shape[-1])
+        return flat, torch.zeros(a_bit.shape[0], a_bit.shape[-1])
+
+    def backward(self, S):
+        return torch.zeros_like(S)
+
+    def params(self):
+        return []
+
+
+class TestEpisodicSlotMemory:
+    def test_controlled_top1_read_is_causal_and_exact(self):
+        D, n = 64, 4
+        g = torch.Generator().manual_seed(41)
+        payload = random_hypervectors(n, D, generator=g).reshape(1, n, D)
+        keys = random_hypervectors(n, D, generator=g).reshape(1, n, D)
+        queries = random_hypervectors(n, D, generator=g).reshape(1, n, D)
+        queries_pm1 = to_pm1(queries)
+        queries_pm1[0, 3] = to_pm1(keys)[0, 1]    # t=3 should retrieve slot 1
+        queries = to_bit1(queries_pm1)
+        pos = to_bit1(torch.ones(n, D))
+        neutral = to_bit1(torch.ones(1, n, D))
+
+        mem = EpisodicSlotMemory(D, name="epi", read_k=1)
+        mem.Kc = _FixedProjection(keys)
+        mem.Qc = _FixedProjection(queries)
+        mem.Qp = _FixedProjection(neutral)
+
+        out = mem.forward(payload, pos)
+        out_pm1 = to_pm1(out)
+        assert torch.equal(out_pm1[0, 0], to_pm1(payload)[0, 0])  # no prior slot -> identity
+        assert torch.equal(out_pm1[0, 3], to_pm1(payload)[0, 1])
+
+    def test_batched_read_respects_configured_window(self):
+        D, n = 64, 4
+        g = torch.Generator().manual_seed(42)
+        payload = random_hypervectors(n, D, generator=g).reshape(1, n, D)
+        keys = random_hypervectors(n, D, generator=g).reshape(1, n, D)
+        queries = random_hypervectors(n, D, generator=g).reshape(1, n, D)
+        queries_pm1 = to_pm1(queries)
+        queries_pm1[0, 3] = to_pm1(keys)[0, 1]    # outside a one-slot window at t=3
+        queries = to_bit1(queries_pm1)
+        pos = to_bit1(torch.ones(n, D))
+        neutral = to_bit1(torch.ones(1, n, D))
+
+        mem = EpisodicSlotMemory(D, name="epi", read_k=1, n_slots=1)
+        mem.Kc = _FixedProjection(keys)
+        mem.Qc = _FixedProjection(queries)
+        mem.Qp = _FixedProjection(neutral)
+
+        out = mem.forward(payload, pos)
+        assert not torch.equal(to_pm1(out)[0, 3], to_pm1(payload)[0, 1])
+
+    def test_streaming_matches_batched_forward(self):
+        D, n = 96, 12
+        g = torch.Generator().manual_seed(43)
+        mem = EpisodicSlotMemory(D, name="epi", read_k=1, generator=g)
+        c = random_hypervectors(2 * n, D, generator=g).reshape(2, n, D)
+        pos = random_hypervectors(n, D, generator=g)
+
+        batched = mem.forward(c, pos)
+        mem.reset_stream(2, n)
+        streamed = [mem.step(c[:, i, :], pos[i], n) for i in range(n)]
+        streamed = to_bit1(torch.stack([to_pm1(x) for x in streamed], dim=1))
+        assert torch.equal(to_pm1(streamed), to_pm1(batched))
+
+    def test_backward_and_margin_update_address_projections(self):
+        D, n = 64, 5
+        g = torch.Generator().manual_seed(44)
+        mem = EpisodicSlotMemory(D, name="epi", read_k=1, generator=g)
+        c = random_hypervectors(2 * n, D, generator=g).reshape(2, n, D)
+        pos = random_hypervectors(n, D, generator=g)
+        mem.forward(c, pos)
+        g_c = mem.backward(torch.randn(2, n, D))
+        assert g_c.shape == (2, n, D)
+        matched = torch.tensor([[-1, 0, 1, 2, 3], [-1, 0, 1, 2, 3]])
+        margin = mem.margin_loss(matched, theta_pos=1.0, theta_neg=-1.0)
+        assert margin >= 0.0
+        assert torch.any(mem.Kc.W.q != 0)
+        assert torch.any(mem.Qc.W.q != 0)
+        assert torch.any(mem.Qp.W.q != 0)
 
 
 class TestHopfield:

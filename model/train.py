@@ -1,8 +1,9 @@
 """Train a HÆMMR binary language model on WikiText with the GPT-2 tokenizer.
 
-Everything is 1-bit: the codebook, binding masks, Hopfield slots, channel-mix
-weights and residual gates are all ``brute.bit1`` and trained by BOLD bit-flips
-(no floating-point latent weights).  Runs locally on a Mac CPU.
+Everything is 1-bit: the codebook, binding masks, episodic address projections,
+Hopfield slots, channel-mix weights and residual gates are all ``brute.bit1``
+and trained by BOLD bit-flips (no floating-point latent weights). Runs locally
+on a Mac CPU.
 
 Quick start (a few minutes)::
 
@@ -95,6 +96,10 @@ def main():
     p.add_argument("--d-ff", type=int, default=2048)
     p.add_argument("--slots", type=int, default=256, help="Hopfield bank slots M.")
     p.add_argument("--top-k", type=int, default=15, help="Hopfield WTA width (odd).")
+    p.add_argument("--epi-slots", type=int, default=None,
+                   help="episodic exact-recall window; default = full sequence during training.")
+    p.add_argument("--epi-read-k", type=int, default=1,
+                   help="episodic top-k read width (1 = exact single-slot).")
     p.add_argument("--seq-len", type=int, default=64)
     p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--steps", type=int, default=1500, help="number of optimiser (flip) steps.")
@@ -107,9 +112,17 @@ def main():
                    help="anneal η geometrically to this value by the last step.")
     p.add_argument("--log-csv", default=None, help="append the loss curve to this CSV file.")
     p.add_argument("--no-position", dest="use_position", action="store_false", default=True,
-                   help="don't bind ρ^i(POS); let order come from the BSR decay (RWKV-style).")
-    p.add_argument("--position-decode", default=None, choices=["none", "next_unbind"],
-                   help="decode positioned concepts safely; default is next_unbind when positions are on.")
+                   help="disable hierarchical position codes in the episodic address lane.")
+    p.add_argument("--no-structured-codebook", dest="structured_codebook",
+                   action="store_false", default=True,
+                   help="use random token codes instead of the small-model BEF initializer.")
+    p.add_argument("--bef-sweeps", type=int, default=30)
+    p.add_argument("--sem-weight", type=float, default=0.5,
+                   help="semantic rerank weight added to lexical decode logits.")
+    p.add_argument("--boundary-nu", type=float, default=None,
+                   help="BEP-style boundary eligibility gate; unset disables it.")
+    p.add_argument("--label-smoothing", type=float, default=0.0)
+    p.add_argument("--flip-dropout", type=float, default=0.0)
     p.add_argument("--gate-open", type=float, default=0.05,
                    help="residual-gate init openness (higher ⇒ context flows sooner).")
     p.add_argument("--codebook-flip-scale", type=float, default=0.3,
@@ -152,9 +165,15 @@ def main():
 
     cfg = HaemmrConfig(vocab_size=V, D=args.D, n_layers=args.layers, d_ff=args.d_ff,
                        n_slots=args.slots, top_k=args.top_k, seed=args.seed,
+                       epi_slots=args.epi_slots, epi_read_k=args.epi_read_k,
                        use_position=args.use_position, gate_open=args.gate_open,
+                       structured_codebook=args.structured_codebook,
+                       bef_sweeps=args.bef_sweeps, sem_weight=args.sem_weight,
+                       boundary_nu=args.boundary_nu,
+                       label_smoothing=args.label_smoothing,
+                       flip_dropout=args.flip_dropout,
                        codebook_flip_scale=args.codebook_flip_scale,
-                       position_decode=args.position_decode)
+                       )
     model = HaemmrLM(cfg, device=device)
     opt = BoldOptimizer(model.parameters(),
                         BoldConfig(eta=args.eta, eta_decay=eta_decay,
