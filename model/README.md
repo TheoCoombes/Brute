@@ -104,6 +104,10 @@ Useful flags:
   mitigations.
 * `--eta`, `--threshold`, `--m-clip`: BOLD flip accumulator controls.
 
+For multi-layer WikiText runs, start with `--boundary-nu 0.5`. Without the
+boundary eligibility mask, deeper stacks can accumulate noisy BooleanLinear
+signals and show rising validation loss after an initially promising drop.
+
 The inline BEF initializer is intentionally capped for interactive startup; for
 large vocabularies it falls back to random balanced codes. A production-scale
 BEF should be precomputed offline and loaded as the codebook.

@@ -34,7 +34,7 @@ class _LazyPM1Cache(dict):
         self._pm1_sources = pm1_sources or {}
 
     def __getitem__(self, key):
-        if key not in self and key in self._pm1_sources:
+        if not super().__contains__(key) and key in self._pm1_sources:
             bit_key, shape = self._pm1_sources[key]
             value = to_pm1(super().__getitem__(bit_key))
             if shape is not None:
@@ -42,6 +42,12 @@ class _LazyPM1Cache(dict):
             super().__setitem__(key, value)
             return value
         return super().__getitem__(key)
+
+    def __contains__(self, key):
+        return super().__contains__(key) or key in self._pm1_sources
+
+    def get(self, key, default=None):
+        return self[key] if key in self else default
 
 
 # ── packed broadcast binding (c ⊗ mask) ───────────────────────────────────────
@@ -200,6 +206,15 @@ def _broadcast_like(vec_bit: brute.Tensor, ref_bit: brute.Tensor) -> brute.Tenso
     return _BT._make_bit1_from_packed(pv_b, list(ref_bit.shape))
 
 
+def _batched_similarity(q_bit: brute.Tensor, key_bit: brute.Tensor) -> torch.Tensor:
+    """Batched ``<q, key>`` using packed XNOR-popcount per batch row."""
+    B = int(q_bit.shape[0])
+    return torch.stack(
+        [brute.fast.matmul(q_bit[b], key_bit[b]) for b in range(B)],
+        dim=0,
+    )
+
+
 # ── Token codebook (shared input embedding + output decoder) ───────────────────
 
 class TokenCodebook:
@@ -306,10 +321,11 @@ class HopfieldBank:
         qU.index_add_(0, flat_idx,
                       S_read.unsqueeze(1).expand(Mtok, kk, self.D).reshape(-1, self.D))
         self.U.add_signal(qU)
-        # Hebbian: keys drift toward the queries that select them.
+        # Hebbian key specialisation in BOLD's minimise-loss convention:
+        # a negative query signal flips only bits that disagree with the query.
         qP = torch.zeros_like(self.P.q)
         qP.index_add_(0, flat_idx,
-                      q_pm1.unsqueeze(1).expand(Mtok, kk, self.D).reshape(-1, self.D))
+                      -q_pm1.unsqueeze(1).expand(Mtok, kk, self.D).reshape(-1, self.D))
         self.P.add_signal(qP)
         return torch.zeros_like(S_read)
 
@@ -372,19 +388,16 @@ class EpisodicSlotMemory:
         kc_bit, _ = self.Kc.forward(c_flat)
         qc_bit, _ = self.Qc.forward(c_flat)
         qp_bit, _ = self.Qp.forward(c_flat)
-        kc = to_pm1(kc_bit).reshape(B, n, D)
-        qc = to_pm1(qc_bit).reshape(B, n, D)
-        qp = to_pm1(qp_bit).reshape(B, n, D)
-        c_pm1 = to_pm1(c_bit)                                   # payload (verbatim concept)
+        kc_bit = kc_bit.reshape(B, n, D)
+        qc_bit = qc_bit.reshape(B, n, D)
+        qp_bit = qp_bit.reshape(B, n, D)
         if pos_bit is None:
-            pos = torch.ones(n, D, dtype=torch.float32, device=c_bit.device)
-        else:
-            pos = to_pm1(pos_bit)                               # (n,D) positional keys
+            pos_bit = brute.ones(n, D, dtype=brute.bit1, device=c_bit.device)
 
         # two-component score (content + position), causal read-before-write
-        content = torch.einsum("btd,bmd->btm", qc, kc)         # (B,n,n)
-        position = torch.einsum("btd,md->btm", qp, pos)        # (B,n,n)
-        score = content + position
+        content = _batched_similarity(qc_bit, kc_bit)          # (B,n,n)
+        position = brute.fast.matmul(qp_bit.reshape(B * n, D), pos_bit).reshape(B, n, n)
+        score = (content + position).to(torch.float32)
         t = torch.arange(n, device=c_bit.device).unsqueeze(1)
         m = torch.arange(n, device=c_bit.device).unsqueeze(0)
         causal = m < t
@@ -398,23 +411,45 @@ class EpisodicSlotMemory:
             topv, topi = score.max(dim=2, keepdim=True)       # argmax tie-breaks like streaming
         else:
             topv, topi = torch.topk(score, k=kk, dim=2)        # (B,n,kk)
-        # bundle the top-k source concepts (k=1 ⇒ exact single-slot read)
-        sel_pay = torch.gather(
-            c_pm1.unsqueeze(1).expand(B, n, n, D), 2,
-            topi.unsqueeze(-1).expand(B, n, kk, D))            # (B,n,kk,D)
         valid_top = topv > (neg / 2)
-        sel_pay = sel_pay * valid_top.unsqueeze(-1)
-        read = sel_pay.sum(dim=2)                              # integer vote
-        # position 0 (and any all-masked row) has no valid slot → identity read
         no_slot = ~valid_top.any(dim=2)                        # (B,n)
-        read = torch.where(no_slot.unsqueeze(-1), c_pm1, read)
-        read_bit = sign_to_bit1(read)
 
-        self._cache = {
-            "shape": (B, n, D), "kc": kc, "qc": qc, "qp": qp, "pos": pos,
-            "c_pm1": c_pm1, "score": score, "topi": topi, "no_slot": no_slot,
-            "causal": causal,
+        cache_data = {
+            "shape": (B, n, D), "kc_bit": kc_bit, "qc_bit": qc_bit,
+            "qp_bit": qp_bit, "pos_bit": pos_bit, "c_bit": c_bit,
+            "score": score, "topi": topi, "no_slot": no_slot, "causal": causal,
         }
+        pm1_sources = {
+            "kc": ("kc_bit", (B, n, D)),
+            "qc": ("qc_bit", (B, n, D)),
+            "qp": ("qp_bit", (B, n, D)),
+            "pos": ("pos_bit", (n, D)),
+            "c_pm1": ("c_bit", (B, n, D)),
+        }
+
+        if kk == 1:
+            # Exact single-slot read can gather whole packed rows directly.
+            packed = c_bit._packed_buf
+            Kp = int(packed.shape[-1])
+            idx = topi.squeeze(-1).clamp_min(0)
+            gathered = torch.gather(
+                packed, 1, idx.unsqueeze(-1).expand(B, n, Kp))
+            out_packed = torch.where(no_slot.unsqueeze(-1), packed, gathered)
+            read_bit = _BT._make_bit1_from_packed(out_packed.contiguous(), [B, n, D])
+        else:
+            # Multi-slot reads still need an integer vote over payload signs.
+            c_pm1 = to_pm1(c_bit)
+            cache_data["c_pm1"] = c_pm1
+            pm1_sources.pop("c_pm1")
+            sel_pay = torch.gather(
+                c_pm1.unsqueeze(1).expand(B, n, n, D), 2,
+                topi.unsqueeze(-1).expand(B, n, kk, D))        # (B,n,kk,D)
+            sel_pay = sel_pay * valid_top.unsqueeze(-1)
+            read = sel_pay.sum(dim=2)                          # integer vote
+            read = torch.where(no_slot.unsqueeze(-1), c_pm1, read)
+            read_bit = sign_to_bit1(read)
+
+        self._cache = _LazyPM1Cache(cache_data, pm1_sources=pm1_sources)
         return read_bit
 
     def _attn(self):
@@ -637,9 +672,8 @@ class BSR:
         k_bit = k_bit.reshape(B, n, D)
         v_bit = v_bit.reshape(B, n, D)
         q_bit = q_bit.reshape(B, n, D)
-        k_pm1 = to_pm1(k_bit)
-        v_pm1 = to_pm1(v_bit)
-        assoc_pm1 = k_pm1 * v_pm1                             # (B, n, D) bound association
+        assoc_bit = bind(k_bit, v_bit)
+        assoc_pm1 = to_pm1(assoc_bit)                         # (B, n, D) bound association
 
         decay = self.decay
         A = torch.zeros(B, D, dtype=torch.float32, device=c_bit.device)
@@ -648,18 +682,20 @@ class BSR:
         for i in range(n):
             Ssign = torch.where(A >= 0, 1.0, -1.0)
             S_state_pm1[:, i, :] = Ssign
-            pred = k_pm1[:, i, :] * Ssign                     # bundle's prediction for k_i
-            g_i = (pred != v_pm1[:, i, :]).to(torch.float32)  # disagreement gate
+            g_i = (Ssign != assoc_pm1[:, i, :]).to(torch.float32)
             gate[:, i, :] = g_i
             A = decay * A + g_i * assoc_pm1[:, i, :]
         S_state_bit = sign_to_bit1(S_state_pm1)
         self._cache = _LazyPM1Cache(
             {
                 "k_bit": k_bit, "v_bit": v_bit, "q_bit": q_bit,
-                "k_pm1": k_pm1, "v_pm1": v_pm1,
                 "S_state_pm1": S_state_pm1, "gate": gate, "shape": (B, n, D),
             },
-            pm1_sources={"q_pm1": ("q_bit", (B, n, D))},
+            pm1_sources={
+                "k_pm1": ("k_bit", (B, n, D)),
+                "v_pm1": ("v_bit", (B, n, D)),
+                "q_pm1": ("q_bit", (B, n, D)),
+            },
         )
         return bind(q_bit, S_state_bit)
 
@@ -711,12 +747,9 @@ class BSR:
         k_bit, _ = self.K.forward(c_bit)
         v_bit, _ = self.V.forward(c_bit)
         q_bit, _ = self.Q.forward(c_bit)
-        k_pm1 = to_pm1(k_bit)
-        v_pm1 = to_pm1(v_bit)
-        assoc_pm1 = k_pm1 * v_pm1
+        assoc_pm1 = to_pm1(bind(k_bit, v_bit))
         Ssign = torch.where(self._stream_A >= 0, 1.0, -1.0)
         r = bind(q_bit, sign_to_bit1(Ssign))
-        pred = k_pm1 * Ssign
-        g_i = (pred != v_pm1).to(torch.float32)
+        g_i = (Ssign != assoc_pm1).to(torch.float32)
         self._stream_A = self.decay * self._stream_A + g_i * assoc_pm1
         return r

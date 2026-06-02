@@ -300,6 +300,21 @@ class TestHopfield:
         assert torch.any(hb.U.q != 0)                    # payloads get loss signal
         assert torch.any(hb.P.q != 0)                    # keys get Hebbian signal
 
+    def test_hebbian_key_signal_pulls_selected_key_toward_query(self):
+        hb = HopfieldBank(64, n_slots=1, top_k=1, name="hop",
+                          generator=torch.Generator().manual_seed(12))
+        q = _rand_bits(1, 64, seed=13)
+        hb.P.bit = _rand_bits(1, 64, seed=14)
+        hb.P._pm1 = None
+        hb.forward(q)
+        hb.backward(torch.zeros(1, 64))
+        q_pm1 = to_pm1(q)
+        p_pm1 = hb.P.pm1
+        disagree = p_pm1 != q_pm1
+        agree = ~disagree
+        assert torch.equal(hb.P.q[disagree], p_pm1[disagree])
+        assert torch.equal(hb.P.q[agree], -p_pm1[agree])
+
     def test_controlled_slot_retrieval(self):
         hb = HopfieldBank(128, n_slots=8, top_k=1, name="hop",
                           generator=torch.Generator().manual_seed(12))

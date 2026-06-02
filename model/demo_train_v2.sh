@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Demo training script for the v2 architecture.
+# Demo training script for a small 2-layer v2 architecture.
 # Run from the repo root:
 #   bash model/demo_train_v2.sh
 
@@ -19,10 +19,10 @@ exec "$VENV_PY" "$ROOT_DIR/model/train.py" \
   --dataset wikitext-2 \
   --data-root "$ROOT_DIR/model/.data" \
   --vocab-cap 512 \
-  --max-train-tokens 500000 \
-  --D 1024 \
-  --layers 1 \
-  --d-ff 2048 \
+  --max-train-tokens 200000 \
+  --D 256 \
+  --layers 2 \
+  --d-ff 512 \
   --slots 64 \
   --top-k 5 \
   --epi-read-k 1 \
@@ -32,8 +32,9 @@ exec "$VENV_PY" "$ROOT_DIR/model/train.py" \
   --eta 3.0 \
   --threshold 8.0 \
   --eta-end 1.0 \
-  --eval-every 100 \
-  --sample-every 100 \
+  --boundary-nu 0.5 \
+  --eval-every 200 \
+  --sample-every 400 \
   --sample-len 40 \
   --temperature 0.8 \
   --sample-top-k 20 \

@@ -39,7 +39,7 @@ import brute
 from bold import BoldParam
 from layers import (
     BSR, BooleanLinear, DiagBind, EpisodicSlotMemory, HopfieldBank,
-    ResidualMerge, TokenCodebook,
+    ResidualMerge, TokenCodebook, _LazyPM1Cache,
 )
 from vsa import hierarchical_position_codes, to_pm1
 
@@ -325,21 +325,25 @@ class HaemmrLM:
         chat_flat = chat.reshape(B * n, D)
         ell_bit, _ = self.lex_proj.forward(chat_flat)           # ℓ̂ lexical frame
         lex_logits = self.codebook.decode(ell_bit)              # ⟨ℓ̂, E⟩
-        ell_pm1 = to_pm1(ell_bit)
 
-        sem_pm1 = None
+        sem_bit = None
         if self.cfg.sem_weight > 0:
             sem_bit = self.sem_bind.forward(chat_flat)          # ĉ ⊗ W_sem
             sem_logits = self.codebook.decode(sem_bit)
-            sem_pm1 = to_pm1(sem_bit)
             logits = lex_logits.float() + self.cfg.sem_weight * sem_logits.float()
         else:
             logits = lex_logits.float()
 
-        self._fwd_cache = {
-            "B": B, "n": n, "ell_pm1": ell_pm1, "sem_pm1": sem_pm1,
+        cache_data = {
+            "B": B, "n": n, "ell_bit": ell_bit, "sem_bit": sem_bit,
             "flip_masks": flip_masks, "cleanup": cleanup_cache,
         }
+        pm1_sources = {"ell_pm1": ("ell_bit", tuple(ell_bit.shape))}
+        if sem_bit is None:
+            cache_data["sem_pm1"] = None
+        else:
+            pm1_sources["sem_pm1"] = ("sem_bit", tuple(sem_bit.shape))
+        self._fwd_cache = _LazyPM1Cache(cache_data, pm1_sources=pm1_sources)
         return logits
 
     # ── loss + BOLD backward ─────────────────────────────────────────────────
