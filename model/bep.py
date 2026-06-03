@@ -1,7 +1,7 @@
 """BEP / BOLD native binary training — integer hidden weight, binary errors.
 
-This replaces the old STE-style float backprop (``bold.py``) with the learning
-machinery actually prescribed by the papers:
+This replaces the old STE-style float backprop with the learning machinery
+actually prescribed by the papers:
 
   * **BEP** (*Boolean error propagation*, 2512.04189 — Table 2, Eqs. 1-9): the
     backward signal is a **binary desired activation** ``a*`` propagated by

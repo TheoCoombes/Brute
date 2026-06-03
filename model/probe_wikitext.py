@@ -1,11 +1,11 @@
-"""Run small WikiText probes for position/no-position HÆMMR settings.
+"""Run small WikiText probes for content-only vs positioned HÆMMR settings.
 
-This script wraps train.py so probes use the same training code as normal runs.
-By default it runs two short probes:
+This wraps `train.py` so the probe uses the same current training code as the
+main CLI. By default it runs two short probes:
   1. content-only episodic addressing
   2. hierarchical position codes in the episodic address lane
 
-Use --final to run a longer final model with the better probe setting.
+Use `--final` to run a longer final model with the better probe setting.
 """
 
 from __future__ import annotations
@@ -42,8 +42,8 @@ def train_cmd(args, name: str, *, positioned: bool, steps: int, D: int, layers: 
         sys.executable, str(ROOT / "train.py"),
         "--dataset", args.dataset,
         "--data-root", args.data_root,
-        "--vocab-cap", str(args.vocab_cap),
         "--max-train-tokens", str(args.max_train_tokens),
+        "--codebook-mode", args.codebook_mode,
         "--D", str(D),
         "--layers", str(layers),
         "--d-ff", str(args.d_ff),
@@ -52,9 +52,13 @@ def train_cmd(args, name: str, *, positioned: bool, steps: int, D: int, layers: 
         "--seq-len", str(args.seq_len),
         "--batch-size", str(args.batch_size),
         "--steps", str(steps),
-        "--eta", str(args.eta),
-        "--threshold", str(args.threshold),
-        "--eta-end", str(args.eta_end),
+        "--r", str(args.r),
+        "--p-r", str(args.p_r),
+        "--bits", str(args.bits),
+        "--gate-open", str(args.gate_open),
+        "--flip-dropout", str(args.flip_dropout),
+        "--sem-weight", str(args.sem_weight),
+        "--bef-sweeps", str(args.bef_sweeps),
         "--eval-every", str(args.eval_every),
         "--sample-every", str(args.sample_every),
         "--sample-len", str(args.sample_len),
@@ -66,6 +70,8 @@ def train_cmd(args, name: str, *, positioned: bool, steps: int, D: int, layers: 
     ]
     if not positioned:
         cmd.append("--no-position")
+    if args.boundary_nu is not None:
+        cmd.extend(["--boundary-nu", str(args.boundary_nu)])
     return cmd, csv_path, ckpt_path
 
 
@@ -74,7 +80,6 @@ def main():
     p.add_argument("--out-dir", default="./runs")
     p.add_argument("--dataset", default="wikitext-2", choices=["wikitext-2", "wikitext-103"])
     p.add_argument("--data-root", default="./.data")
-    p.add_argument("--vocab-cap", type=int, default=1024)
     p.add_argument("--max-train-tokens", type=int, default=500000)
     p.add_argument("--probe-steps", type=int, default=350)
     p.add_argument("--final", action="store_true")
@@ -88,9 +93,18 @@ def main():
     p.add_argument("--top-k", type=int, default=7)
     p.add_argument("--seq-len", type=int, default=64)
     p.add_argument("--batch-size", type=int, default=32)
-    p.add_argument("--eta", type=float, default=3.0)
-    p.add_argument("--eta-end", type=float, default=1.0)
-    p.add_argument("--threshold", type=float, default=10.0)
+    p.add_argument("--r", type=float, default=0.1)
+    p.add_argument("--p-r", type=float, default=0.0)
+    p.add_argument("--bits", type=int, default=15)
+    p.add_argument("--gate-open", type=float, default=0.05)
+    p.add_argument("--flip-dropout", type=float, default=0.0)
+    p.add_argument("--sem-weight", type=float, default=0.5)
+    p.add_argument("--bef-sweeps", type=int, default=30)
+    p.add_argument("--boundary-nu", type=float, default=None)
+    p.add_argument("--codebook-mode", choices=("offline", "structured", "random"),
+                   default="offline",
+                   help="offline GPT-2 SimHash by default; structured = inline BEF; "
+                        "random = unstructured codebook.")
     p.add_argument("--eval-every", type=int, default=100)
     p.add_argument("--sample-every", type=int, default=250)
     p.add_argument("--sample-len", type=int, default=50)

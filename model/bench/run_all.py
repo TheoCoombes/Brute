@@ -1,4 +1,4 @@
-"""Main entry point: run experiment groups, update AGENTS.md."""
+"""Main entry point: run experiment groups and refresh benchmark-report.md."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from bench.experiments import ALL_EXPERIMENTS, EXPERIMENTS_BY_GROUP, GROUP_ORDER
-from bench.report import update_agents_md
+from bench.report import update_benchmark_report
 from bench.runner import RESULTS_DIR, load_results, run_group
 
 
@@ -50,8 +50,8 @@ def main() -> None:
     if args.dry_run:
         return
 
-    print("\nUpdating AGENTS.md ...")
-    update_agents_md(load_results())
+    print("\nUpdating benchmark-report.md ...")
+    update_benchmark_report(load_results())
     print("Done.")
 
 

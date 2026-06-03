@@ -44,7 +44,7 @@ IGNORE_INDEX = -1
 
 @dataclass
 class HaemmrConfig:
-    vocab_size: int = 2048
+    vocab_size: int = 50257              # GPT-2 tokenizer size; training overrides from data
     D: int = 1024                       # concept hypervector dimension
     n_layers: int = 2
     d_ff: int = 2048                    # channel-mix hidden width

@@ -1,21 +1,28 @@
 """Train a HÆMMR binary language model on WikiText with the GPT-2 tokenizer.
 
-Everything is 1-bit: the codebook, binding masks, episodic address projections,
-Hopfield slots, channel-mix weights and residual gates are all ``brute.bit1``
-and trained by BOLD bit-flips (no floating-point latent weights). Runs locally
-on a Mac CPU.
+The hot path stays packed-bit: the codebook, binding masks, episodic address
+projections, Hopfield slots, channel-mix weights, and residual gates all live
+as ``brute.bit1`` tensors. Training uses BEP/BOLD-style integer hidden weights
+(``bep.py``): each parameter stores an int16 ``H`` buffer, the visible weight is
+``sign(H)``, and the backward path threads binary desired activations instead of
+float gradients.
 
 Quick start (a few minutes)::
 
-    python train.py --steps 1500 --D 1024 --layers 2 --vocab-cap 2048 --seq-len 64
+    python train.py --steps 1500 --D 1024 --layers 2 --seq-len 64
 
 Useful flags::
 
-    --D            concept hypervector dim (bigger ⇒ better VSA geometry)
+    --D            concept hypervector dimension
     --layers       number of Boolean blocks
-    --vocab-cap    cap the 50k GPT-2 vocab to the top-N tokens (keeps decode fast)
-    --eta          BOLD accumulation rate η
-    --threshold    integrated evidence needed before a bit flips
+    --codebook-mode {offline,structured,random}
+                  offline GPT-2 SimHash by default; structured = inline BEF;
+                  random = unstructured codebook
+    --r            margin trigger fraction for lexical updates
+    --bits         hidden-weight clamp width
+    --gate-open    residual gate initial openness
+    --no-position  disable hierarchical position codes in the episodic lane
+    --sem-weight   semantic rerank weight added to lexical decode logits
     --device       cpu | mps | cuda  (default: auto)
 """
 
@@ -33,8 +40,11 @@ import torch
 import brute  # noqa: F401 — ensure the extension is importable
 
 from bep import BepConfig, BepOptimizer
-from data import OOV_ID, make_lm_batches, wikitext
+from data import make_lm_batches, wikitext
 from model import HaemmrConfig, HaemmrLM, IGNORE_INDEX
+
+
+CODEBOOK_MODES = ("offline", "structured", "random")
 
 
 def auto_device(choice):
@@ -73,11 +83,10 @@ def evaluate(model, X, Y, batch_size, max_batches=40):
             "ppl": float(torch.exp(torch.tensor(loss)).item())}
 
 
-def sample_demo(model, corpus, prompt, n_new, *, temperature, top_k, ban_oov, rep_window):
+def sample_demo(model, corpus, prompt, n_new, *, temperature, top_k, rep_window):
     ids = corpus.encode(prompt).unsqueeze(0).to(model.device)
-    ban = [OOV_ID] if ban_oov else None
     out = model.generate(ids, n_new, temperature=temperature, top_k=top_k,
-                         ban_ids=ban, repetition_window=rep_window)
+                         repetition_window=rep_window)
     new_ids = out[0, ids.shape[1]:].cpu()
     text = corpus.decode(new_ids).replace("\n", "\\n")
     return text
@@ -88,7 +97,6 @@ def main():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--dataset", default="wikitext-2", choices=["wikitext-2", "wikitext-103"])
     p.add_argument("--data-root", default="./.data")
-    p.add_argument("--vocab-cap", type=int, default=2048)
     p.add_argument("--max-train-tokens", type=int, default=None,
                    help="Truncate the training stream (faster local demo).")
     p.add_argument("--D", type=int, default=1024, help="Concept hypervector dim.")
@@ -111,12 +119,13 @@ def main():
     p.add_argument("--log-csv", default=None, help="append the loss curve to this CSV file.")
     p.add_argument("--no-position", dest="use_position", action="store_false", default=True,
                    help="disable hierarchical position codes in the episodic address lane.")
-    p.add_argument("--no-structured-codebook", dest="structured_codebook",
-                   action="store_false", default=True,
-                   help="use random token codes instead of the small-model BEF initializer.")
-    p.add_argument("--offline-codebook", action="store_true", default=False,
-                   help="initialise the codebook from GPT-2 pretrained embeddings "
-                        "(SimHash; semantically-structured, cached offline).")
+    p.add_argument(
+        "--codebook-mode",
+        choices=CODEBOOK_MODES,
+        default="offline",
+        help="offline GPT-2 SimHash by default; structured uses inline BEF; "
+             "random uses an unstructured codebook.",
+    )
     p.add_argument("--bef-sweeps", type=int, default=30)
     p.add_argument("--sem-weight", type=float, default=0.5,
                    help="semantic rerank weight added to lexical decode logits.")
@@ -141,13 +150,17 @@ def main():
     torch.manual_seed(args.seed)
     print(f"device: {device}")
 
-    print(f"loading {args.dataset} (vocab cap {args.vocab_cap}) …")
+    codebook_mode = args.codebook_mode
+    structured_codebook = codebook_mode != "random"
+    offline_codebook = codebook_mode == "offline"
+
+    print(f"loading {args.dataset} with full GPT-2 tokenizer (codebook={codebook_mode}) …")
     corpus = wikitext(name=args.dataset, data_root=args.data_root,
-                      vocab_cap=args.vocab_cap, max_train_tokens=args.max_train_tokens)
+                      max_train_tokens=args.max_train_tokens)
     V = corpus.vocab_size
-    Xtr, Ytr = make_lm_batches(corpus.train_ids, seq_len=args.seq_len, mask_oov=True,
+    Xtr, Ytr = make_lm_batches(corpus.train_ids, seq_len=args.seq_len,
                                seed=args.seed, shuffle=True)
-    Xva, Yva = make_lm_batches(corpus.val_ids, seq_len=args.seq_len, mask_oov=True,
+    Xva, Yva = make_lm_batches(corpus.val_ids, seq_len=args.seq_len,
                                seed=args.seed, shuffle=False)
     Xtr, Ytr = Xtr.to(device), Ytr.to(device)
     Xva, Yva = Xva.to(device), Yva.to(device)
@@ -159,14 +172,14 @@ def main():
                        n_slots=args.slots, top_k=args.top_k, seed=args.seed,
                        epi_slots=args.epi_slots, epi_read_k=args.epi_read_k,
                        use_position=args.use_position, gate_open=args.gate_open,
-                       structured_codebook=args.structured_codebook,
+                       structured_codebook=structured_codebook,
                        bef_sweeps=args.bef_sweeps, sem_weight=args.sem_weight,
                        boundary_nu=args.boundary_nu,
                        flip_dropout=args.flip_dropout,
                        r=args.r, p_r=args.p_r, bits=args.bits,
                        )
     codebook_init = None
-    if args.offline_codebook:
+    if offline_codebook:
         from codebook import from_corpus
         print(f"building offline GPT-2 SimHash codebook (D={args.D}) …")
         codebook_init = from_corpus(corpus, args.D, seed=args.seed,
@@ -229,7 +242,7 @@ def main():
         if args.sample_every and step % args.sample_every == 0:
             txt = sample_demo(model, corpus, args.prompt, args.sample_len,
                               temperature=args.temperature, top_k=args.sample_top_k,
-                              ban_oov=True, rep_window=args.rep_window)
+                              rep_window=args.rep_window)
             print(f"  sample[{args.prompt!r}]: {txt}")
 
     torch.save({"model": model.state_dict(), "opt": opt.state_dict(),

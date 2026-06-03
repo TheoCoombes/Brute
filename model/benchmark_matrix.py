@@ -107,9 +107,7 @@ def run_components(args):
     keys = random_hypervectors(16, D, generator=g)
     payloads = random_hypervectors(16, D, generator=g)
     hop.P.bit = keys
-    hop.P._pm1 = None
     hop.U.bit = payloads
-    hop.U._pm1 = None
     out = hop.forward(keys)
     hop_acc = float((to_pm1(out) == to_pm1(payloads)).float().mean())
     rows.append(_metric("component_hopfield", "controlled_top1_payload_bit_accuracy", hop_acc, "fraction"))
@@ -126,9 +124,11 @@ def run_synthetic(args):
     rows = []
     synth_args = SimpleNamespace(
         seed=args.seed, D=args.synthetic_D, layers=1, d_ff=2 * args.synthetic_D,
-        slots=32, top_k=3, device="cpu", eta=3.0, threshold=8.0,
-        gate_open=0.05, codebook_flip_scale=0.5, steps=args.haemmr_steps,
-        use_position=True, margin_supervision=True,
+        slots=32, top_k=3, epi_slots=None, epi_read_k=1, decay_shifts=(1, 2, 3, 4, 0),
+        device="cpu", gate_open=0.05, r=0.1, bits=15, flip_dropout=0.0,
+        codebook_mode="structured", bef_sweeps=30, sem_weight=0.5,
+        use_position=True, use_bsr=True, use_episodic=True, use_hopfield=True,
+        margin_supervision=True, steps=args.haemmr_steps,
         batch_size=64, baseline_steps=args.transformer_steps, baseline_dim=64,
         baseline_layers=2, baseline_lr=3e-3,
     )

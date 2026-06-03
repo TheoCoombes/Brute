@@ -5,6 +5,8 @@
 > position-bound decode path, BSR-only exact-recall attempt, and static Hopfield
 > role before episodic slot memory, delta-BSR writes, hierarchical address-lane
 > positions, and concept-to-lexical decode were added.
+>
+> The current auto-generated benchmark report lives in `benchmark-report.md`.
 
 Generated from:
 
@@ -96,7 +98,7 @@ Best small run available:
 | Validation perplexity | 244.67 | 250.92 |
 | Validation accuracy | 0.0106 | 0.0073 |
 
-Config: D=256, one block, vocab cap 512, v1 `position_decode=next_unbind`,
+Config: D=256, one block, 512-token reduced vocabulary, v1 `position_decode=next_unbind`,
 normal batches, no local megabatching. v2 removed this decode mode by keeping
 the decoded concept stream position-free.
 
@@ -124,7 +126,7 @@ created a testable pathology.
 The original handoff implemented the self-contained `model/` package:
 
 - `vsa.py`: packed bit1 VSA operations.
-- `bold.py`: BOLD parameter and optimizer machinery.
+- `bep.py`: BEP/BOLD parameter and optimizer machinery.
 - `layers.py`: BooleanLinear, DiagBind, TokenCodebook, HopfieldBank, BSR,
   gated residual merges.
 - `model.py`: HÆMMR stack, loss/backward, generation.

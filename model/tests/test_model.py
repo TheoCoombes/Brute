@@ -109,7 +109,7 @@ class TestLearning:
         torch.manual_seed(0)
         cycle, V = 8, 16
         ids = repeating_sequence(cycle=cycle, n_tokens=8192)
-        X, Y = make_lm_batches(ids, seq_len=16, mask_oov=False, shuffle=True)
+        X, Y = make_lm_batches(ids, seq_len=16, shuffle=True)
         m = tiny_model(V=V, D=256, L=L, d_ff=512)
         opt = BepOptimizer(m.parameters(), BepConfig(r=0.1))
         bs = 32

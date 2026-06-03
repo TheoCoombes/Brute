@@ -159,6 +159,7 @@ def eval_model(model, task: str, seq_len: int, *, device="cpu", batches=4, batch
 
 def run_haemmr(task: str, seq_len: int, args):
     torch.manual_seed(args.seed)
+    structured_codebook = args.codebook_mode != "random"
     cfg = HaemmrConfig(
         vocab_size=16, D=args.D, n_layers=args.layers, d_ff=args.d_ff,
         n_slots=args.slots, top_k=args.top_k, seed=args.seed,
@@ -166,7 +167,7 @@ def run_haemmr(task: str, seq_len: int, args):
         decay_shifts=args.decay_shifts,
         use_position=args.use_position, gate_open=args.gate_open, r=args.r,
         bits=args.bits, flip_dropout=args.flip_dropout,
-        structured_codebook=args.structured_codebook,
+        structured_codebook=structured_codebook,
         bef_sweeps=args.bef_sweeps, sem_weight=args.sem_weight,
         use_bsr=args.use_bsr, use_episodic=args.use_episodic,
         use_hopfield=args.use_hopfield,
@@ -243,10 +244,9 @@ def main():
     p.add_argument("--decay-shifts", type=lambda s: tuple(int(x) for x in s.split(",")),
                    default=(1, 2, 3, 4, 0),
                    help='comma-separated BSR decay shifts, e.g. "1,2,3,4,0"')
-    p.add_argument("--structured-codebook", dest="structured_codebook",
-                   action="store_true", default=True)
-    p.add_argument("--no-structured-codebook", dest="structured_codebook",
-                   action="store_false")
+    p.add_argument("--codebook-mode", choices=("structured", "random"),
+                   default="structured",
+                   help="structured = inline BEF; random = unstructured codebook.")
     p.add_argument("--bef-sweeps", type=int, default=30)
     p.add_argument("--no-bsr", dest="use_bsr", action="store_false", default=True)
     p.add_argument("--no-episodic", dest="use_episodic", action="store_false", default=True)

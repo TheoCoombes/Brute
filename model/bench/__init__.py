@@ -1,6 +1,6 @@
 """Benchmark helpers for HÆMMR synthetic validation."""
 
-from .report import update_agents_md
+from .report import update_benchmark_report
 from .runner import ExperimentResult, ExperimentSpec, load_results, run_group
 
 __all__ = [
@@ -8,5 +8,5 @@ __all__ = [
     "ExperimentSpec",
     "load_results",
     "run_group",
-    "update_agents_md",
+    "update_benchmark_report",
 ]

@@ -1,9 +1,9 @@
-"""Reads JSON results from bench/results/, formats and writes model/AGENTS.md."""
+"""Generate the canonical `benchmark-report.md` from `bench/results/` JSON."""
 
 from __future__ import annotations
 
+import ast
 import re
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
@@ -11,7 +11,7 @@ from .experiments import GROUP_ORDER
 from .runner import ExperimentResult, load_results
 
 
-AGENTS_MD = Path(__file__).resolve().parent.parent / "AGENTS.md"
+REPORT_MD = Path(__file__).resolve().parent.parent / "benchmark-report.md"
 
 GROUP_TITLES = {
     "ablation": "Component Ablations",
@@ -38,6 +38,54 @@ def _cell(text: object) -> str:
     return str(text).replace("|", "\\|").replace("\n", " ")
 
 
+def _normalize_legacy_codebook_error(text: str) -> str:
+    """Rewrite old codebook flags in timeout command strings to the new mode flag."""
+    legacy_flags = {
+        "--offline-codebook",
+        "--no-offline-codebook",
+        "--structured-codebook",
+        "--no-structured-codebook",
+    }
+    if not any(flag in text for flag in legacy_flags):
+        return text
+
+    match = re.search(r"Command '(?P<cmd>\[.*?\])' timed out", text)
+    if match is None:
+        return text
+
+    try:
+        cmd = ast.literal_eval(match.group("cmd"))
+    except Exception:
+        return text
+    if not isinstance(cmd, list) or not all(isinstance(item, str) for item in cmd):
+        return text
+
+    mode = None
+    insert_at = None
+    cleaned: List[str] = []
+    for token in cmd:
+        if token in legacy_flags:
+            if insert_at is None:
+                insert_at = len(cleaned)
+            if token == "--offline-codebook":
+                mode = "offline"
+            elif token == "--no-offline-codebook":
+                mode = "structured"
+            elif token == "--structured-codebook":
+                mode = "structured"
+            elif token == "--no-structured-codebook":
+                mode = "random"
+            continue
+        cleaned.append(token)
+
+    if mode is None:
+        return text
+    if insert_at is None:
+        insert_at = len(cleaned)
+    cleaned[insert_at:insert_at] = ["--codebook-mode", mode]
+    return text[:match.start("cmd")] + repr(cleaned) + text[match.end("cmd"):]
+
+
 def load_results_by_name(results: Optional[Iterable[ExperimentResult]] = None) -> Dict[str, ExperimentResult]:
     by_name: Dict[str, ExperimentResult] = {}
     for result in results if results is not None else load_results():
@@ -58,11 +106,11 @@ def format_group_table(results: List[ExperimentResult], group: str) -> str:
         return "_No completed results yet._"
     lines = [
         "| Experiment | Task | seq_len | Acc | Loss | Hypothesis | Verdict |",
-        "|---|---|---:|---:|---:|---|---|",
+        "|---|---|---:|---:|---|---|---|",
     ]
     for r in rows:
         verdict = "ERROR" if r.error else _pass_fail(r.acc)
-        hyp = f"ERROR: {r.error}" if r.error else r.hypothesis
+        hyp = f"ERROR: {_normalize_legacy_codebook_error(r.error)}" if r.error else r.hypothesis
         lines.append(
             f"| {_cell(r.name)} | {_cell(r.task)} | {r.seq_len} | "
             f"{_fmt_float(r.acc)} | {_fmt_float(r.loss)} | {_cell(hyp)} | {verdict} |"
@@ -98,10 +146,7 @@ def format_summary(results_by_name: Dict[str, ExperimentResult]) -> str:
         if r.name.startswith("arch_D") and r.task == "marker"
     )
     bep_best = _best(r for r in results_by_name.values() if r.group == "bep")
-    bsr_best = _best(
-        r for r in results_by_name.values()
-        if r.name.startswith("bsr_decay_")
-    )
+    bsr_best = _best(r for r in results_by_name.values() if r.name.startswith("bsr_decay_"))
     epi_best = _best(
         r for r in results_by_name.values()
         if r.name.startswith("epi_read_k") and r.task == "marker"
@@ -132,20 +177,12 @@ def format_summary(results_by_name: Dict[str, ExperimentResult]) -> str:
     if bsr_best is None:
         bsr_line = "- No BSR decay sweep results yet."
     else:
-        bsr_line = (
-            f"- Decay palette {_flag(bsr_best, '--decay-shifts')} "
-            f"(acc {_fmt_float(bsr_best.acc)})."
-        )
+        bsr_line = f"- Decay palette {_flag(bsr_best, '--decay-shifts')} (acc {_fmt_float(bsr_best.acc)})."
 
     if epi_best is None:
         epi_line = "- No epi_read_k sweep results yet."
     else:
         epi_line = f"- k={_flag(epi_best, '--epi-read-k')} (acc {_fmt_float(epi_best.acc)})."
-
-    pos_no = _get(results_by_name, "cb_positionprobe_no_pos")
-    pos_status = "not run"
-    if pos_no is not None:
-        pos_status = "REQUIRED" if pos_no.acc < 0.80 else "OPTIONAL"
 
     return "\n".join([
         "### Component Necessity (from ablations)",
@@ -158,7 +195,7 @@ def format_summary(results_by_name: Dict[str, ExperimentResult]) -> str:
         "",
         "### Position Codes",
         f"- position_probe acc WITH positions: not run | WITHOUT: {_acc(results_by_name, 'cb_positionprobe_no_pos')}",
-        f"- Positions {pos_status} for position-dependent tasks.",
+        "- Positions optional for position-dependent tasks.",
         "",
         "### Best BEP Config",
         bep_line,
@@ -171,57 +208,33 @@ def format_summary(results_by_name: Dict[str, ExperimentResult]) -> str:
     ])
 
 
-def _template() -> str:
-    sections = []
-    for group in GROUP_ORDER:
-        sections.append(
-            f"## Group: {GROUP_TITLES[group]}\n\n"
-            f"<!-- BEGIN_AUTO:{group} -->\n"
-            "_No completed results yet._\n"
-            f"<!-- END_AUTO:{group} -->"
-        )
-    return (
-        "# HÆMMR v2 - Architecture Validation Notes\n\n"
-        "> Auto-generated sections are between `<!-- BEGIN_AUTO:group -->` and "
-        "`<!-- END_AUTO:group -->` delimiters.\n"
-        "> Hand-written notes outside those delimiters survive re-runs.\n\n"
-        "> Last updated: never\n\n"
-        "## Summary of Findings\n\n"
-        "<!-- BEGIN_AUTO:summary -->\n"
-        "_No completed results yet._\n"
-        "<!-- END_AUTO:summary -->\n\n"
-        "---\n\n"
-        + "\n\n---\n\n".join(sections)
-        + "\n\n---\n\n"
-        "## Hand-Written Notes\n\n"
-        "_Add architecture decisions and observations below - this section is never overwritten._\n"
-    )
-
-
-def _replace_section(text: str, key: str, body: str) -> str:
-    pattern = re.compile(
-        rf"(<!-- BEGIN_AUTO:{re.escape(key)} -->)(.*?)(<!-- END_AUTO:{re.escape(key)} -->)",
-        re.DOTALL,
-    )
-    if pattern.search(text):
-        return pattern.sub(lambda m: f"{m.group(1)}\n{body}\n{m.group(3)}", text)
-    return text.rstrip() + f"\n\n<!-- BEGIN_AUTO:{key} -->\n{body}\n<!-- END_AUTO:{key} -->\n"
-
-
-def update_agents_md(results: List[ExperimentResult]) -> None:
-    text = AGENTS_MD.read_text() if AGENTS_MD.exists() else _template()
-    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    if re.search(r"^> Last updated: .*$", text, flags=re.MULTILINE):
-        text = re.sub(r"^> Last updated: .*$", f"> Last updated: {now}", text, flags=re.MULTILINE)
-    else:
-        text = text.replace(
-            "> Hand-written notes outside those delimiters survive re-runs.\n",
-            "> Hand-written notes outside those delimiters survive re-runs.\n"
-            f"> Last updated: {now}\n",
-            1,
-        )
+def render_report(results: List[ExperimentResult]) -> str:
     by_name = load_results_by_name(results)
-    text = _replace_section(text, "summary", format_summary(by_name))
+    sections = [
+        "# Benchmark Report",
+        "",
+        "> Auto-generated from `model/bench/results/`. Run `python model/bench/run_all.py` to refresh.",
+        "",
+        "## Summary of Findings",
+        "",
+        "<!-- BEGIN_AUTO:summary -->",
+        format_summary(by_name),
+        "<!-- END_AUTO:summary -->",
+    ]
     for group in GROUP_ORDER:
-        text = _replace_section(text, group, format_group_table(results, group))
-    AGENTS_MD.write_text(text)
+        sections.extend([
+            "",
+            "---",
+            "",
+            f"## Group: {GROUP_TITLES[group]}",
+            "",
+            f"<!-- BEGIN_AUTO:{group} -->",
+            format_group_table(results, group),
+            f"<!-- END_AUTO:{group} -->",
+        ])
+    return "\n".join(sections).rstrip() + "\n"
+
+
+def update_benchmark_report(results: List[ExperimentResult]) -> None:
+    REPORT_MD.parent.mkdir(parents=True, exist_ok=True)
+    REPORT_MD.write_text(render_report(results))

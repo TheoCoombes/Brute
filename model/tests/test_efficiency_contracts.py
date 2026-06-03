@@ -19,6 +19,9 @@ def test_no_local_megabatch_or_old_flip_cap_api():
     assert "--accum" not in joined
     assert "args.accum" not in joined
     assert "max_flip_frac" not in joined
+    assert "--vocab-cap" not in joined
+    assert "--offline-codebook" not in joined
+    assert "--structured-codebook" not in joined
 
 
 def test_hot_forward_uses_brute_fast_matmul():

@@ -1,8 +1,6 @@
-# HAEMMR v2 - Architecture Validation Notes
+# Benchmark Report
 
-> Auto-generated sections are between `<!-- BEGIN_AUTO:group -->` and `<!-- END_AUTO:group -->` delimiters.
-> Hand-written notes outside those delimiters survive re-runs.
-> Last updated: 2026-06-03T22:19:36+00:00
+> Auto-generated from `model/bench/results/`. Run `python model/bench/run_all.py` to refresh.
 
 ## Summary of Findings
 
@@ -17,7 +15,7 @@
 
 ### Position Codes
 - position_probe acc WITH positions: not run | WITHOUT: 1.000
-- Positions OPTIONAL for position-dependent tasks.
+- Positions optional for position-dependent tasks.
 
 ### Best BEP Config
 - r=0.1, gate_open=0.05, bits=12 (acc 1.000).
@@ -35,7 +33,7 @@
 
 <!-- BEGIN_AUTO:ablation -->
 | Experiment | Task | seq_len | Acc | Loss | Hypothesis | Verdict |
-|---|---|---:|---:|---:|---|---|
+|---|---|---:|---:|---|---|---|
 | abl_baseline_copy | copy | 16 | 1.000 | 0.124 | Full model should reach >=80% on copy | PASS |
 | abl_baseline_marker | marker | 16 | 1.000 | 0.000 | Full model should reach >=90% on marker | PASS |
 | abl_no_bsr_copy | copy | 16 | 1.000 | 0.094 | Without BSR, copy may still work via episodic recall | PASS |
@@ -52,7 +50,7 @@
 
 <!-- BEGIN_AUTO:bsr -->
 | Experiment | Task | seq_len | Acc | Loss | Hypothesis | Verdict |
-|---|---|---:|---:|---:|---|---|
+|---|---|---:|---:|---|---|---|
 | bsr_decay_fixed1 | bsr_long | 24 | 1.000 | 0.000 | Single-timescale decay should be worse at long gaps | PASS |
 | bsr_decay_fixed4 | bsr_long | 24 | 1.000 | 0.000 | Fast decay should lose early context | PASS |
 | bsr_decay_multiscale | bsr_long | 24 | 1.000 | 0.000 | Default multi-scale palette should be best | PASS |
@@ -70,7 +68,7 @@
 
 <!-- BEGIN_AUTO:episodic -->
 | Experiment | Task | seq_len | Acc | Loss | Hypothesis | Verdict |
-|---|---|---:|---:|---:|---|---|
+|---|---|---:|---:|---|---|---|
 | epi_no_margin_sup_marker | marker | 16 | 0.501 | 8.445 | Without address-margin supervision, convergence should slow | FAIL |
 | epi_no_position_distracted | epi_distracted | 32 | 0.984 | 0.095 | Content-only scoring should work if content is unique | PASS |
 | epi_read_k1_induction64 | induction | 64 | 1.000 | 0.001 | Long-range induction with exact read | PASS |
@@ -89,7 +87,7 @@
 
 <!-- BEGIN_AUTO:hopfield -->
 | Experiment | Task | seq_len | Acc | Loss | Hypothesis | Verdict |
-|---|---|---:|---:|---:|---|---|
+|---|---|---:|---:|---|---|---|
 | hop_no_hopfield_prior_task | hopfield_prior | 16 | 1.000 | 0.049 | Without Hopfield, prior task should fail | PASS |
 | hop_prior_task_large | hopfield_prior | 16 | 1.000 | 0.311 | Large Hopfield bank should learn prior faster | PASS |
 | hop_prior_task_small | hopfield_prior | 16 | 1.000 | 0.200 | Small Hopfield bank should learn four prior tokens | PASS |
@@ -107,7 +105,7 @@
 
 <!-- BEGIN_AUTO:bep -->
 | Experiment | Task | seq_len | Acc | Loss | Hypothesis | Verdict |
-|---|---|---:|---:|---:|---|---|
+|---|---|---:|---:|---|---|---|
 | bep_bits12_marker | marker | 16 | 1.000 | 0.000 | 12-bit H range | PASS |
 | bep_bits15_marker | marker | 16 | 1.000 | 0.000 | Default 15-bit H range | PASS |
 | bep_bits8_marker | marker | 16 | 1.000 | 0.000 | 8-bit H clips more aggressively | PASS |
@@ -128,7 +126,7 @@
 
 <!-- BEGIN_AUTO:codebook -->
 | Experiment | Task | seq_len | Acc | Loss | Hypothesis | Verdict |
-|---|---|---:|---:|---:|---|---|
+|---|---|---:|---:|---|---|---|
 | cb_bef10_marker | marker | 16 | 1.000 | 0.000 | BEF 10 sweeps is fast | PASS |
 | cb_bef30_marker | marker | 16 | 1.000 | 0.000 | BEF 30 sweeps has stronger separation | PASS |
 | cb_positionprobe_no_pos | position_probe | 16 | 1.000 | 0.000 | Position disabled should fail position-dependent task | PASS |
@@ -144,20 +142,14 @@
 
 <!-- BEGIN_AUTO:arch -->
 | Experiment | Task | seq_len | Acc | Loss | Hypothesis | Verdict |
-|---|---|---:|---:|---:|---|---|
+|---|---|---:|---:|---|---|---|
 | arch_D128_marker | marker | 16 | 1.000 | 0.000 | D=128: default | PASS |
 | arch_D256_marker | marker | 16 | 1.000 | 0.000 | D=256: richer geometry | PASS |
-| arch_D512_marker | marker | 16 | 0.000 | inf | ERROR: TimeoutExpired: Command '['/Users/theocoombes/Documents/Programming Projects/Binary LLM/Implementation/.venv/bin/python', '/Users/theocoombes/Documents/Programming Projects/Binary LLM/Implementation/model/probe_synthetic.py', '--tasks', 'marker', '--lengths', '16', '--steps', '300', '--json-out', '/Users/theocoombes/Documents/Programming Projects/Binary LLM/Implementation/model/bench/results/.arch_D512_marker_97202_20260603T221724.tmp.json', '--D', '512', '--layers', '1', '--d-ff', '1024', '--slots', '32', '--top-k', '3', '--r', '0.1', '--gate-open', '0.05', '--seed', '0', '--batch-size', '64', '--structured-codebook', '--bef-sweeps', '10', '--sem-weight', '0.5']' timed out after 90 seconds | ERROR |
+| arch_D512_marker | marker | 16 | 0.000 | inf | ERROR: TimeoutExpired: Command '['/Users/theocoombes/Documents/Programming Projects/Binary LLM/Implementation/.venv/bin/python', '/Users/theocoombes/Documents/Programming Projects/Binary LLM/Implementation/model/probe_synthetic.py', '--tasks', 'marker', '--lengths', '16', '--steps', '300', '--json-out', '/Users/theocoombes/Documents/Programming Projects/Binary LLM/Implementation/model/bench/results/.arch_D512_marker_97202_20260603T221724.tmp.json', '--D', '512', '--layers', '1', '--d-ff', '1024', '--slots', '32', '--top-k', '3', '--r', '0.1', '--gate-open', '0.05', '--seed', '0', '--batch-size', '64', '--codebook-mode', 'structured', '--bef-sweeps', '10', '--sem-weight', '0.5']' timed out after 90 seconds | ERROR |
 | arch_D64_marker | marker | 16 | 0.590 | 4.717 | D=64: minimum useful size | FAIL |
 | arch_L1_copy16 | copy | 16 | 1.000 | 0.124 | One-layer copy task | PASS |
 | arch_L1_induction64 | induction | 64 | 1.000 | 0.001 | One layer at long range | PASS |
 | arch_L2_copy16 | copy | 16 | 1.000 | 0.337 | Two-layer copy task | PASS |
 | arch_L2_induction64 | induction | 64 | 1.000 | 0.030 | Two layers: test depth benefit | PASS |
-| arch_L3_induction64 | induction | 64 | 0.000 | inf | ERROR: TimeoutExpired: Command '['/Users/theocoombes/Documents/Programming Projects/Binary LLM/Implementation/.venv/bin/python', '/Users/theocoombes/Documents/Programming Projects/Binary LLM/Implementation/model/probe_synthetic.py', '--tasks', 'induction', '--lengths', '64', '--steps', '300', '--json-out', '/Users/theocoombes/Documents/Programming Projects/Binary LLM/Implementation/model/bench/results/.arch_L3_induction64_97199_20260603T221806.tmp.json', '--D', '128', '--layers', '3', '--d-ff', '256', '--slots', '32', '--top-k', '3', '--r', '0.1', '--gate-open', '0.05', '--seed', '0', '--batch-size', '64', '--structured-codebook', '--bef-sweeps', '10', '--sem-weight', '0.5']' timed out after 90 seconds | ERROR |
+| arch_L3_induction64 | induction | 64 | 0.000 | inf | ERROR: TimeoutExpired: Command '['/Users/theocoombes/Documents/Programming Projects/Binary LLM/Implementation/.venv/bin/python', '/Users/theocoombes/Documents/Programming Projects/Binary LLM/Implementation/model/probe_synthetic.py', '--tasks', 'induction', '--lengths', '64', '--steps', '300', '--json-out', '/Users/theocoombes/Documents/Programming Projects/Binary LLM/Implementation/model/bench/results/.arch_L3_induction64_97199_20260603T221806.tmp.json', '--D', '128', '--layers', '3', '--d-ff', '256', '--slots', '32', '--top-k', '3', '--r', '0.1', '--gate-open', '0.05', '--seed', '0', '--batch-size', '64', '--codebook-mode', 'structured', '--bef-sweeps', '10', '--sem-weight', '0.5']' timed out after 90 seconds | ERROR |
 <!-- END_AUTO:arch -->
-
----
-
-## Hand-Written Notes
-
-_Add architecture decisions and observations below - this section is never overwritten._

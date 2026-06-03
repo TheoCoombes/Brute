@@ -19,7 +19,7 @@ BASELINE_CFG = {
     "--gate-open": "0.05",
     "--seed": "0",
     "--batch-size": "64",
-    "--structured-codebook": "",
+    "--codebook-mode": "structured",
     "--bef-sweeps": "10",
     "--sem-weight": "0.5",
 }
@@ -187,7 +187,7 @@ BEP_EXPERIMENTS: List[ExperimentSpec] = [
 
 CODEBOOK_EXPERIMENTS: List[ExperimentSpec] = [
     spec("cb_random_marker", "codebook", "marker", 16,
-         overrides={"--no-structured-codebook": ""},
+         overrides={"--codebook-mode": "random"},
          hypothesis="Random codebook should hurt decode geometry"),
     spec("cb_bef10_marker", "codebook", "marker", 16,
          overrides={"--bef-sweeps": "10"}, hypothesis="BEF 10 sweeps is fast"),
