@@ -52,7 +52,9 @@ class HaemmrConfig:
     d_ff: int = 2048                    # channel-mix hidden width
     # episodic slot memory
     epi_read_k: int = 1                 # top-k read width (1 ⇒ exact single-slot)
-    epi_slots: Optional[int] = None     # ring-buffer cap at inference; None ⇒ context length
+    epi_slots: Optional[int] = None     # streaming Tier-1 window cap; None ⇒ 2*epi_chunk
+    epi_chunk: int = 64                 # chunk size C for the two-tier chunked forward
+    epi_registers: int = 64             # Tier-2 register slots S (0 = disabled)
     # latent Hopfield priors
     n_slots: int = 256                  # learned static slots (M)
     top_k: int = 15                     # WTA width (odd → no ties)
@@ -92,6 +94,10 @@ class HaemmrConfig:
             raise ValueError("epi_read_k must be positive")
         if self.epi_slots is not None and self.epi_slots <= 0:
             raise ValueError("epi_slots must be positive when set")
+        if self.epi_chunk <= 0:
+            raise ValueError("epi_chunk must be positive")
+        if self.epi_registers < 0:
+            raise ValueError("epi_registers must be non-negative")
         if self.pos_chunk <= 0:
             raise ValueError("pos_chunk must be positive")
         if self.sem_weight < 0:
@@ -146,7 +152,10 @@ class Block:
             self.bsr = None
             self.merge_bsr = None
         self.epi = EpisodicSlotMemory(D, name=f"{nm}.epi", read_k=cfg.epi_read_k,
-                                      n_slots=cfg.epi_slots, generator=generator,
+                                      n_slots=cfg.epi_slots,
+                                      epi_chunk=cfg.epi_chunk,
+                                      epi_registers=cfg.epi_registers,
+                                      generator=generator,
                                       device=device, boundary_nu=nu)
         self.merge_epi = ResidualMerge(D, name=f"{nm}.merge_epi", p_open=cfg.gate_open,
                                        generator=generator, device=device)

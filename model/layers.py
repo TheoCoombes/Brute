@@ -95,13 +95,29 @@ class BooleanLinear:
     def params(self) -> List[BoldParam]:
         return [self.W]
 
-    def forward(self, a_bit: brute.Tensor) -> Tuple[brute.Tensor, torch.Tensor]:
-        z = brute.fast.matmul(a_bit, self.W.bit)     # (M, out) int32, signed ±1 dot
-        self._cache = _LazyPM1Cache(
-            {"a_bit": a_bit, "z": z},
-            pm1_sources={"a_pm1": ("a_bit", tuple(a_bit.shape))},
-        )
-        return sign_to_bit1(z), z
+    def forward(self, a_bit: brute.Tensor) -> Tuple[brute.Tensor, Optional[torch.Tensor]]:
+        """Returns ``(out_bit, z_or_None)``.
+
+        When ``boundary_nu`` is ``None`` (the common packed path) the fused
+        ``xnor_popcount_matmul_sign`` kernel is used and ``z`` is never
+        materialised — the returned second element is ``None``.  When
+        ``boundary_nu`` is set the int32 pre-activation ``z`` is required for
+        the eligibility mask, so the standard ``matmul + sign`` path is kept.
+        """
+        if self.boundary_nu is None:
+            out_bit = brute.fast.matmul_sign(a_bit, self.W.bit, self.in_dim)
+            self._cache = _LazyPM1Cache(
+                {"a_bit": a_bit},
+                pm1_sources={"a_pm1": ("a_bit", tuple(a_bit.shape))},
+            )
+            return out_bit, None
+        else:
+            z = brute.fast.matmul(a_bit, self.W.bit)   # (M, out) int32
+            self._cache = _LazyPM1Cache(
+                {"a_bit": a_bit, "z": z},
+                pm1_sources={"a_pm1": ("a_bit", tuple(a_bit.shape))},
+            )
+            return sign_to_bit1(z), z
 
     def backward(self, S: torch.Tensor) -> torch.Tensor:
         """``S``: (M, out) signal at the output activation. Returns (M, in)."""
@@ -310,11 +326,14 @@ class HopfieldBank:
             packed = self.U.bit._packed_buf.index_select(0, idx.squeeze(1))
             read_bit = _BT._make_bit1_from_packed(packed.contiguous(), [q_bit.shape[0], self.D])
         else:
-            _, idx = torch.topk(sim, k=kk, dim=1)          # (M_tok, k)
-            U_pm1 = self.U.pm1                             # (M, D)
-            sel = U_pm1[idx]                               # (M_tok, k, D)
-            read = sel.sum(dim=1)                          # (M_tok, D) integer vote
-            read_bit = sign_to_bit1(read)
+            _, idx = torch.topk(sim, k=kk, dim=1)         # (M_tok, k)
+            # Bit-sliced majority vote — no int32 tally, no unpack.
+            # Gather k packed payload rows → (M_tok, k, Kp), then majority.
+            sel_packed = self.U.bit._packed_buf[idx.reshape(-1)].reshape(
+                q_bit.shape[0], kk, -1)
+            rows_bit = _BT._make_bit1_from_packed(
+                sel_packed.contiguous(), [q_bit.shape[0], kk, self.D])
+            read_bit = brute.fast.majority(rows_bit, kk, self.D)
         self._cache = _LazyPM1Cache(
             {"idx": idx, "q_bit": q_bit},
             pm1_sources={"q_pm1": ("q_bit", tuple(q_bit.shape))},
@@ -346,57 +365,105 @@ class HopfieldBank:
         return torch.zeros_like(S_read)
 
 
-# ── Binary Episodic Slot Memory (exact in-window recall) ───────────────────────
+# ── Binary Episodic Slot Memory (two-tier chunked, linear-time) ────────────────
 
 class EpisodicSlotMemory:
-    """Addressable binary slots for exact context-local recall.
+    """Two-tier causal memory for exact local recall and bounded global recall.
 
-    Every token writes its own slot and a later query retrieves a specific one
-    by Hamming address, so copy-within-window is a lookup rather than a bundle
-    decode.
+    **Tier 1 — exact local recall (O(n·C)):**
+    Each token in chunk ``g`` attends causally over the 2C-token window spanning
+    chunks ``g-1`` and ``g``.  This is chunk-parallel (no O(n²) dense matrix).
+    When ``n ≤ C`` the sequence is a single chunk and degenerates exactly to the
+    previous full intra-sequence causal top-1 recall behaviour.
 
-    Addressing is two-component (content + position), the binary analogue of
-    content + positional attention:
+    **Tier 2 — bounded global register cache (O(n·S), optional):**
+    A fixed bank of ``S`` register slots per batch element carries salient tokens
+    from chunks older than Tier-1's 2C span, enabling beyond-window induction.
+    Registers are written by LSH last-writer-wins after each completed chunk.
+    Tier-2 read is a content-only Hamming search over the S slots; the higher
+    score of the two candidates (Tier-1 vs Tier-2) wins.  When ``S=0`` the bank
+    is disabled and the behaviour is pure Tier-1.
 
-        score[t,m] = ⟨q^c_t, k^c_m⟩ + ⟨q^p_t, POS_m⟩,   for m < t  (read-before-write)
-
-    where ``k^c = Kc(c)``, ``q^c = Qc(c)``, ``q^p = Qp(c)`` are dense Boolean
-    projections (the address lane — never decoded) and ``POS_m`` are the absolute
-    position codes.  Content addressing solves induction/marker; the positional
-    query lets a trigger retrieve "the token at position p" (copy).  The payload
-    is the source concept verbatim: position-free, already in the clean decode
-    frame, and requiring no decode-time positional unbind.
-
-    Forward read is **hard top-1** (exact).  The backward pass is a
-    straight-through *soft-attention* surrogate so the address projections get a
-    real LM-loss gradient.  :meth:`margin_loss` adds a local Hamming-margin
-    objective for retrieval curricula.
+    **Backward:**
+    Tier-1 uses a soft-attention (softmax surrogate) backward windowed to the
+    2C chunk size.  Tier-2 has no key gradient (hard piecewise-constant
+    selection); the value path routes signal to the source token's concept.
+    Address projections Kc/Qc/Qp get gradient from Tier-1 and margin_loss.
     """
 
     def __init__(self, D: int, *, name: str = "epi", read_k: int = 1,
                  n_slots: Optional[int] = None, attn_inv_temp: Optional[float] = None,
+                 epi_chunk: int = 64, epi_registers: int = 64,
                  generator: Optional[torch.Generator] = None, device=None,
                  boundary_nu: Optional[float] = None):
         self.D = D
         self.k = read_k
-        self.N = n_slots                       # ring-buffer cap (None ⇒ one slot / token)
+        self.N = n_slots                        # streaming Tier-1 window cap
+        self.C = epi_chunk                      # chunk size
+        self.S = epi_registers                  # Tier-2 register slots (0 = disabled)
         self.inv_temp = attn_inv_temp if attn_inv_temp is not None else D ** -0.5
-        self.Kc = BooleanLinear(D, D, name=f"{name}.Kc", generator=generator, device=device, boundary_nu=boundary_nu)
-        self.Qc = BooleanLinear(D, D, name=f"{name}.Qc", generator=generator, device=device, boundary_nu=boundary_nu)
-        self.Qp = BooleanLinear(D, D, name=f"{name}.Qp", generator=generator, device=device, boundary_nu=boundary_nu)
+        self.Kc = BooleanLinear(D, D, name=f"{name}.Kc", generator=generator,
+                                device=device, boundary_nu=boundary_nu)
+        self.Qc = BooleanLinear(D, D, name=f"{name}.Qc", generator=generator,
+                                device=device, boundary_nu=boundary_nu)
+        self.Qp = BooleanLinear(D, D, name=f"{name}.Qp", generator=generator,
+                                device=device, boundary_nu=boundary_nu)
         self._cache: dict = {}
-        # streaming (inference) ring-buffer state, stored as packed bit buffers
+        # streaming state (packed ring buffers)
         self._s_kc = self._s_pos = self._s_pay = None
         self._s_ptr = 0
         self._s_cnt = 0
+        # streaming Tier-2 registers
+        self._r_kc = self._r_pay = self._r_valid = None
 
     def params(self) -> List[BoldParam]:
         return self.Kc.params() + self.Qc.params() + self.Qp.params()
 
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _banded_sim(q_bit: brute.Tensor, k_bit: brute.Tensor) -> torch.Tensor:
+        """(B, q_cnt, D) × (B, k_cnt, D) → (B, q_cnt, k_cnt) int32."""
+        B, q_cnt, D = q_bit.shape
+        k_cnt = int(k_bit.shape[1])
+        return torch.stack([
+            brute.fast.matmul(q_bit[b], k_bit[b])
+            for b in range(B)
+        ], dim=0)
+
+    @staticmethod
+    def _reg_sim(q_bit: brute.Tensor, reg_packed: torch.Tensor, D: int) -> torch.Tensor:
+        """(B, q_cnt, D) bit1 × (B, S, Kp) int64 → (B, q_cnt, S) int32."""
+        B, q_cnt, _ = q_bit.shape
+        S = reg_packed.shape[1]
+        return torch.stack([
+            brute.fast.matmul(
+                q_bit[b],
+                _BT._make_bit1_from_packed(reg_packed[b].contiguous(), [S, D]))
+            for b in range(B)
+        ], dim=0)
+
     # ── batched (parallel-training) form ──────────────────────────────────────
-    def forward(self, c_bit: brute.Tensor, pos_bit: brute.Tensor | None) -> brute.Tensor:
-        """``c`` (B,n,D) bit1, ``pos`` (n,D) bit1 position codes → read (B,n,D) bit1."""
+
+    def forward(self, c_bit: brute.Tensor, pos_bit: Optional[brute.Tensor]) -> brute.Tensor:
+        """``c`` (B,n,D) bit1, ``pos`` (n,D) bit1 → read (B,n,D) bit1.
+
+        Processes the sequence in chunks of size C.  When n ≤ C this is a
+        single chunk and the result is identical to the old full-sequence causal
+        read (Tier-2 inactive for the first chunk).
+        """
         B, n, D = c_bit.shape
+        C = self.C
+        S = self.S
+        G = (n + C - 1) // C
+        Kp = int(c_bit._packed_buf.shape[-1])
+        dev = c_bit.device
+        neg = torch.finfo(torch.float32).min / 4
+
+        if pos_bit is None:
+            pos_bit = brute.ones(n, D, dtype=brute.bit1, device=dev)
+
+        # Project all tokens in one batched call.
         c_flat = c_bit.reshape(B * n, D)
         kc_bit, _ = self.Kc.forward(c_flat)
         qc_bit, _ = self.Qc.forward(c_flat)
@@ -404,100 +471,228 @@ class EpisodicSlotMemory:
         kc_bit = kc_bit.reshape(B, n, D)
         qc_bit = qc_bit.reshape(B, n, D)
         qp_bit = qp_bit.reshape(B, n, D)
-        if pos_bit is None:
-            pos_bit = brute.ones(n, D, dtype=brute.bit1, device=c_bit.device)
 
-        # two-component score (content + position), causal read-before-write
-        content = _batched_similarity(qc_bit, kc_bit)          # (B,n,n)
-        position = brute.fast.matmul(qp_bit.reshape(B * n, D), pos_bit).reshape(B, n, n)
-        score = (content + position).to(torch.float32)
-        t = torch.arange(n, device=c_bit.device).unsqueeze(1)
-        m = torch.arange(n, device=c_bit.device).unsqueeze(0)
-        causal = m < t
-        if self.N is not None:
-            causal = causal & ((t - m) <= self.N)
-        neg = torch.finfo(score.dtype).min / 4
-        score = score.masked_fill(~causal.unsqueeze(0), neg)
+        pay_packed = c_bit._packed_buf              # (B, n, Kp)
+        out_packed = torch.zeros(B, n, Kp, dtype=torch.int64, device=dev)
 
-        kk = min(self.k, n, self.N or n)
-        if kk == 1:
-            topv, topi = score.max(dim=2, keepdim=True)       # argmax tie-breaks like streaming
-        else:
-            topv, topi = torch.topk(score, k=kk, dim=2)        # (B,n,kk)
-        valid_top = topv > (neg / 2)
-        no_slot = ~valid_top.any(dim=2)                        # (B,n)
+        # Per-chunk bookkeeping for the backward.
+        chunk_scores: List[torch.Tensor] = []       # (B, q_cnt, w_cnt) per chunk
+        chunk_ranges: List[Tuple[int, int, int, int]] = []
+        chunk_no_slot: List[torch.Tensor] = []      # (B, q_cnt) bool per chunk
 
+        # Tier-2 register state (only allocated when S > 0).
+        reg_kc:     Optional[torch.Tensor] = None   # (B, S, Kp) int64
+        reg_pay:    Optional[torch.Tensor] = None   # (B, S, Kp) int64
+        reg_src:    Optional[torch.Tensor] = None   # (B, S) int64 source position
+        reg_valid:  Optional[torch.Tensor] = None   # (B, S) bool
+        if S > 0:
+            reg_kc    = torch.zeros(B, S, Kp, dtype=torch.int64, device=dev)
+            reg_pay   = torch.zeros(B, S, Kp, dtype=torch.int64, device=dev)
+            reg_src   = torch.full((B, S), -1, dtype=torch.int64, device=dev)
+            reg_valid = torch.zeros(B, S, dtype=torch.bool, device=dev)
+
+        # Full-sequence Tier-2 bookkeeping for the backward value path.
+        t2_used = torch.zeros(B, n, dtype=torch.bool, device=dev)
+        t2_src  = torch.full((B, n), -1, dtype=torch.int64, device=dev)
+
+        for g in range(G):
+            q_start = g * C
+            q_end   = min((g + 1) * C, n)
+            q_cnt   = q_end - q_start
+            k_start = max(0, (g - 1) * C)
+            k_end   = q_end              # keys up to end of current chunk
+            w_cnt   = k_end - k_start
+
+            qc_chunk = qc_bit[:, q_start:q_end, :]   # (B, q_cnt, D) bit1
+            qp_chunk = qp_bit[:, q_start:q_end, :]
+            kc_win   = kc_bit[:, k_start:k_end, :]   # (B, w_cnt, D) bit1
+            pos_win  = pos_bit[k_start:k_end, :]      # (w_cnt, D) bit1
+
+            # Tier-1 scores (B, q_cnt, w_cnt)
+            content  = self._banded_sim(qc_chunk, kc_win)
+            position = brute.fast.matmul(
+                qp_chunk.reshape(B * q_cnt, D), pos_win).reshape(B, q_cnt, w_cnt)
+            score = (content + position).to(torch.float32)
+
+            # Causal mask: key at global position k_start+j is visible to query
+            # at global position q_start+i only if k_start+j < q_start+i.
+            q_glob = torch.arange(q_start, q_end, device=dev)  # (q_cnt,)
+            k_glob = torch.arange(k_start, k_end, device=dev)  # (w_cnt,)
+            causal  = k_glob.unsqueeze(0) < q_glob.unsqueeze(1)  # (q_cnt, w_cnt)
+            if self.N is not None:
+                in_win = (q_glob.unsqueeze(1) - k_glob.unsqueeze(0)) <= self.N
+                causal = causal & in_win
+            score = score.masked_fill(~causal.unsqueeze(0), neg)
+
+            topv, topi = score.max(dim=2)             # (B, q_cnt)
+            valid_t1 = topv > (neg / 2)
+            no_slot_t1 = ~valid_t1                    # (B, q_cnt)
+
+            # Gather Tier-1 payload.
+            t1_pay = torch.gather(
+                pay_packed[:, k_start:k_end, :], 1,
+                topi.clamp_min(0).unsqueeze(-1).expand(B, q_cnt, Kp))  # (B, q_cnt, Kp)
+
+            # Tier-2 read — active from chunk g=1 onwards (registers populated
+            # after chunk 0 is folded in at the end of g=0's iteration).
+            use_t2 = torch.zeros(B, q_cnt, dtype=torch.bool, device=dev)
+            if S > 0 and g >= 1 and reg_valid.any():
+                gscore = self._reg_sim(qc_chunk, reg_kc, D).float()  # (B, q_cnt, S)
+                gscore.masked_fill_(~reg_valid.unsqueeze(1).expand(B, q_cnt, S), neg)
+                gt2v, gt2i = gscore.max(dim=2)                        # (B, q_cnt)
+                valid_t2 = gt2v > (neg / 2)
+                use_t2 = valid_t2 & (gt2v > topv)                     # prefer higher score
+
+                # Gather Tier-2 payload.
+                gt2i_cl = gt2i.clamp_min(0)
+                t2_pay = torch.gather(
+                    reg_pay, 1,
+                    gt2i_cl.unsqueeze(-1).expand(B, q_cnt, Kp))       # (B, q_cnt, Kp)
+
+                # Record source positions for the backward value path.
+                t2_src_chunk = torch.gather(reg_src, 1, gt2i_cl)      # (B, q_cnt)
+                t2_src_chunk = torch.where(use_t2, t2_src_chunk,
+                                           torch.full_like(t2_src_chunk, -1))
+
+                out_chunk = torch.where(
+                    use_t2.unsqueeze(-1),
+                    t2_pay,
+                    torch.where(no_slot_t1.unsqueeze(-1),
+                                pay_packed[:, q_start:q_end, :], t1_pay))
+
+                t2_used[:, q_start:q_end] = use_t2
+                t2_src[:, q_start:q_end]  = t2_src_chunk
+            else:
+                out_chunk = torch.where(
+                    no_slot_t1.unsqueeze(-1),
+                    pay_packed[:, q_start:q_end, :], t1_pay)
+
+            out_packed[:, q_start:q_end, :] = out_chunk
+
+            chunk_scores.append(score)
+            chunk_ranges.append((q_start, q_end, k_start, k_end))
+            chunk_no_slot.append(no_slot_t1)
+
+            # Fold chunk g-1 tokens into Tier-2 registers so they are available
+            # as global context for chunk g+1 and beyond.
+            if S > 0 and g >= 1:
+                fold_s = (g - 1) * C
+                fold_e = min(g * C, n)
+                fold_n = fold_e - fold_s
+
+                n_bk   = max(1, (S - 1).bit_length())  # ceil(log2(S))
+                bk_mask = (1 << n_bk) - 1
+
+                kc_fold_w0 = kc_bit._packed_buf[:, fold_s:fold_e, 0]  # (B, fold_n) int64
+                buckets    = (kc_fold_w0 & bk_mask).long() % S         # (B, fold_n)
+                src_idx    = torch.arange(fold_s, fold_e, device=dev
+                                         ).unsqueeze(0).expand(B, -1)  # (B, fold_n)
+
+                bk_kp = buckets.unsqueeze(-1).expand(B, fold_n, Kp)
+                reg_kc.scatter_(1, bk_kp, kc_bit._packed_buf[:, fold_s:fold_e, :])
+                reg_pay.scatter_(1, bk_kp, pay_packed[:, fold_s:fold_e, :])
+                reg_src.scatter_(1, buckets, src_idx)
+                reg_valid.scatter_(
+                    1, buckets,
+                    torch.ones(B, fold_n, dtype=torch.bool, device=dev))
+
+            # On the very last chunk, also fold chunk G-1 (= current chunk g)
+            # into registers so a hypothetical next chunk could use them.
+            # (Does not affect this forward pass but keeps register state correct
+            # for streaming continuations; only relevant when G >= 1.)
+            if S > 0 and g == G - 1 and G > 0:
+                fold_s = g * C
+                fold_e = n
+                fold_n = fold_e - fold_s
+                if fold_n > 0:
+                    n_bk   = max(1, (S - 1).bit_length())
+                    bk_mask = (1 << n_bk) - 1
+                    kc_fold_w0 = kc_bit._packed_buf[:, fold_s:fold_e, 0]
+                    buckets    = (kc_fold_w0 & bk_mask).long() % S
+                    src_idx    = torch.arange(fold_s, fold_e, device=dev
+                                             ).unsqueeze(0).expand(B, -1)
+                    bk_kp = buckets.unsqueeze(-1).expand(B, fold_n, Kp)
+                    reg_kc.scatter_(1, bk_kp, kc_bit._packed_buf[:, fold_s:fold_e, :])
+                    reg_pay.scatter_(1, bk_kp, pay_packed[:, fold_s:fold_e, :])
+                    reg_src.scatter_(1, buckets, src_idx)
+                    reg_valid.scatter_(
+                        1, buckets,
+                        torch.ones(B, fold_n, dtype=torch.bool, device=dev))
+
+        # Tier-1 no_slot: positions where Tier-1 found nothing.
+        no_slot_t1_full = torch.cat(chunk_no_slot, dim=1)  # (B, n)
+        # Final no_slot: Tier-1 found nothing AND Tier-2 not used.
+        no_slot_full = no_slot_t1_full & ~t2_used
+
+        # Assemble cache for backward.
         cache_data = {
             "shape": (B, n, D), "kc_bit": kc_bit, "qc_bit": qc_bit,
             "qp_bit": qp_bit, "pos_bit": pos_bit, "c_bit": c_bit,
-            "score": score, "topi": topi, "no_slot": no_slot, "causal": causal,
+            "chunk_scores": chunk_scores, "chunk_ranges": chunk_ranges,
+            "no_slot": no_slot_full, "t2_used": t2_used, "t2_src": t2_src,
         }
         pm1_sources = {
-            "kc": ("kc_bit", (B, n, D)),
-            "qc": ("qc_bit", (B, n, D)),
-            "qp": ("qp_bit", (B, n, D)),
-            "pos": ("pos_bit", (n, D)),
-            "c_pm1": ("c_bit", (B, n, D)),
+            "kc":    ("kc_bit", (B, n, D)),
+            "qc":    ("qc_bit", (B, n, D)),
+            "qp":    ("qp_bit", (B, n, D)),
+            "pos":   ("pos_bit", (n, D)),
+            "c_pm1": ("c_bit",  (B, n, D)),
         }
-
-        if kk == 1:
-            # Exact single-slot read can gather whole packed rows directly.
-            packed = c_bit._packed_buf
-            Kp = int(packed.shape[-1])
-            idx = topi.squeeze(-1).clamp_min(0)
-            gathered = torch.gather(
-                packed, 1, idx.unsqueeze(-1).expand(B, n, Kp))
-            out_packed = torch.where(no_slot.unsqueeze(-1), packed, gathered)
-            read_bit = _BT._make_bit1_from_packed(out_packed.contiguous(), [B, n, D])
-        else:
-            # Multi-slot reads still need an integer vote over payload signs.
-            c_pm1 = to_pm1(c_bit)
-            cache_data["c_pm1"] = c_pm1
-            pm1_sources.pop("c_pm1")
-            sel_pay = torch.gather(
-                c_pm1.unsqueeze(1).expand(B, n, n, D), 2,
-                topi.unsqueeze(-1).expand(B, n, kk, D))        # (B,n,kk,D)
-            sel_pay = sel_pay * valid_top.unsqueeze(-1)
-            read = sel_pay.sum(dim=2)                          # integer vote
-            read = torch.where(no_slot.unsqueeze(-1), c_pm1, read)
-            read_bit = sign_to_bit1(read)
-
         self._cache = _LazyPM1Cache(cache_data, pm1_sources=pm1_sources)
-        return read_bit
-
-    def _attn(self):
-        """Softmax attention weights over the causal score (for the ST backward)."""
-        score = self._cache["score"]
-        return torch.softmax(score * self.inv_temp, dim=2)     # (B,n,n)
+        return _BT._make_bit1_from_packed(out_packed.contiguous(), [B, n, D])
 
     def backward(self, S_read: torch.Tensor) -> torch.Tensor:
-        """``S_read`` (B,n,D) signal at the read. Returns signal at ``c`` (B,n,D).
+        """``S_read`` (B,n,D) → signal at ``c`` (B,n,D).
 
-        Forward selection is hard (argmax); the backward uses the soft-attention
-        surrogate ``a = softmax(score)`` (straight-through) so the address
-        projections receive a gradient.  Three signal paths feed back into ``c``:
-        the payload (value) path, and the query/key (address) paths.
+        Tier-1: windowed soft-attention (softmax surrogate) per chunk.
+        Tier-2: hard value pass-through to source token; no key gradient.
         """
         B, n, D = self._cache["shape"]
         kc, qc, qp = self._cache["kc"], self._cache["qc"], self._cache["qp"]
-        c_pm1, pos = self._cache["c_pm1"], self._cache["pos"]
+        c_pm1  = self._cache["c_pm1"]
+        pos    = self._cache["pos"]
         no_slot = self._cache["no_slot"]
-        a = self._attn()                                       # (B,n,n)
+        chunk_scores = self._cache["chunk_scores"]
+        chunk_ranges = self._cache["chunk_ranges"]
+        t2_used = self._cache["t2_used"]
+        t2_src  = self._cache["t2_src"]
 
-        # value path: read_t = Σ_m a[t,m]·c_m  ⇒  dL/dc_m = Σ_t a[t,m]·S_read[t]
-        g_val = torch.einsum("btm,btd->bmd", a, S_read)        # (B,n,D)
+        g_val = torch.zeros(B, n, D, dtype=S_read.dtype, device=S_read.device)
+        g_qc  = torch.zeros(B, n, D, dtype=S_read.dtype, device=S_read.device)
+        g_kc  = torch.zeros(B, n, D, dtype=S_read.dtype, device=S_read.device)
+        g_qp  = torch.zeros(B, n, D, dtype=S_read.dtype, device=S_read.device)
 
-        # score path through softmax: dL/da[t,m] = ⟨S_read[t], c_m⟩
-        dA = torch.einsum("btd,bmd->btm", S_read, c_pm1)       # (B,n,n)
-        dscore = a * (dA - (a * dA).sum(dim=2, keepdim=True))  # softmax jacobian
-        dscore = dscore * self.inv_temp
-        # score = ⟨qc_t,kc_m⟩ + ⟨qp_t,pos_m⟩
-        g_qc = torch.einsum("btm,bmd->btd", dscore, kc)
-        g_kc = torch.einsum("btm,btd->bmd", dscore, qc)
-        g_qp = torch.einsum("btm,md->btd", dscore, pos)
+        for score_g, (q_start, q_end, k_start, k_end) in zip(chunk_scores, chunk_ranges):
+            q_cnt = q_end - q_start
+            a_g = torch.softmax(score_g * self.inv_temp, dim=2)  # (B, q_cnt, w_cnt)
 
-        # where a row had no valid slot the read was the identity c_t
+            S_g       = S_read[:, q_start:q_end, :]              # (B, q_cnt, D)
+            c_win     = c_pm1[:, k_start:k_end, :]               # (B, w_cnt, D)
+            kc_win    = kc[:, k_start:k_end, :]
+            pos_win   = pos[k_start:k_end, :]
+            qc_chunk  = qc[:, q_start:q_end, :]
+            qp_chunk  = qp[:, q_start:q_end, :]
+
+            # Value path: dL/dc_m = Σ_t a[t,m]·S[t]
+            g_val[:, k_start:k_end, :] += torch.einsum("bqw,bqd->bwd", a_g, S_g)
+
+            # Score path (softmax Jacobian).
+            dA      = torch.einsum("bqd,bwd->bqw", S_g, c_win)
+            dscore  = a_g * (dA - (a_g * dA).sum(dim=2, keepdim=True))
+            dscore  = dscore * self.inv_temp
+
+            g_qc[:, q_start:q_end, :] += torch.einsum("bqw,bwd->bqd", dscore, kc_win)
+            g_kc[:, k_start:k_end, :] += torch.einsum("bqw,bqd->bwd", dscore, qc_chunk)
+            g_qp[:, q_start:q_end, :] += torch.einsum("bqw,wd->bqd",  dscore, pos_win)
+
+        # Identity path: no valid slot → read was c_t itself.
         g_val = g_val + no_slot.unsqueeze(-1) * S_read
+
+        # Tier-2 value path: route signal from Tier-2 queries to their source.
+        if t2_used.any():
+            t2_sig = S_read * t2_used.unsqueeze(-1).to(S_read.dtype)  # (B, n, D)
+            src    = t2_src.clamp_min(0).unsqueeze(-1).expand(B, n, D)
+            g_val.scatter_add_(1, src, t2_sig)
 
         g_c = g_val
         g_c = g_c + self.Kc.backward(g_kc.reshape(B * n, D)).reshape(B, n, D)
@@ -505,120 +700,201 @@ class EpisodicSlotMemory:
         g_c = g_c + self.Qp.backward(g_qp.reshape(B * n, D)).reshape(B, n, D)
         return g_c
 
-    # ── local Hamming-margin objective for the address lane ───────────────────
+    # ── local Hamming-margin objective (windowed Tier-1 only) ─────────────────
+
     def margin_loss(self, matched: torch.Tensor, *, theta_pos: float = 0.5,
                     theta_neg: float = 0.0, weight: float = 1.0) -> float:
-        """Push the matched query/key pair above ``θ⁺`` and the best distractor
-        below ``θ⁻`` (margins as a fraction of ``D``), and accumulate the
-        resulting flip-signal onto the address projections.
+        """Hinge margin over the Tier-1 window — trains address projections.
 
-        ``matched`` is ``(B,n)`` long: for each query position ``t`` the slot id
-        ``m`` it *should* retrieve, or ``-1`` if there is no supervised target.
-        Must be called after :meth:`forward` (uses its cache); returns the scalar
-        margin loss for logging.  Trains the addresses with a local discrete
-        target.
+        ``matched`` (B,n) long: for each query position ``t`` the global token
+        index it *should* retrieve, or ``-1`` if unsupervised.  A matched slot
+        outside the Tier-1 window is automatically skipped (the Tier-2 path has
+        no margin signal; its value gradient comes from the backward).
         """
         B, n, D = self._cache["shape"]
-        kc, qc, qp = self._cache["kc"], self._cache["qc"], self._cache["qp"]
-        pos, score = self._cache["pos"], self._cache["score"]
+        kc = self._cache["kc"]
+        qc = self._cache["qc"]
+        qp = self._cache["qp"]
+        pos = self._cache["pos"]
+
         tp, tn = theta_pos * D, theta_neg * D
-        causal = self._cache["causal"].unsqueeze(0).expand(B, n, n)
-        in_range = (matched >= 0) & (matched < n)
-        safe_idx = matched.clamp(0, max(n - 1, 0))
-        valid = in_range & torch.gather(causal, 2, safe_idx.unsqueeze(-1)).squeeze(-1)
-        if int(valid.sum()) == 0:
-            return 0.0
-        m_idx = safe_idx                                      # (B,n)
-        pos_score = torch.gather(score, 2, m_idx.unsqueeze(-1)).squeeze(-1)  # (B,n)
-        # hardest distractor = best non-matched valid slot
-        distract = score.clone()
-        distract.scatter_(2, m_idx.unsqueeze(-1), torch.finfo(score.dtype).min / 4)
-        neg_score, neg_idx = distract.max(dim=2)              # (B,n)
+        total_loss = 0.0
+        n_valid_total = 0
+        scale = weight
 
-        # hinge: want pos_score ≥ tp and neg_score ≤ tn
-        pos_viol = (pos_score < tp) & valid                   # push matched up
-        neg_viol = (neg_score > tn) & valid                   # push distractor down
-        loss = (((tp - pos_score).clamp_min(0) + (neg_score - tn).clamp_min(0)) * valid).sum()
-        n_valid = int(valid.sum())
-        loss_val = float(loss.item()) / max(n_valid, 1)
-
-        # flip-signal: raise ⟨q,k⟩ for matched (−1 on score gradient sense), lower for distractor
         g_qc = torch.zeros(B, n, D, device=qc.device)
         g_kc = torch.zeros(B, n, D, device=kc.device)
         g_qp = torch.zeros(B, n, D, device=qp.device)
-        scale = weight / max(n_valid, 1)
-        # raise matched score: dScore>0 ⇒ signal pushes ⟨q,k⟩ up  (use −kc as the
-        # "increase similarity" direction in BOLD's minimise-loss convention)
-        pm = (pos_viol.float() * scale).unsqueeze(-1)         # (B,n,1)
-        k_match = torch.gather(kc, 1, m_idx.unsqueeze(-1).expand(B, n, D))   # (B,n,D)
-        pos_match = torch.gather(pos.unsqueeze(0).expand(B, n, D), 1,
-                                 m_idx.unsqueeze(-1).expand(B, n, D))
-        g_qc -= pm * k_match
-        g_qp -= pm * pos_match
-        g_kc.scatter_add_(1, m_idx.unsqueeze(-1).expand(B, n, D), -pm * qc)
-        # lower distractor score
-        nm = (neg_viol.float() * scale).unsqueeze(-1)
-        k_neg = torch.gather(kc, 1, neg_idx.unsqueeze(-1).expand(B, n, D))
-        pos_neg = torch.gather(pos.unsqueeze(0).expand(B, n, D), 1,
-                               neg_idx.unsqueeze(-1).expand(B, n, D))
-        g_qc += nm * k_neg
-        g_qp += nm * pos_neg
-        g_kc.scatter_add_(1, neg_idx.unsqueeze(-1).expand(B, n, D), nm * qc)
+
+        for score_g, (q_start, q_end, k_start, k_end) in zip(
+                self._cache["chunk_scores"], self._cache["chunk_ranges"]):
+            q_cnt = q_end - q_start
+            w_cnt = k_end - k_start
+
+            matched_g = matched[:, q_start:q_end]  # (B, q_cnt) global slot idx
+            # Adjust to window-relative index.
+            rel_g     = matched_g - k_start          # (B, q_cnt) offset into window
+            in_range  = (rel_g >= 0) & (rel_g < w_cnt) & (matched_g >= 0)
+            if not in_range.any():
+                continue
+
+            safe_rel  = rel_g.clamp(0, max(w_cnt - 1, 0))
+            # Must also be causally reachable: key < query.
+            q_glob    = torch.arange(q_start, q_end, device=matched.device)
+            k_at_safe = k_start + safe_rel  # (B, q_cnt) global key position
+            causal_ok = k_at_safe < q_glob.unsqueeze(0)
+            valid     = in_range & causal_ok
+
+            if not valid.any():
+                continue
+
+            n_valid = int(valid.sum())
+            n_valid_total += n_valid
+            s = scale / max(n_valid, 1)
+
+            pos_score = torch.gather(score_g, 2, safe_rel.unsqueeze(-1)).squeeze(-1)  # (B, q_cnt)
+            distract  = score_g.clone()
+            distract.scatter_(2, safe_rel.unsqueeze(-1),
+                              torch.finfo(score_g.dtype).min / 4)
+            neg_score, neg_idx = distract.max(dim=2)
+
+            pos_viol = (pos_score < tp) & valid
+            neg_viol = (neg_score > tn) & valid
+            chunk_loss = (
+                ((tp - pos_score).clamp_min(0) + (neg_score - tn).clamp_min(0))
+                * valid.float()
+            ).sum()
+            total_loss += float(chunk_loss.item())
+
+            kc_win  = kc[:, k_start:k_end, :]
+            qc_ch   = qc[:, q_start:q_end, :]
+            pos_win = pos[k_start:k_end, :]
+
+            pm = (pos_viol.float() * s).unsqueeze(-1)
+            k_match   = torch.gather(kc_win, 1, safe_rel.unsqueeze(-1).expand(B, q_cnt, D))
+            pos_match = torch.gather(
+                pos_win.unsqueeze(0).expand(B, w_cnt, D), 1,
+                safe_rel.unsqueeze(-1).expand(B, q_cnt, D))
+            g_qc[:, q_start:q_end, :] -= pm * k_match
+            g_qp[:, q_start:q_end, :] -= pm * pos_match
+            g_kc[:, k_start:k_end, :].scatter_add_(
+                1, safe_rel.unsqueeze(-1).expand(B, q_cnt, D), -pm * qc_ch)
+
+            nm = (neg_viol.float() * s).unsqueeze(-1)
+            k_neg   = torch.gather(kc_win, 1, neg_idx.unsqueeze(-1).expand(B, q_cnt, D))
+            pos_neg = torch.gather(
+                pos_win.unsqueeze(0).expand(B, w_cnt, D), 1,
+                neg_idx.unsqueeze(-1).expand(B, q_cnt, D))
+            g_qc[:, q_start:q_end, :] += nm * k_neg
+            g_qp[:, q_start:q_end, :] += nm * pos_neg
+            g_kc[:, k_start:k_end, :].scatter_add_(
+                1, neg_idx.unsqueeze(-1).expand(B, q_cnt, D), nm * qc_ch)
 
         self.Qc.backward(g_qc.reshape(B * n, D))
         self.Kc.backward(g_kc.reshape(B * n, D))
         self.Qp.backward(g_qp.reshape(B * n, D))
-        return loss_val
+        return total_loss / max(n_valid_total, 1)
 
     # ── streaming (inference) ring-buffer form ────────────────────────────────
+
     @torch.no_grad()
     def reset_stream(self, batch_size: int, n_slots: int, *, device=None) -> None:
+        """Reset Tier-1 ring buffer and Tier-2 registers."""
         dev = device if device is not None else self.Kc.W.device
         Kp = (self.D + 63) // 64
-        self._s_kc = torch.zeros(batch_size, n_slots, Kp, dtype=torch.int64, device=dev)
+        self._s_kc  = torch.zeros(batch_size, n_slots, Kp, dtype=torch.int64, device=dev)
         self._s_pos = torch.zeros(batch_size, n_slots, Kp, dtype=torch.int64, device=dev)
         self._s_pay = torch.zeros(batch_size, n_slots, Kp, dtype=torch.int64, device=dev)
         self._s_ptr = 0
         self._s_cnt = 0
+        self._s_step = 0    # total steps processed; gates Tier-2 reads at step >= C
+        if self.S > 0:
+            self._r_kc    = torch.zeros(batch_size, self.S, Kp, dtype=torch.int64, device=dev)
+            self._r_pay   = torch.zeros(batch_size, self.S, Kp, dtype=torch.int64, device=dev)
+            self._r_valid = torch.zeros(batch_size, self.S, dtype=torch.bool, device=dev)
 
     @torch.no_grad()
     def step(self, c_bit: brute.Tensor, pos_bit: brute.Tensor, n_slots: int) -> brute.Tensor:
-        """One causal step (ring buffer of ``n_slots``). ``c`` (B,D), ``pos`` (D,)."""
+        """One causal streaming step.  ``c`` (B,D), ``pos`` (D,) → read (B,D) bit1.
+
+        ``n_slots`` caps the Tier-1 ring buffer.  Use ``2*C`` for full
+        streaming parity with the chunked batched forward.
+
+        Tier-2 reads are gated at ``step_count >= C`` (mirroring the batched
+        forward where Tier-2 is first active at chunk g=1).
+        """
         if c_bit.dim() == 1:
             c_bit = c_bit.reshape(1, self.D)
         B, D = c_bit.shape
-        if self._s_kc is None or self._s_kc.shape[0] != B or self._s_kc.shape[1] != n_slots:
+        if (self._s_kc is None or self._s_kc.shape[0] != B
+                or self._s_kc.shape[1] != n_slots):
             self.reset_stream(B, n_slots, device=c_bit.device)
+
+        Kp = (D + 63) // 64
         qc_bit = self.Qc.forward(c_bit)[0]
         qp_bit = self.Qp.forward(c_bit)[0]
+
         if self._s_cnt == 0:
-            read_bit = c_bit                                   # nothing to retrieve yet
+            read_bit = c_bit        # nothing to retrieve yet
         else:
-            cnt = self._s_cnt
-            rows = []
-            for b in range(B):
-                kc = _BT._make_bit1_from_packed(
-                    self._s_kc[b, :cnt].contiguous(), [cnt, D])
-                pc = _BT._make_bit1_from_packed(
-                    self._s_pos[b, :cnt].contiguous(), [cnt, D])
-                content = brute.fast.matmul(qc_bit[b:b + 1], kc).squeeze(0)
-                position = brute.fast.matmul(qp_bit[b:b + 1], pc).squeeze(0)
-                rows.append(content + position)
-            score = torch.stack(rows, dim=0)                  # (B,cnt)
-            sel = score.argmax(dim=1)                         # (B,)
-            gathered = self._s_pay[torch.arange(B, device=c_bit.device), sel]
-            read_bit = _BT._make_bit1_from_packed(gathered.contiguous(), [B, D])
-        # write current token into the ring buffer (after the read)
+            cnt_buf = torch.full((B,), self._s_cnt, dtype=torch.int32, device=c_bit.device)
+            read_t1, _, score_t1 = brute.fast.episodic_causal_search(
+                qc_bit, self._s_kc, qp_bit, self._s_pos, self._s_pay, cnt_buf, D)
+
+            # Tier-2 read: gated at step >= C to match batched-forward chunk logic.
+            use_t2_read = (self.S > 0
+                           and getattr(self, "_s_step", 0) >= self.C
+                           and self._r_kc is not None
+                           and self._r_valid.any())
+            if use_t2_read:
+                neg_v = float(-(D * 2 + 2))
+                best_t2_scores = torch.full((B,), neg_v, device=c_bit.device)
+                best_t2_pay   = torch.zeros(B, Kp, dtype=torch.int64, device=c_bit.device)
+                for b in range(B):
+                    if not self._r_valid[b].any():
+                        continue
+                    reg_b = _BT._make_bit1_from_packed(
+                        self._r_kc[b].contiguous(), [self.S, D])
+                    sims = brute.fast.matmul(qc_bit[b:b + 1], reg_b).squeeze(0).float()
+                    sims.masked_fill_(~self._r_valid[b], neg_v)
+                    best_idx = int(sims.argmax().item())
+                    if float(sims[best_idx].item()) > neg_v / 2:
+                        best_t2_scores[b] = sims[best_idx]
+                        best_t2_pay[b]    = self._r_pay[b, best_idx]
+
+                use_t2 = best_t2_scores > score_t1.float()   # (B,) bool
+                out_pk = torch.where(
+                    use_t2.unsqueeze(-1),
+                    best_t2_pay, read_t1._packed_buf)
+                read_bit = _BT._make_bit1_from_packed(out_pk.contiguous(), [B, D])
+            else:
+                read_bit = read_t1
+
+        # Write into Tier-1 ring buffer (read-before-write).
         kc_bit = self.Kc.forward(c_bit)[0]
         pos_store = pos_bit
         if not getattr(pos_store, "_is_bit1", False):
             pos_store = sign_to_bit1(pos_store.reshape(1, D)).reshape(D)
         p = self._s_ptr
-        self._s_kc[:, p] = kc_bit._packed_buf
+        self._s_kc[:, p]  = kc_bit._packed_buf
         self._s_pos[:, p] = pos_store._packed_buf.reshape(1, -1).expand(B, -1)
         self._s_pay[:, p] = c_bit._packed_buf
         self._s_ptr = (p + 1) % n_slots
         self._s_cnt = min(self._s_cnt + 1, n_slots)
+
+        # Write into Tier-2 registers (LSH last-writer-wins).
+        if self.S > 0 and self._r_kc is not None:
+            n_bk    = max(1, (self.S - 1).bit_length())
+            bk_mask = (1 << n_bk) - 1
+            kc_w0   = kc_bit._packed_buf[:, 0]
+            buckets = (kc_w0 & bk_mask).long() % self.S
+            for b in range(B):
+                bkt = int(buckets[b])
+                self._r_kc[b, bkt]    = kc_bit._packed_buf[b]
+                self._r_pay[b, bkt]   = c_bit._packed_buf[b]
+                self._r_valid[b, bkt] = True
+
+        self._s_step = getattr(self, "_s_step", 0) + 1
         return read_bit
 
 

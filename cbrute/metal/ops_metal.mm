@@ -357,6 +357,103 @@ bsr_scan(const at::Tensor& q, const at::Tensor& assoc,
     return {read, state, gate};
 }
 
+// ── xnor_popcount_matmul_sign ─────────────────────────────────────────────
+at::Tensor xnor_popcount_matmul_sign(const at::Tensor& A, const at::Tensor& B, int64_t K) {
+    TORCH_CHECK(A.is_mps() && B.is_mps());
+    TORCH_CHECK(A.dim() == 2 && B.dim() == 2);
+    const int64_t M = A.size(0), N = B.size(0), Kp = A.size(1);
+    TORCH_CHECK(Kp == B.size(1), "xnor_popcount_matmul_sign: packed K mismatch");
+
+    const int64_t Np = (N + 63) / 64;
+    auto Ac = A.contiguous(), Bc = B.contiguous();
+    auto C  = at::zeros({M, Np}, A.options().dtype(at::kLong));
+
+    // Dispatch: (Np * 64, M, 1) total threads; threadgroup = (64, 1, 1).
+    // Each threadgroup = 1 output word (2 simdgroups of 32 lanes each).
+    const int32_t K_logical = (int32_t)K;
+    MTLSize grid = MTLSizeMake((NSUInteger)Np * 64, (NSUInteger)M, 1);
+    MTLSize tg   = MTLSizeMake(64, 1, 1);
+    dispatch_kernel_ps(BRUTE_CACHED_PS("xnor_u64_sign"),
+        {{mtl_buf(Ac), byte_offset(Ac)},
+         {mtl_buf(Bc), byte_offset(Bc)},
+         {mtl_buf(C),  byte_offset(C)}},
+        {(int32_t)N, (int32_t)Kp, K_logical},
+        grid, tg);
+    return C;
+}
+
+// ── packed_majority ────────────────────────────────────────────────────────
+at::Tensor packed_majority(const at::Tensor& rows, int64_t k, int64_t D) {
+    TORCH_CHECK(rows.is_mps());
+    TORCH_CHECK(rows.dim() == 3, "packed_majority: rows must be 3-D");
+    TORCH_CHECK(rows.scalar_type() == at::kLong);
+    TORCH_CHECK(k > 0 && D > 0);
+
+    const int64_t batch = rows.size(0);
+    const int64_t Kp    = rows.size(2);
+    TORCH_CHECK(rows.size(1) == k);
+    TORCH_CHECK(Kp == (D + 63) / 64, "packed_majority: Kp mismatch with D");
+
+    const int n_bits   = (k == 1) ? 1
+        : (int)std::ceil(std::log2((double)k + 1.0));
+    const int threshold = (int)(k / 2) + 1;
+
+    auto rc  = rows.contiguous();
+    auto out = at::zeros({batch, Kp}, rc.options());
+
+    MTLSize grid = MTLSizeMake((NSUInteger)(batch * Kp), 1, 1);
+    MTLSize tg   = MTLSizeMake(256, 1, 1);
+    dispatch_kernel_ps(BRUTE_CACHED_PS("packed_majority_k"),
+        {{mtl_buf(rc),  byte_offset(rc)},
+         {mtl_buf(out), byte_offset(out)}},
+        {(int32_t)k, (int32_t)Kp, threshold, n_bits, (int32_t)D},
+        grid, tg);
+    return out;
+}
+
+// ── episodic_causal_search ─────────────────────────────────────────────────
+std::tuple<at::Tensor, at::Tensor, at::Tensor>
+episodic_causal_search(const at::Tensor& qc, const at::Tensor& kc_buf,
+                        const at::Tensor& qp, const at::Tensor& pos_buf,
+                        const at::Tensor& payload, const at::Tensor& cnt,
+                        int64_t D) {
+    TORCH_CHECK(qc.is_mps());
+    TORCH_CHECK(qc.dim() == 2 && qp.dim() == 2);
+    TORCH_CHECK(kc_buf.dim() == 3 && pos_buf.dim() == 3 && payload.dim() == 3);
+    TORCH_CHECK(cnt.dim() == 1 && cnt.scalar_type() == at::kInt);
+    TORCH_CHECK(D > 0);
+
+    const int64_t B  = qc.size(0);
+    const int64_t Kp = qc.size(1);
+    const int64_t N  = kc_buf.size(1);
+
+    auto qcc  = qc.contiguous(),   qpc = qp.contiguous();
+    auto kcc  = kc_buf.contiguous(), psc = pos_buf.contiguous();
+    auto payc = payload.contiguous(), cntc = cnt.contiguous();
+
+    auto read      = at::zeros({B, Kp}, qcc.options());
+    auto idx_out   = at::full({B}, int32_t(-1), qcc.options().dtype(at::kInt));
+    auto score_out = at::full({B}, int32_t(-(int32_t)D * 2 - 2),
+                              qcc.options().dtype(at::kInt));
+
+    const int32_t N_max_i = (int32_t)N;
+    MTLSize grid = MTLSizeMake((NSUInteger)B, 1, 1);
+    MTLSize tg   = MTLSizeMake(256, 1, 1);
+    dispatch_kernel_ps(BRUTE_CACHED_PS("episodic_search_k"),
+        {{mtl_buf(qcc),  byte_offset(qcc)},
+         {mtl_buf(kcc),  byte_offset(kcc)},
+         {mtl_buf(qpc),  byte_offset(qpc)},
+         {mtl_buf(psc),  byte_offset(psc)},
+         {mtl_buf(payc), byte_offset(payc)},
+         {mtl_buf(cntc), byte_offset(cntc)},
+         {mtl_buf(read),      byte_offset(read)},
+         {mtl_buf(idx_out),   byte_offset(idx_out)},
+         {mtl_buf(score_out), byte_offset(score_out)}},
+        {N_max_i, (int32_t)Kp, (int32_t)D},
+        grid, tg);
+    return {read, idx_out, score_out};
+}
+
 //  Per-element popcount — handles any integer dtype.
 at::Tensor popcount(const at::Tensor& packed) {
     auto p = packed.contiguous();

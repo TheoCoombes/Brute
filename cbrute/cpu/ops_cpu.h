@@ -26,6 +26,14 @@ at::Tensor  hamming_distance (const at::Tensor& A,
 at::Tensor  bit1_hamming_total(const at::Tensor& A,
                                const at::Tensor& B);             // total popcount(A^B), no broadcast
 
+//  Fused sign ops
+at::Tensor  xnor_popcount_matmul_sign(const at::Tensor& A, const at::Tensor& B, int64_t K);
+at::Tensor  packed_majority(const at::Tensor& rows, int64_t k, int64_t D);
+std::tuple<at::Tensor, at::Tensor, at::Tensor>
+episodic_causal_search(const at::Tensor& qc, const at::Tensor& kc_buf,
+                        const at::Tensor& qp, const at::Tensor& pos_buf,
+                        const at::Tensor& payload, const at::Tensor& cnt, int64_t D);
+
 //  Misc
 at::Tensor& randomize_bits(at::Tensor& out);
 

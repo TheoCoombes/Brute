@@ -165,6 +165,27 @@ def random_hypervectors(num: int, D: int, *, generator: torch.Generator | None =
     return hv.to(device) if device is not None else hv
 
 
+def lsh_buckets(kc_packed: torch.Tensor, S: int) -> torch.Tensor:
+    """LSH bucket index for each token using low bits of the first packed word.
+
+    ``kc_packed`` is ``(B, n, Kp)`` int64.  Returns ``(B, n)`` int64 bucket
+    indices in ``[0, S)``.  Content keys are balanced binary codes, so their
+    low bits are a free locality hash — no extra projection needed.
+    """
+    n_bits = max(1, (S - 1).bit_length())
+    mask   = (1 << n_bits) - 1
+    return (kc_packed[:, :, 0] & mask).long() % S
+
+
+def packed_majority_vote(rows: brute.Tensor, k: int, D: int) -> brute.Tensor:
+    """Majority vote over ``k`` packed binary rows → packed bit1 output.
+
+    Thin wrapper around ``brute.fast.majority`` for use in the model layers.
+    ``rows`` is ``(batch, k, D)`` bit1; returns ``(batch, D)`` bit1.
+    """
+    return brute.fast.majority(rows, k, D)
+
+
 def hamming_similarity(q_bit: brute.Tensor, keys_bit: brute.Tensor) -> torch.Tensor:
     """Signed similarity ``<q, key> = D - 2·Hamming`` for every key (XNOR+popcount).
 

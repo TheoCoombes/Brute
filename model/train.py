@@ -115,9 +115,13 @@ def main():
     p.add_argument("--no-bsr", dest="use_bsr", action="store_false", default=True,
                    help="disable BSR accumulator path for packed-only hardware profiles.")
     p.add_argument("--epi-slots", type=int, default=None,
-                   help="episodic exact-recall window; default = full sequence during training.")
+                   help="episodic streaming Tier-1 window cap; default = 2*epi-chunk.")
     p.add_argument("--epi-read-k", type=int, default=1,
                    help="episodic top-k read width (1 = exact single-slot).")
+    p.add_argument("--epi-chunk", type=int, default=64,
+                   help="episodic chunk size C for the two-tier chunked forward.")
+    p.add_argument("--epi-registers", type=int, default=64,
+                   help="episodic Tier-2 register slots S (0 = disable global register cache).")
     p.add_argument("--seq-len", type=int, default=64)
     p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--steps", type=int, default=1500, help="number of optimiser (flip) steps.")
@@ -205,6 +209,7 @@ def main():
                        n_slots=args.slots, top_k=args.top_k, seed=args.seed,
                        use_bsr=args.use_bsr,
                        epi_slots=args.epi_slots, epi_read_k=args.epi_read_k,
+                       epi_chunk=args.epi_chunk, epi_registers=args.epi_registers,
                        use_position=args.use_position, gate_open=args.gate_open,
                        structured_codebook=args.structured_codebook,
                        bef_sweeps=args.bef_sweeps, sem_weight=args.sem_weight,

@@ -69,6 +69,14 @@ Current model-facing fused ops:
 - `pack_sign`: numeric `x >= 0` threshold directly to packed bit1 storage.
 - `xnor_popcount_matmul`: packed XNOR/popcount matrix multiply returning signed
   int32 similarities.
+- `xnor_popcount_matmul_sign`: fused XNOR/popcount + sign threshold returning
+  packed bit1 directly — no int32 intermediate. Used by `BooleanLinear` when
+  `boundary_nu` is `None`.
+- `packed_majority`: bit-sliced majority vote over `k` packed rows, processing
+  64 lanes per word. Replaces integer-tally + sign in multi-slot Hopfield and
+  episodic reads.
+- `episodic_causal_search`: fused windowed Hamming scan + top-1 + payload
+  gather for the streaming inference path. Returns (read, idx, score).
 - `bsr_scan`: packed BSR forward scan returning packed read/state/gate buffers.
 
 When adding an op, update all applicable backend headers, drivers, schemas in

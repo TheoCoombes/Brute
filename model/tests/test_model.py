@@ -144,6 +144,15 @@ class TestLearning:
         info = m.metrics(m.forward(X), Y)
         assert info["acc"] > 0.9, f"context disambiguation only reached {info['acc']:.3f}"
 
+    def test_epi_chunk_epi_registers_in_config(self):
+        cfg = HaemmrConfig(epi_chunk=32, epi_registers=16)
+        assert cfg.epi_chunk == 32
+        assert cfg.epi_registers == 16
+        with pytest.raises(ValueError):
+            HaemmrConfig(epi_chunk=0)
+        with pytest.raises(ValueError):
+            HaemmrConfig(epi_registers=-1)
+
     def test_induction_pattern_at_length_64(self):
         """If A is followed by B earlier, seeing A again should predict B."""
         torch.manual_seed(0)

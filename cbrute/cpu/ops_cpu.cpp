@@ -317,4 +317,216 @@ at::Tensor& randomize_bits(at::Tensor& out) {
     return out;
 }
 
+// ── Fused sign ops ──────────────────────────────────────────────────────────
+
+// xnor_popcount_matmul_sign — like xnor_popcount_matmul but the epilogue
+// packs sign(K - 2H) directly into bit1 output (M, ceil(N/64)) instead of
+// storing int32. Eliminates the intermediate int32 buffer + separate pack_sign
+// call in BooleanLinear when boundary_nu is None.
+at::Tensor xnor_popcount_matmul_sign(const at::Tensor& A, const at::Tensor& B, int64_t K) {
+    TORCH_CHECK(A.dim() == 2 && B.dim() == 2,
+                "xnor_popcount_matmul_sign: inputs must be 2-D");
+    const int64_t M = A.size(0), N = B.size(0), Kp = A.size(1);
+    TORCH_CHECK(Kp == B.size(1), "xnor_popcount_matmul_sign: packed K mismatch");
+    TORCH_CHECK(A.scalar_type() == at::kLong && B.scalar_type() == at::kLong,
+                "xnor_popcount_matmul_sign: inputs must be int64 packed buffers");
+
+    const int64_t Np = (N + PACK_WIDTH - 1) / PACK_WIDTH;
+    const int32_t K_logical = (int32_t)K;
+
+    auto Ac = A.contiguous();
+    auto Bc = B.contiguous();
+    auto C  = at::zeros({M, Np}, at::kLong);
+
+    const uint64_t* a = reinterpret_cast<const uint64_t*>(Ac.data_ptr<int64_t>());
+    const uint64_t* b = reinterpret_cast<const uint64_t*>(Bc.data_ptr<int64_t>());
+    uint64_t*       c = reinterpret_cast<uint64_t*>(C.data_ptr<int64_t>());
+
+    // Process M rows in MATMUL_M_GRAIN chunks.  For each row we iterate over N
+    // output bits in packs of 64 (one output word each), reusing the
+    // Highway-vectorised XorPopcountPair for the K inner loop.
+    at::parallel_for(0, M, MATMUL_M_GRAIN, [&](int64_t ms, int64_t me) {
+        for (int64_t m = ms; m < me; ++m) {
+            const uint64_t* a_row = a + m * Kp;
+            uint64_t*       c_row = c + m * Np;
+            for (int64_t nw = 0; nw < Np; ++nw) {
+                uint64_t word = 0;
+                const int64_t n_base = nw * PACK_WIDTH;
+                const int64_t n_end  = std::min(n_base + PACK_WIDTH, N);
+                for (int64_t n = n_base; n < n_end; ++n) {
+                    const int32_t sim = hnk::XorPopcountPair(
+                        a_row, b + n * Kp, Kp, K_logical);
+                    if (sim >= 0) word |= (uint64_t(1) << (n - n_base));
+                }
+                c_row[nw] = word;
+            }
+        }
+    });
+    return C;
+}
+
+namespace {
+// Bit-parallel ≥ threshold comparator on n_bits partial-sum words.
+// partial[j] holds the j-th bit of the per-lane count (j=0 → LSB).
+// Returns a 64-bit mask: bit b is 1 iff count[b] >= threshold.
+inline uint64_t count_geq_threshold(const uint64_t* partial, int n_bits, int threshold) {
+    uint64_t greater = 0;
+    uint64_t equal   = ~uint64_t(0);
+    for (int bit = n_bits - 1; bit >= 0; --bit) {
+        const int t_bit = (threshold >> bit) & 1;
+        if (t_bit == 0) {
+            greater |= (equal & partial[bit]);
+            equal   &= ~partial[bit];
+        } else {
+            equal &= partial[bit];
+        }
+    }
+    return greater | equal;
+}
+} // anon
+
+// packed_majority — bit-sliced majority vote over k packed rows.
+// rows: (batch, k, Kp) int64.  Output: (batch, Kp) int64 packed bit1.
+// Output bit b of word w for batch element b is 1 iff more than k/2
+// of the k input rows have that bit set (odd k ⇒ no ties).
+at::Tensor packed_majority(const at::Tensor& rows, int64_t k, int64_t D) {
+    TORCH_CHECK(rows.dim() == 3,
+                "packed_majority: rows must be 3-D (batch, k, Kp)");
+    TORCH_CHECK(rows.scalar_type() == at::kLong,
+                "packed_majority: rows must be int64");
+    TORCH_CHECK(k > 0, "packed_majority: k must be positive");
+    TORCH_CHECK(D > 0, "packed_majority: D must be positive");
+
+    const int64_t batch = rows.size(0);
+    const int64_t Kp    = rows.size(2);
+    TORCH_CHECK(rows.size(1) == k, "packed_majority: dim 1 must equal k");
+    TORCH_CHECK(Kp == (D + PACK_WIDTH - 1) / PACK_WIDTH,
+                "packed_majority: Kp mismatch with D");
+
+    // Number of bits needed to represent counts 0..k.
+    const int n_bits = (k == 1) ? 1
+        : static_cast<int>(std::ceil(std::log2(static_cast<double>(k) + 1.0)));
+    TORCH_CHECK(n_bits <= 8, "packed_majority: k too large (n_bits > 8)");
+    const int threshold = static_cast<int>(k / 2) + 1;  // (k+1)/2 for odd k
+
+    const uint64_t pad_mask = (D % PACK_WIDTH == 0)
+        ? ~uint64_t(0) : ((uint64_t(1) << (D % PACK_WIDTH)) - 1);
+
+    auto rc  = rows.contiguous();
+    auto out = at::zeros({batch, Kp}, at::kLong);
+
+    const uint64_t* r = reinterpret_cast<const uint64_t*>(rc.data_ptr<int64_t>());
+    uint64_t*       o = reinterpret_cast<uint64_t*>(out.data_ptr<int64_t>());
+
+    at::parallel_for(0, batch, ROW_GRAIN, [&](int64_t bs, int64_t be) {
+        uint64_t partial[8];
+        for (int64_t b = bs; b < be; ++b) {
+            for (int64_t w = 0; w < Kp; ++w) {
+                std::fill(partial, partial + n_bits, uint64_t(0));
+                // Carry-ripple addition of k rows.
+                for (int64_t ki = 0; ki < k; ++ki) {
+                    uint64_t carry = r[(b * k + ki) * Kp + w];
+                    for (int j = 0; j < n_bits && carry; ++j) {
+                        const uint64_t s = partial[j] ^ carry;
+                        carry = partial[j] & carry;
+                        partial[j] = s;
+                    }
+                }
+                uint64_t res = count_geq_threshold(partial, n_bits, threshold);
+                if (w == Kp - 1) res &= pad_mask;
+                o[b * Kp + w] = res;
+            }
+        }
+    });
+    return out;
+}
+
+// episodic_causal_search — fused windowed Hamming scan + top-1 + payload gather.
+// Intended for the inference/streaming forward path where a query (qc, qp) is
+// scored against a ring buffer of keys (kc_buf, pos_buf) of size cnt[b] per
+// batch element. Returns the gathered read payload, the argmax index, and the
+// best score.
+//
+// qc, qp: (B, Kp) int64 packed
+// kc_buf, pos_buf, payload: (B, N, Kp) int64 packed
+// cnt: (B,) int32 valid slot count (<= N)
+// Returns: read (B, Kp), idx (B,) int32, score (B,) int32
+std::tuple<at::Tensor, at::Tensor, at::Tensor>
+episodic_causal_search(const at::Tensor& qc, const at::Tensor& kc_buf,
+                        const at::Tensor& qp, const at::Tensor& pos_buf,
+                        const at::Tensor& payload, const at::Tensor& cnt,
+                        int64_t D) {
+    TORCH_CHECK(qc.dim() == 2 && qp.dim() == 2,
+                "episodic_causal_search: qc/qp must be 2-D (B, Kp)");
+    TORCH_CHECK(kc_buf.dim() == 3 && pos_buf.dim() == 3 && payload.dim() == 3,
+                "episodic_causal_search: buffers must be 3-D (B, N, Kp)");
+    TORCH_CHECK(cnt.dim() == 1 && cnt.scalar_type() == at::kInt,
+                "episodic_causal_search: cnt must be 1-D int32");
+    TORCH_CHECK(D > 0, "episodic_causal_search: D must be positive");
+
+    const int64_t B  = qc.size(0);
+    const int64_t Kp = qc.size(1);
+    TORCH_CHECK(qp.size(0) == B && qp.size(1) == Kp);
+    TORCH_CHECK(kc_buf.size(0) == B && kc_buf.size(2) == Kp);
+    TORCH_CHECK(pos_buf.sizes() == kc_buf.sizes() && payload.sizes() == kc_buf.sizes());
+    TORCH_CHECK(cnt.size(0) == B);
+
+    const int64_t N = kc_buf.size(1);
+    const int32_t K_logical = (int32_t)D;
+
+    auto qcc   = qc.contiguous();
+    auto qpc   = qp.contiguous();
+    auto kcc   = kc_buf.contiguous();
+    auto psc   = pos_buf.contiguous();
+    auto payc  = payload.contiguous();
+    auto cntc  = cnt.contiguous();
+
+    auto read      = at::zeros({B, Kp}, at::kLong);
+    auto idx_out   = at::full({B}, int32_t(-1), at::kInt);
+    auto score_out = at::full({B}, int32_t(-(int32_t)D * 2 - 2), at::kInt);
+
+    const uint64_t* qc_ptr  = reinterpret_cast<const uint64_t*>(qcc.data_ptr<int64_t>());
+    const uint64_t* qp_ptr  = reinterpret_cast<const uint64_t*>(qpc.data_ptr<int64_t>());
+    const uint64_t* kc_ptr  = reinterpret_cast<const uint64_t*>(kcc.data_ptr<int64_t>());
+    const uint64_t* ps_ptr  = reinterpret_cast<const uint64_t*>(psc.data_ptr<int64_t>());
+    const uint64_t* pay_ptr = reinterpret_cast<const uint64_t*>(payc.data_ptr<int64_t>());
+    const int32_t*  cnt_ptr = cntc.data_ptr<int32_t>();
+    uint64_t*       r_ptr   = reinterpret_cast<uint64_t*>(read.data_ptr<int64_t>());
+    int32_t*        i_ptr   = idx_out.data_ptr<int32_t>();
+    int32_t*        s_ptr   = score_out.data_ptr<int32_t>();
+
+    at::parallel_for(0, B, ROW_GRAIN, [&](int64_t bs, int64_t be) {
+        for (int64_t b = bs; b < be; ++b) {
+            const int32_t valid = cnt_ptr[b];
+            if (valid <= 0) continue;
+
+            const uint64_t* qc_row  = qc_ptr  + b * Kp;
+            const uint64_t* qp_row  = qp_ptr  + b * Kp;
+            const uint64_t* kc_rows = kc_ptr  + b * N * Kp;
+            const uint64_t* ps_rows = ps_ptr  + b * N * Kp;
+            const uint64_t* pa_rows = pay_ptr + b * N * Kp;
+
+            int32_t best = INT32_MIN;
+            int32_t best_i = -1;
+            for (int32_t i = 0; i < valid; ++i) {
+                const int32_t cs = hnk::XorPopcountPair(
+                    qc_row, kc_rows + i * Kp, Kp, K_logical);
+                const int32_t ps = hnk::XorPopcountPair(
+                    qp_row, ps_rows + i * Kp, Kp, K_logical);
+                const int32_t total = cs + ps;
+                if (total > best) { best = total; best_i = i; }
+            }
+
+            i_ptr[b] = best_i;
+            s_ptr[b] = best;
+            if (best_i >= 0) {
+                const uint64_t* src = pa_rows + (int64_t)best_i * Kp;
+                uint64_t*       dst = r_ptr   + b * Kp;
+                for (int64_t w = 0; w < Kp; ++w) dst[w] = src[w];
+            }
+        }
+    });
+    return {read, idx_out, score_out};
+}
+
 }} // cbrute::cpu

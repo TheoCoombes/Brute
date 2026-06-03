@@ -119,6 +119,71 @@ def sign(a: torch.Tensor) -> Tensor:
     )
 
 
+def matmul_sign(a: Tensor, b_t: Tensor, K: int) -> Tensor:
+    """A (M×K) @ B^T-as-(N×K) → packed bit1 (M, ceil(N/64)).
+
+    Fuses the XNOR-popcount matmul and the sign threshold into one pass,
+    avoiding the int32 intermediate.  C[m,n] = 1 iff K − 2H(A[m],B[n]) ≥ 0.
+
+    Use instead of ``matmul`` + ``sign`` in BooleanLinear when ``boundary_nu``
+    is None (the common case) — the int32 ``z`` is never materialised.
+    """
+    return Tensor._make_bit1_from_packed(
+        torch.ops.brute.xnor_popcount_matmul_sign(
+            a._packed_buf, b_t._packed_buf, K),
+        list(a.shape[:-1]) + [int(b_t.shape[0])],
+    )
+
+
+def majority(rows: Tensor, k: int, D: int) -> Tensor:
+    """Bit-sliced majority vote over ``k`` packed rows.
+
+    ``rows`` is shape ``(batch, k, D)`` bit1.  Returns ``(batch, D)`` bit1
+    where bit d is 1 iff more than k//2 of the k input rows have bit d set.
+    For odd k there are no ties.
+    """
+    return Tensor._make_bit1_from_packed(
+        torch.ops.brute.packed_majority(rows._packed_buf, k, D),
+        [int(rows.shape[0]), D],
+    )
+
+
+def episodic_causal_search(
+    qc: Tensor,
+    kc_buf: torch.Tensor,
+    qp: Tensor,
+    pos_buf: torch.Tensor,
+    payload: torch.Tensor,
+    cnt: torch.Tensor,
+    D: int,
+) -> tuple[Tensor, torch.Tensor, torch.Tensor]:
+    """Fused windowed Hamming search + top-1 + payload gather (inference path).
+
+    Args:
+        qc:      (B, D) bit1 — content query
+        kc_buf:  (B, N, Kp) int64 packed — content key ring buffer
+        qp:      (B, D) bit1 — position query
+        pos_buf: (B, N, Kp) int64 packed — position ring buffer
+        payload: (B, N, Kp) int64 packed — payload ring buffer
+        cnt:     (B,) int32 — valid slot count per batch element
+        D:       logical dimension
+
+    Returns:
+        read:  (B, D) bit1 — gathered payload at argmax slot
+        idx:   (B,) int32 — argmax slot index (-1 if no valid slot)
+        score: (B,) int32 — best total Hamming score
+    """
+    Kp = int(kc_buf.shape[-1])
+    B  = int(qc.shape[0])
+    read_packed, idx, score = torch.ops.brute.episodic_causal_search(
+        qc._packed_buf, kc_buf, qp._packed_buf, pos_buf, payload, cnt, D)
+    return (
+        Tensor._make_bit1_from_packed(read_packed, [B, D]),
+        idx,
+        score,
+    )
+
+
 def bsr_scan(q: Tensor, assoc: Tensor, decay_shifts: torch.Tensor) -> tuple[Tensor, Tensor, Tensor]:
     """Fused packed BSR forward scan.
 
@@ -164,6 +229,7 @@ __all__ = [
     'bitwise_xor', 'bitwise_and', 'bitwise_or', 'bitwise_not',
     'eq', 'ne',
     'popcount', 'hamming',
-    'matmul', 'sign', 'bsr_scan',
+    'matmul', 'sign', 'matmul_sign', 'majority', 'episodic_causal_search',
+    'bsr_scan',
     'xor_packed', 'and_packed', 'or_packed', 'matmul_packed',
 ]

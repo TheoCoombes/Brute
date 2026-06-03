@@ -44,11 +44,17 @@ Hamming similarity against the shared codebook, with optional semantic rerank.
 ## Packed Hot Paths
 
 - `vsa.sign_to_bit1` uses `brute.fast.sign` and `brute.pack_sign` for int32 and
-  float32 thresholds.
-- `BooleanLinear` uses `brute.fast.matmul`.
+  float32 thresholds (BSR accumulator, general conversions).
+- `BooleanLinear` uses `brute.fast.matmul_sign` (fused, no int32 intermediate)
+  when `boundary_nu` is `None`; falls back to `brute.fast.matmul` + sign when
+  `boundary_nu` is set (needs `|z|` for the eligibility gate).
+- Multi-slot `HopfieldBank` uses `brute.fast.majority` (bit-sliced packed vote)
+  instead of integer tally + sign.
 - BSR forward uses `brute.fast.bsr_scan`, which keeps read/state/gate packed.
-- Episodic streaming stores key, position, and payload ring-buffer state as
-  packed bit buffers.
+- Episodic batched training uses the two-tier chunked forward (O(n·C)) via
+  `_banded_sim` per chunk window; no (B, n, n) score matrix.
+- Episodic streaming uses `brute.fast.episodic_causal_search` (fused Hamming
+  scan + top-1 + payload gather over the Tier-1 ring buffer).
 
 BOLD backward still materialises real-valued signal views where needed. That is
 training state, not canonical parameter storage.
@@ -68,13 +74,13 @@ restore deleted probe scripts as test substitutes.
 
 ## Known Limits
 
-- Batched episodic training constructs `(B, n, n)` scores and is quadratic in
-  sequence length.
-- Multi-slot Hopfield and episodic votes still materialise integer tallies.
 - Decode rerank scores the full compact vocabulary.
 - The inline BEF initializer is for small/local runs; large vocabularies need
   a precomputed codebook.
 - CUDA kernels are implemented but not locally tested in this Mac workspace.
+- Streaming generation (`generate()`) still recomputes the full context each
+  token; wiring block-level BSR/episodic streaming state into autoregressive
+  inference is deferred.
 
 ## Working Rules
 

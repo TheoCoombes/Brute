@@ -16,6 +16,7 @@
 #include "kernels/popcount.cuh"
 #include "kernels/matmul_fallback.cuh"
 #include "kernels/matmul_cutlass.cuh"
+#include "kernels/fused_ops.cuh"
 
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/Dispatch.h>
@@ -385,6 +386,90 @@ at::Tensor bit1_hamming_total(const at::Tensor& A, const at::Tensor& B) {
 }
 
 at::Tensor& randomize_bits(at::Tensor& out) { out.random_(); return out; }
+
+// ── Fused sign ops ──────────────────────────────────────────────────────────
+
+at::Tensor xnor_popcount_matmul_sign(const at::Tensor& A, const at::Tensor& B, int64_t K) {
+    TORCH_CHECK(A.dim() == 2 && B.dim() == 2,
+                "xnor_popcount_matmul_sign: inputs must be 2-D");
+    const int64_t M = A.size(0), N = B.size(0), Kp = A.size(1);
+    TORCH_CHECK(Kp == B.size(1), "xnor_popcount_matmul_sign: packed K mismatch");
+
+    const int64_t Np = (N + 63) / 64;
+    auto Ac = A.contiguous();
+    auto Bc = B.contiguous();
+    auto C  = at::zeros({M, Np}, A.options().dtype(at::kLong));
+
+    const int32_t K_logical = (int32_t)K;
+    // One thread per (m, n); threads write bits via atomicOr.
+    dim3 block(16, 16);
+    dim3 grid((unsigned)((N + 15) / 16), (unsigned)((M + 15) / 16));
+    kernels::k_xnor_popcount_matmul_sign<<<grid, block, 0, cur_stream()>>>(
+        as_u64(Ac), as_u64(Bc),
+        reinterpret_cast<uint64_t*>(C.data_ptr<int64_t>()),
+        (int)M, (int)N, (int)Kp, K_logical, (int)Np);
+    return C;
+}
+
+at::Tensor packed_majority(const at::Tensor& rows, int64_t k, int64_t D) {
+    TORCH_CHECK(rows.dim() == 3, "packed_majority: rows must be 3-D");
+    TORCH_CHECK(rows.scalar_type() == at::kLong);
+    TORCH_CHECK(k > 0 && D > 0);
+
+    const int64_t batch = rows.size(0);
+    const int64_t Kp    = rows.size(2);
+    TORCH_CHECK(rows.size(1) == k);
+    TORCH_CHECK(Kp == (D + 63) / 64, "packed_majority: Kp mismatch with D");
+
+    const int n_bits   = (k == 1) ? 1
+        : (int)std::ceil(std::log2((double)k + 1.0));
+    const int threshold = (int)(k / 2) + 1;
+
+    auto rc  = rows.contiguous();
+    auto out = at::zeros({batch, Kp}, rc.options());
+
+    const int64_t total = batch * Kp;
+    dim3 block(256);
+    dim3 grid((unsigned)((total + 255) / 256));
+    kernels::k_packed_majority<<<grid, block, 0, cur_stream()>>>(
+        as_u64(rc), reinterpret_cast<uint64_t*>(out.data_ptr<int64_t>()),
+        (int)batch, (int)k, (int)Kp, threshold, n_bits, (int)D);
+    return out;
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor>
+episodic_causal_search(const at::Tensor& qc, const at::Tensor& kc_buf,
+                        const at::Tensor& qp, const at::Tensor& pos_buf,
+                        const at::Tensor& payload, const at::Tensor& cnt,
+                        int64_t D) {
+    TORCH_CHECK(qc.dim() == 2 && qp.dim() == 2);
+    TORCH_CHECK(kc_buf.dim() == 3 && pos_buf.dim() == 3 && payload.dim() == 3);
+    TORCH_CHECK(cnt.dim() == 1 && cnt.scalar_type() == at::kInt);
+    TORCH_CHECK(D > 0);
+
+    const int64_t B  = qc.size(0);
+    const int64_t Kp = qc.size(1);
+    const int64_t N  = kc_buf.size(1);
+
+    auto qcc  = qc.contiguous(),   qpc  = qp.contiguous();
+    auto kcc  = kc_buf.contiguous(), psc  = pos_buf.contiguous();
+    auto payc = payload.contiguous(), cntc = cnt.contiguous();
+
+    auto read      = at::zeros({B, Kp}, qcc.options());
+    auto idx_out   = at::full({B}, int32_t(-1), qcc.options().dtype(at::kInt));
+    auto score_out = at::full({B}, int32_t(-(int32_t)D * 2 - 2),
+                              qcc.options().dtype(at::kInt));
+
+    dim3 block(256);
+    dim3 grid((unsigned)((B + 255) / 256));
+    kernels::k_episodic_causal_search<<<grid, block, 0, cur_stream()>>>(
+        as_u64(qcc), as_u64(kcc), as_u64(qpc), as_u64(psc), as_u64(payc),
+        cntc.data_ptr<int32_t>(),
+        reinterpret_cast<uint64_t*>(read.data_ptr<int64_t>()),
+        idx_out.data_ptr<int32_t>(), score_out.data_ptr<int32_t>(),
+        (int)N, (int)Kp, (int)D);
+    return {read, idx_out, score_out};
+}
 
 }} // cbrute::cuda
 #endif // HAVE_CUDA
