@@ -20,11 +20,23 @@ def test_no_local_megabatch_or_old_flip_cap_api():
 
 def test_hot_forward_uses_brute_fast_matmul():
     layers = _text("layers.py")
+    bold = _text("bold.py")
+    fast = (ROOT.parent / "brute" / "fast.py").read_text()
     # BooleanLinear fused path now uses matmul_sign; int32 matmul kept for boundary_nu
     assert "brute.fast.matmul_sign(a_bit, self.W.bit" in layers
     assert "brute.fast.matmul(a_bit, self.W.bit)" in layers   # boundary_nu path
-    assert "return brute.fast.matmul(chat_bit, self.E.bit)" in layers
+    assert "return brute.fast.matmul(ell_bit, self.E_lex)" in layers   # fixed lexical decode
     assert "sim = brute.fast.matmul(q_bit, self.P.bit)" in layers
+    assert "brute.fast.ternary_matmul" in layers
+    assert "brute.fast.bold_update_packed" in bold
+    assert "bsr_delta_scan" in layers
+    assert "bold_update_packed" in fast
+
+
+def test_bold_has_no_float_q_buffer():
+    bold = _text("bold.py")
+    assert "self.q = torch.zeros(self.shape, dtype=torch.float32" not in bold
+    assert "self.q = torch.zeros(self.shape, dtype=torch.int16" in bold
 
 
 def test_no_position_bound_decode_mode():
@@ -37,7 +49,12 @@ def test_no_position_bound_decode_mode():
     assert "decode_pos" not in model_py
 
 
-def test_packed_hardware_forward_has_no_unpack_or_pm1_cache():
+def test_packed_hardware_forward_keeps_weights_packed():
+    """v3 forward: learned weights stay packed; matmul_sign is used; no bool→bit1
+    packing.  The clipped integer concept highway is the *one* concession — it
+    unpacks each branch read to ±1 to accumulate the score field — so a small,
+    bounded number of activation unpacks (O(layers·branches)) is expected, but
+    never any parameter ``_pm1`` materialisation in the forward path."""
     cfg = HaemmrConfig(
         vocab_size=128,
         D=128,
@@ -46,7 +63,6 @@ def test_packed_hardware_forward_has_no_unpack_or_pm1_cache():
         n_slots=32,
         top_k=1,
         epi_read_k=1,
-        epi_registers=0,
         use_bsr=False,
         use_position=False,
         sem_weight=0.0,
@@ -61,9 +77,15 @@ def test_packed_hardware_forward_has_no_unpack_or_pm1_cache():
         logits = model.forward(ids)
 
     assert logits.shape == (32, cfg.vocab_size)
-    assert counts["unpack_pm1"] == 0
-    assert counts["as_tensor_bit1_pack"] == 0
+    # No learned weight is ever unpacked to ±1 in the forward path.
     assert sum(1 for p in model.parameters() if p._pm1 is not None) == 0
+    # No bool→bit1 re-packing on the hot path.
+    assert counts["as_tensor_bit1_pack"] == 0
+    # Boolean linears use the fused matmul_sign path (no int32 intermediate).
+    assert counts["fast_matmul_sign"] >= 1
+    # Highway concession: branch-read unpacks are bounded by O(layers·branches),
+    # not by sequence length or vocabulary.
+    assert counts["unpack_pm1"] <= 2 + cfg.n_layers * 4
 
 
 def test_boolean_linear_fused_path_uses_matmul_sign():
@@ -88,7 +110,7 @@ def test_episodic_forward_is_linear_not_quadratic():
     from vsa import random_hypervectors
 
     D, n, C = 64, 128, 64
-    mem = EpisodicSlotMemory(D, name="epi_contract", epi_chunk=C, epi_registers=0)
+    mem = EpisodicSlotMemory(D, name="epi_contract", epi_chunk=C)
     c   = random_hypervectors(n, D).reshape(1, n, D)
     pos = random_hypervectors(n, D)
     mem.forward(c, pos)

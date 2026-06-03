@@ -115,14 +115,16 @@ def main():
     p.add_argument("--top-k", type=int, default=15, help="Hopfield WTA width (odd).")
     p.add_argument("--no-bsr", dest="use_bsr", action="store_false", default=True,
                    help="disable BSR accumulator path for packed-only hardware profiles.")
-    p.add_argument("--epi-slots", type=int, default=None,
-                   help="episodic streaming Tier-1 window cap; default = 2*epi-chunk.")
+    p.add_argument("--epi-window", type=int, default=None,
+                   help="fixed episodic ring width W (None = chunk-bounded).")
     p.add_argument("--epi-read-k", type=int, default=1,
                    help="episodic top-k read width (1 = exact single-slot).")
     p.add_argument("--epi-chunk", type=int, default=64,
-                   help="episodic chunk size C for the two-tier chunked forward.")
-    p.add_argument("--epi-registers", type=int, default=64,
-                   help="episodic Tier-2 register slots S (0 = disable global register cache).")
+                   help="episodic chunk size C for the chunked ring search.")
+    p.add_argument("--epi-bonus", type=float, default=0.0,
+                   help="episodic shortlist-seeding weight at decode time (0 = off).")
+    p.add_argument("--no-multiscale", dest="multiscale", action="store_false", default=True,
+                   help="disable per-depth scaling of episodic windows and BSR decay.")
     p.add_argument("--seq-len", type=int, default=64)
     p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--steps", type=int, default=1500, help="number of optimiser (flip) steps.")
@@ -143,13 +145,22 @@ def main():
     p.add_argument("--sem-weight", type=float, default=0.5,
                    help="semantic rerank weight added to lexical decode logits.")
     p.add_argument("--boundary-nu", type=float, default=None,
-                   help="BEP-style boundary eligibility gate; unset disables it.")
+                   help="BEP-style per-linear boundary eligibility gate; unset disables it.")
+    p.add_argument("--highway-clip", type=int, default=15,
+                   help="clipped integer concept-highway bound |u| ≤ S (int4/int5).")
+    p.add_argument("--highway-carry", type=int, default=1,
+                   help="λ identity-carry coefficient of the concept highway.")
+    p.add_argument("--alpha-epi", type=int, default=4,
+                   help="episodic branch scale (dominant so exact recall can override).")
+    p.add_argument("--alpha-bsr", type=int, default=1)
+    p.add_argument("--alpha-hop", type=int, default=1)
+    p.add_argument("--alpha-ff", type=int, default=1)
+    p.add_argument("--highway-nu", type=float, default=None,
+                   help="highway boundary gate: only |u| ≤ ν·S bits propagate (None = off).")
     p.add_argument("--label-smoothing", type=float, default=0.0)
     p.add_argument("--flip-dropout", type=float, default=0.0)
-    p.add_argument("--gate-open", type=float, default=0.05,
-                   help="residual-gate init openness (higher ⇒ context flows sooner).")
-    p.add_argument("--codebook-flip-scale", type=float, default=0.3,
-                   help="codebook flip-rate relative to transforms (lower = more stable).")
+    p.add_argument("--sem-flip-scale", type=float, default=0.5,
+                   help="semantic-bank flip-rate relative to transforms.")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default=None, choices=[None, "cpu", "mps", "cuda"])
     p.add_argument("--eval-every", type=int, default=200)
@@ -216,15 +227,20 @@ def main():
     cfg = HaemmrConfig(vocab_size=V, D=args.D, n_layers=args.layers, d_ff=args.d_ff,
                        n_slots=args.slots, top_k=args.top_k, seed=args.seed,
                        use_bsr=args.use_bsr,
-                       epi_slots=args.epi_slots, epi_read_k=args.epi_read_k,
-                       epi_chunk=args.epi_chunk, epi_registers=args.epi_registers,
-                       use_position=args.use_position, gate_open=args.gate_open,
+                       epi_window=args.epi_window, epi_read_k=args.epi_read_k,
+                       epi_chunk=args.epi_chunk, epi_bonus_weight=args.epi_bonus,
+                       multiscale=args.multiscale,
+                       highway_clip=args.highway_clip, highway_carry=args.highway_carry,
+                       alpha_epi=args.alpha_epi, alpha_bsr=args.alpha_bsr,
+                       alpha_hop=args.alpha_hop, alpha_ff=args.alpha_ff,
+                       highway_nu=args.highway_nu,
+                       use_position=args.use_position,
                        structured_codebook=args.structured_codebook,
                        bef_sweeps=args.bef_sweeps, sem_weight=args.sem_weight,
+                       sem_flip_scale=args.sem_flip_scale,
                        boundary_nu=args.boundary_nu,
                        label_smoothing=args.label_smoothing,
                        flip_dropout=args.flip_dropout,
-                       codebook_flip_scale=args.codebook_flip_scale,
                        )
     model = HaemmrLM(cfg, device=device)
     opt = BoldOptimizer(model.parameters(),

@@ -71,6 +71,81 @@ def test_bsr_scan_matches_reference(D, device):
     assert torch.equal(gate.bool().as_subclass(torch.Tensor), ref_gate)
 
 
+def _bsr_delta_reference(q_bool, assoc_bool, shift_by_dim, erase, write, clip):
+    B, n, D = q_bool.shape
+    A = torch.zeros(B, D, dtype=torch.int32, device=q_bool.device)
+    read = torch.zeros_like(q_bool)
+    state = torch.zeros_like(q_bool)
+    gate = torch.zeros_like(q_bool)
+    for t in range(n):
+        state_t = A >= 0
+        assoc_pm1 = torch.where(assoc_bool[:, t], 1, -1).to(torch.int32)
+        S = torch.where(state_t, 1, -1).to(torch.int32)
+        gate_t = state_t != assoc_bool[:, t]
+        read[:, t] = q_bool[:, t] == state_t
+        state[:, t] = state_t
+        gate[:, t] = gate_t
+        decayed = A.clone()
+        for s in sorted(set(int(x) for x in shift_by_dim.tolist())):
+            if s > 0:
+                mask = shift_by_dim == s
+                decayed[:, mask] = A[:, mask] - (A[:, mask] >> s)
+        A = decayed - erase * gate_t.to(torch.int32) * S + write * gate_t.to(torch.int32) * assoc_pm1
+        A = A.clamp(-clip, clip)
+    return read, state, gate
+
+
+@pytest.mark.parametrize("D", [31, 64, 97])
+def test_bsr_delta_scan_matches_reference(D, device):
+    if torch.device(device).type != "cpu":
+        pytest.skip("bsr_delta_scan is a CPU packed-training kernel")
+    B, n = 2, 7
+    q_bool = torch.randint(0, 2, (B, n, D), dtype=torch.bool)
+    assoc_bool = torch.randint(0, 2, (B, n, D), dtype=torch.bool)
+    q = brute.as_tensor(q_bool, dtype=brute.bit1)
+    assoc = brute.as_tensor(assoc_bool, dtype=brute.bit1)
+    shift = (torch.arange(D, dtype=torch.int32) % 4)
+    erase = ((torch.arange(D) % 3) + 1).to(torch.int8)
+    write = ((torch.arange(D) % 2) + 1).to(torch.int8)
+
+    read, state, gate = bfast.bsr_delta_scan(q, assoc, shift, erase, write, 9)
+    ref_read, ref_state, ref_gate = _bsr_delta_reference(q_bool, assoc_bool, shift, erase.int(), write.int(), 9)
+
+    assert torch.equal(read.bool().as_subclass(torch.Tensor), ref_read)
+    assert torch.equal(state.bool().as_subclass(torch.Tensor), ref_state)
+    assert torch.equal(gate.bool().as_subclass(torch.Tensor), ref_gate)
+
+
+@pytest.mark.parametrize("M,K,N", [(3, 5, 17), (4, 8, 64), (2, 7, 97)])
+def test_ternary_bit1_matmul_matches_reference(M, K, N, device):
+    if torch.device(device).type != "cpu":
+        pytest.skip("ternary_bit1_matmul is a CPU packed-training kernel")
+    A = torch.randint(-2, 3, (M, K), dtype=torch.int32)
+    B_bool = torch.randint(0, 2, (K, N), dtype=torch.bool)
+    B = brute.as_tensor(B_bool, dtype=brute.bit1)
+    got = bfast.ternary_matmul(A, B)
+    B_pm1 = torch.where(B_bool, 1, -1).to(torch.int32)
+    ref = A @ B_pm1
+    assert got.dtype == torch.int32
+    assert torch.equal(got, ref)
+
+
+def test_bold_update_packed_matches_flip_rule(device):
+    if torch.device(device).type != "cpu":
+        pytest.skip("bold_update_packed CPU kernel is covered on CPU")
+    bit = brute.as_tensor(torch.tensor([[True, False, True, False, True]]), dtype=brute.bit1)
+    m = torch.tensor([[0, 0, 2, -2, 1]], dtype=torch.int16)
+    q = torch.tensor([[1, -1, -1, 1, 1]], dtype=torch.int32)
+    out, m_out, n_flip = bfast.bold_update_packed(
+        bit, m, q, beta_num=1, beta_den=1, eta=2, threshold=2, m_clip=7)
+
+    # updated m = [2, -2, 0, 0, 3]; entries 0,1,4 agree with current bits.
+    ref = torch.tensor([[False, True, True, False, False]])
+    assert int(n_flip.item()) == 3
+    assert torch.equal(out.bool().as_subclass(torch.Tensor), ref)
+    assert torch.equal(m_out, torch.tensor([[0, 0, 0, 0, 0]], dtype=torch.int16))
+
+
 # ── xnor_popcount_matmul_sign ─────────────────────────────────────────────────
 
 @pytest.mark.parametrize("M,N,K", [(4, 8, 64), (3, 33, 128), (7, 64, 96)])

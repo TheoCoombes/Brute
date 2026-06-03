@@ -135,6 +135,17 @@ def matmul_sign(a: Tensor, b_t: Tensor, K: int) -> Tensor:
     )
 
 
+def ternary_matmul(a: torch.Tensor, b: Tensor, N: int | None = None) -> torch.Tensor:
+    """Dense ternary/integer signal matrix times packed bit1 rows.
+
+    ``a`` is ``(M, K)`` with entries interpreted as signed integer votes.
+    ``b`` is a bit1 tensor with logical shape ``(K, N)``. The result is int32
+    ``(M, N)`` with ``sum_k a[m,k] * (+1/-1 from b[k,n])``.
+    """
+    logical_n = int(b.shape[-1] if N is None else N)
+    return torch.ops.brute.ternary_bit1_matmul(a, b._packed_buf, logical_n)
+
+
 def majority(rows: Tensor, k: int, D: int) -> Tensor:
     """Bit-sliced majority vote over ``k`` packed rows.
 
@@ -201,6 +212,55 @@ def bsr_scan(q: Tensor, assoc: Tensor, decay_shifts: torch.Tensor) -> tuple[Tens
     )
 
 
+def bsr_delta_scan(
+    q: Tensor,
+    assoc: Tensor,
+    decay_shift_by_dim: torch.Tensor,
+    erase_by_dim: torch.Tensor,
+    write_by_dim: torch.Tensor,
+    state_clip: int,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Packed BSR erase/write forward scan.
+
+    Returns ``(read, state, gate)`` as bit1 tensors with the same logical shape
+    as ``q``. Unlike :func:`bsr_scan`, this mirrors the model's decoupled
+    erase/write recurrence and per-dimension power-of-two decay palette.
+    """
+    D = int(q.shape[-1])
+    read, state, gate = torch.ops.brute.bsr_delta_scan(
+        q._packed_buf, assoc._packed_buf, decay_shift_by_dim,
+        erase_by_dim, write_by_dim, int(state_clip), D)
+    shape = list(q.shape)
+    return (
+        Tensor._make_bit1_from_packed(read, shape),
+        Tensor._make_bit1_from_packed(state, shape),
+        Tensor._make_bit1_from_packed(gate, shape),
+    )
+
+
+def bold_update_packed(
+    weight: Tensor,
+    m: torch.Tensor,
+    q: torch.Tensor,
+    beta_num: int,
+    beta_den: int,
+    eta: int,
+    threshold: int,
+    m_clip: int,
+) -> tuple[Tensor, torch.Tensor, torch.Tensor]:
+    """Packed BOLD bit-flip update over a bit1 weight tensor.
+
+    ``m`` and ``q`` are integer tensors in the logical weight shape. The kernel
+    applies ``m <- beta*m + eta*q``, flips packed weight bits where the updated
+    accumulator agrees with the current bit by at least ``threshold``, and resets
+    flipped accumulator entries to zero.
+    """
+    packed, m_out, n_flip = torch.ops.brute.bold_update_packed(
+        weight._packed_buf, m, q, int(beta_num), int(beta_den), int(eta),
+        int(threshold), int(m_clip), int(weight.shape[-1]))
+    return Tensor._make_bit1_from_packed(packed, list(weight.shape)), m_out, n_flip
+
+
 # ── Packed-buffer arithmetic for the truly performance-paranoid ─────────
 
 def xor_packed(a_buf: torch.Tensor, b_buf: torch.Tensor) -> torch.Tensor:
@@ -229,7 +289,8 @@ __all__ = [
     'bitwise_xor', 'bitwise_and', 'bitwise_or', 'bitwise_not',
     'eq', 'ne',
     'popcount', 'hamming',
-    'matmul', 'sign', 'matmul_sign', 'majority', 'episodic_causal_search',
-    'bsr_scan',
+    'matmul', 'sign', 'matmul_sign', 'ternary_matmul',
+    'majority', 'episodic_causal_search',
+    'bsr_scan', 'bsr_delta_scan', 'bold_update_packed',
     'xor_packed', 'and_packed', 'or_packed', 'matmul_packed',
 ]

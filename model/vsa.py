@@ -57,6 +57,12 @@ def to_pm1(x: brute.Tensor) -> torch.Tensor:
     return x.unpack_pm1()
 
 
+def to_i8_pm1(x: brute.Tensor) -> torch.Tensor:
+    """Decode a ``brute.bit1`` tensor to an int8 ±1 tensor (+1 / -1)."""
+    bits = x.bool().as_subclass(torch.Tensor)
+    return bits.to(torch.int8) * 2 - 1
+
+
 def sign_to_bit1(z: torch.Tensor) -> brute.Tensor:
     """Threshold an integer/real tensor to bit1 with the ``sign(0) = +1`` rule.
 
@@ -163,18 +169,6 @@ def random_hypervectors(num: int, D: int, *, generator: torch.Generator | None =
     bits = torch.randint(0, 2, (num, D), generator=generator).bool()  # CPU generator
     hv = brute.as_tensor(bits, dtype=brute.bit1)
     return hv.to(device) if device is not None else hv
-
-
-def lsh_buckets(kc_packed: torch.Tensor, S: int) -> torch.Tensor:
-    """LSH bucket index for each token using low bits of the first packed word.
-
-    ``kc_packed`` is ``(B, n, Kp)`` int64.  Returns ``(B, n)`` int64 bucket
-    indices in ``[0, S)``.  Content keys are balanced binary codes, so their
-    low bits are a free locality hash — no extra projection needed.
-    """
-    n_bits = max(1, (S - 1).bit_length())
-    mask   = (1 << n_bits) - 1
-    return (kc_packed[:, :, 0] & mask).long() % S
 
 
 def packed_majority_vote(rows: brute.Tensor, k: int, D: int) -> brute.Tensor:

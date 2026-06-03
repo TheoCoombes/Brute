@@ -4,9 +4,8 @@ Implements the learning machinery of *Boolean Logic Deep Learning* (Nguyen et
 al., NeurIPS 2024) as summarised in HÆMMR §7:
 
     * Boolean variation  δ(a→b) ∈ {T, 0, F}, embedded e(T)=+1, e(0)=0, e(F)=-1.
-    * The per-weight optimisation signal ``q`` is a signed real: its **sign** is
-      the recommended flip direction, its **magnitude** is the confidence.  It is
-      produced by the layers' backward passes (the XNOR chain rule, Eqs. 5-8).
+    * The per-weight optimisation signal ``q`` is the ternary logic projection
+      of aggregated Boolean variation: positive/T, zero/no variation, negative/F.
     * Flip rule (Eq. 9):     w  ←  ¬w   iff   xnor(q, w) = T
       i.e. flip the bit when the signal *agrees in sign* with the current
       bipolar weight value.  No gradient, no learning-rate-scaled subtraction —
@@ -17,22 +16,21 @@ al., NeurIPS 2024) as summarised in HÆMMR §7:
           β  =  (#unchanged weights) / (#weights)
 
 The weight itself is **stored as ``brute.bit1``** (the canonical parameter).
-``m`` is transient optimiser state (the only integer state, like Adam's
-moments) and resets on every flip.  A cached ±1 float view is kept *only* so the
-backward-pass signal matmuls — which are inherently real-valued, exactly as in
-BOLD — can read it; it is never the source of truth.
+``m`` is integer optimiser state and resets on every flip. ``q`` is a transient
+integer signal buffer cleared after each optimizer step; it is not a latent
+parameter and never drives a gradient-descent update.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional
+from typing import Iterable, List, Optional
 
 import torch
 
 import brute
 
-from vsa import to_bit1, to_pm1
+from vsa import to_pm1
 
 
 class BoldParam:
@@ -46,7 +44,10 @@ class BoldParam:
         Identifier (used for checkpointing / debugging).
     """
 
-    __slots__ = ("name", "bit", "_pm1", "m", "q", "beta", "shape", "device", "flip_scale")
+    __slots__ = (
+        "name", "bit", "_pm1", "m", "q", "beta", "beta_num", "beta_den",
+        "shape", "device", "flip_scale",
+    )
 
     def __init__(self, bit: brute.Tensor, name: str = "", flip_scale: float = 1.0):
         assert getattr(bit, "_is_bit1", False), "BoldParam requires a bit1 tensor"
@@ -55,12 +56,15 @@ class BoldParam:
         self.shape = tuple(bit.shape)
         self.device = bit.device
         self._pm1: Optional[torch.Tensor] = None         # lazy ±1 cache
-        # Integer per-weight accumulator (the tracker's buffer, §7.3) — int8 to
-        # be memory-faithful; it low-pass-filters the noisy per-step signal so
-        # small-but-consistent evidence accumulates and eventually flips a bit.
-        self.m = torch.zeros(self.shape, dtype=torch.int8, device=bit.device)
-        self.q = torch.zeros(self.shape, dtype=torch.float32, device=bit.device)
+        # Integer per-weight accumulator (BOLD Eq. 10). int16 keeps the update
+        # fixed-point and compact while leaving headroom for eta-scaled counts.
+        self.m = torch.zeros(self.shape, dtype=torch.int16, device=bit.device)
+        # Transient ternary Boolean-variation signal (BOLD Eq. 7 projected by
+        # Def. A.1). It is cleared after every optimizer step.
+        self.q = torch.zeros(self.shape, dtype=torch.int16, device=bit.device)
         self.beta = 1.0
+        self.beta_num = 1
+        self.beta_den = 1
         # Per-parameter flip-rate multiplier — the tied codebook is the fragile
         # representation, so it needs more accumulated evidence (higher effective
         # threshold) before it flips.
@@ -76,49 +80,43 @@ class BoldParam:
 
     # ── signal accumulation (called by layer backward) ───────────────────────
     def add_signal(self, q_delta: torch.Tensor) -> None:
-        """Accumulate a flip-signal contribution ``q`` (same shape as the weight)."""
+        """Accumulate a Boolean variation contribution ``q``.
+
+        Inputs are projected to their logic value {-1, 0, +1}; the accumulator
+        ``m`` carries persistence over training iterations.
+        """
         if q_delta.shape != self.q.shape:
             q_delta = q_delta.reshape(self.q.shape)
-        self.q += q_delta.to(self.q.dtype)
+        q_i = torch.sign(q_delta).to(self.q.dtype)
+        self.q.add_(q_i)
 
     def zero_signal(self) -> None:
         self.q.zero_()
 
     # ── flip step (BOLD Eqs. 9-11, integer accumulator) ──────────────────────
     @torch.no_grad()
-    def apply(self, eta: float, threshold: float = 6.0, m_clip: int = 127) -> int:
+    def apply(self, eta: float, threshold: float = 1.0, m_clip: int = 127) -> int:
         """Apply one BOLD update step.  Returns the number of bits flipped.
 
-        ``m ← β·m + η·q̂`` accumulates evidence into the integer buffer, where
-        ``q̂`` is the step signal normalised to unit scale (so one step adds
-        ``≈η`` and the threshold is interpretable across parameters of different
-        magnitudes).  A bit flips when the *accumulated* evidence in its current
-        direction crosses ``threshold`` — i.e. BOLD's sign rule (Eq. 9,
-        ``m·e(w) > 0``) gated by enough integrated confidence.  Nothing is ever
-        discarded: a small consistent signal still accumulates over many steps
-        and eventually flips (unlike a top-k cap).  Acted bits reset to 0 (error
-        feedback); β auto-regularises (Eq. 11).
+        ``m ← β·m + η·q`` is performed as integer fixed-point arithmetic. A bit
+        flips when the updated accumulator agrees with the current Boolean
+        weight and crosses ``threshold`` (Eq. 9 / Algorithm 1), then that
+        accumulator entry is reset to zero. β is the exact unchanged/total
+        fraction from the previous step (Eq. 11).
         """
-        pm1 = self.pm1
-        q = self.q
-        scale = q.abs().mean()
-        m = self.m.to(torch.int16)
-        if scale > 0:
-            inc = torch.round(eta * q / scale).to(torch.int16)
-            m = torch.round(self.beta * m.float()).to(torch.int16) + inc      # Eq. 10
-            m = m.clamp_(-m_clip, m_clip)
-        evidence = m.float() * pm1                                  # >0 ⇔ agrees (Eq. 9)
-        eff_threshold = max(1.0, threshold / max(self.flip_scale, 1e-6))
-        flip = evidence >= eff_threshold
-        n_flip = int(flip.sum().item())
-        if n_flip:
-            new_pm1 = torch.where(flip, -pm1, pm1)
-            m = torch.where(flip, torch.zeros_like(m), m)           # reset (EF)
-            self.bit = to_bit1(new_pm1)
-            self._pm1 = new_pm1
-        self.m = m.clamp_(-m_clip, m_clip).to(torch.int8)
+        eta_i = max(0, int(round(float(eta))))
+        eff_threshold = max(1, int(round(float(threshold) / max(self.flip_scale, 1e-6))))
+        bit, m, n_flip_t = brute.fast.bold_update_packed(
+            self.bit, self.m, self.q, self.beta_num, self.beta_den,
+            eta_i, eff_threshold, int(m_clip))
+        n_flip = int(n_flip_t.item())
+        self.bit = bit
+        self.m = m
+        self._pm1 = None
         n_tot = self.m.numel()
-        self.beta = (n_tot - n_flip) / max(n_tot, 1)                # Eq. 11
+        self.beta_num = n_tot - n_flip
+        self.beta_den = max(n_tot, 1)
+        self.beta = self.beta_num / self.beta_den                  # Eq. 11
         self.q.zero_()
         return n_flip
 
@@ -129,6 +127,8 @@ class BoldParam:
             "shape": self.shape,
             "m": self.m.detach().cpu().clone(),
             "beta": self.beta,
+            "beta_num": self.beta_num,
+            "beta_den": self.beta_den,
         }
 
     def load_state_dict(self, sd: dict) -> None:
@@ -138,15 +138,17 @@ class BoldParam:
         self._pm1 = None
         self.m = sd["m"].to(self.device)
         self.beta = float(sd["beta"])
+        self.beta_num = int(sd.get("beta_num", round(self.beta * self.m.numel())))
+        self.beta_den = int(sd.get("beta_den", max(self.m.numel(), 1)))
 
 
 @dataclass
 class BoldConfig:
-    eta: float = 3.0                # accumulation rate η (a step adds ≈η to the int buffer)
+    eta: float = 3.0                # integer-rounded accumulation factor η
     eta_decay: float = 1.0          # multiplicative decay per optimiser step
-    eta_min: float = 0.5
-    threshold: float = 6.0          # integrated evidence needed to flip a bit (hysteresis)
-    m_clip: int = 127               # int8 accumulator saturation (±127)
+    eta_min: float = 1.0
+    threshold: float = 6.0          # integer evidence needed to flip a bit
+    m_clip: int = 127               # accumulator saturation (±127 by default)
 
 
 class BoldOptimizer:

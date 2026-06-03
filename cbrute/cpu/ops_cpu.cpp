@@ -203,6 +203,61 @@ at::Tensor xnor_popcount_matmul(const at::Tensor& A, const at::Tensor& B, int64_
     return C;
 }
 
+at::Tensor ternary_bit1_matmul(const at::Tensor& A, const at::Tensor& B, int64_t N) {
+    TORCH_CHECK(A.dim() == 2 && B.dim() == 2,
+                "ternary_bit1_matmul: inputs must be 2-D");
+    TORCH_CHECK(B.scalar_type() == at::kLong,
+                "ternary_bit1_matmul: B must be int64 packed storage");
+    TORCH_CHECK(A.scalar_type() == at::kChar || A.scalar_type() == at::kShort
+                || A.scalar_type() == at::kInt || A.scalar_type() == at::kFloat,
+                "ternary_bit1_matmul: A must be int8, int16, int32, or float32");
+    const int64_t M = A.size(0), K = A.size(1), Kb = B.size(0), Kp = B.size(1);
+    TORCH_CHECK(K == Kb, "ternary_bit1_matmul: reduction dimension mismatch");
+    TORCH_CHECK(N >= 0, "ternary_bit1_matmul: N must be non-negative");
+    TORCH_CHECK(Kp == (N + PACK_WIDTH - 1) / PACK_WIDTH,
+                "ternary_bit1_matmul: packed width does not match N");
+
+    auto Ac = A.contiguous();
+    auto Bc = B.contiguous();
+    auto C = at::empty({M, N}, at::kInt);
+    if (M == 0 || N == 0) return C;
+
+    const uint64_t* b = reinterpret_cast<const uint64_t*>(Bc.data_ptr<int64_t>());
+    int32_t* c = C.data_ptr<int32_t>();
+
+    auto run = [&](auto* a) {
+        at::parallel_for(0, M, ROW_GRAIN, [&](int64_t begin, int64_t end) {
+            for (int64_t m = begin; m < end; ++m) {
+                for (int64_t w = 0; w < Kp; ++w) {
+                    const int64_t live = std::min<int64_t>(PACK_WIDTH, N - w * PACK_WIDTH);
+                    for (int64_t lane = 0; lane < live; ++lane) {
+                        const uint64_t mask = uint64_t(1) << lane;
+                        int32_t sum = 0;
+                        for (int64_t k = 0; k < K; ++k) {
+                            const int32_t av = static_cast<int32_t>(a[m * K + k]);
+                            if (av == 0) continue;
+                            const bool bit = (b[k * Kp + w] & mask) != 0;
+                            sum += bit ? av : -av;
+                        }
+                        c[m * N + w * PACK_WIDTH + lane] = sum;
+                    }
+                }
+            }
+        });
+    };
+
+    if (A.scalar_type() == at::kChar) {
+        run(Ac.data_ptr<int8_t>());
+    } else if (A.scalar_type() == at::kShort) {
+        run(Ac.data_ptr<int16_t>());
+    } else if (A.scalar_type() == at::kInt) {
+        run(Ac.data_ptr<int32_t>());
+    } else {
+        run(Ac.data_ptr<float>());
+    }
+    return C;
+}
+
 std::tuple<at::Tensor, at::Tensor, at::Tensor>
 bsr_scan(const at::Tensor& q, const at::Tensor& assoc,
          const at::Tensor& decay_shifts, int64_t D) {
@@ -267,6 +322,190 @@ bsr_scan(const at::Tensor& q, const at::Tensor& assoc,
         }
     });
     return {read, state, gate};
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor>
+bsr_delta_scan(const at::Tensor& q, const at::Tensor& assoc,
+               const at::Tensor& decay_shift_by_dim,
+               const at::Tensor& erase_by_dim,
+               const at::Tensor& write_by_dim,
+               int64_t state_clip, int64_t D) {
+    TORCH_CHECK(q.dim() == 3 && assoc.dim() == 3,
+                "bsr_delta_scan: q and assoc must be packed tensors with shape (B, n, Kp)");
+    TORCH_CHECK(q.sizes() == assoc.sizes(), "bsr_delta_scan: q/assoc shape mismatch");
+    TORCH_CHECK(q.scalar_type() == at::kLong && assoc.scalar_type() == at::kLong,
+                "bsr_delta_scan: q and assoc must be int64 packed buffers");
+    TORCH_CHECK(decay_shift_by_dim.dim() == 1 && decay_shift_by_dim.scalar_type() == at::kInt,
+                "bsr_delta_scan: decay_shift_by_dim must be a 1-D int32 tensor");
+    TORCH_CHECK(erase_by_dim.dim() == 1 && write_by_dim.dim() == 1,
+                "bsr_delta_scan: erase/write must be 1-D tensors");
+    TORCH_CHECK(erase_by_dim.scalar_type() == at::kChar || erase_by_dim.scalar_type() == at::kInt,
+                "bsr_delta_scan: erase_by_dim must be int8 or int32");
+    TORCH_CHECK(write_by_dim.scalar_type() == at::kChar || write_by_dim.scalar_type() == at::kInt,
+                "bsr_delta_scan: write_by_dim must be int8 or int32");
+    TORCH_CHECK(D >= 0, "bsr_delta_scan: D must be non-negative");
+    TORCH_CHECK(state_clip > 0, "bsr_delta_scan: state_clip must be positive");
+    TORCH_CHECK(decay_shift_by_dim.numel() == D && erase_by_dim.numel() == D
+                && write_by_dim.numel() == D,
+                "bsr_delta_scan: per-dimension tensors must have length D");
+
+    const auto qc = q.contiguous();
+    const auto ac = assoc.contiguous();
+    const auto sc = decay_shift_by_dim.contiguous();
+    const auto ec = erase_by_dim.contiguous();
+    const auto wc = write_by_dim.contiguous();
+    const int64_t B = qc.size(0), n = qc.size(1), Kp = qc.size(2);
+    TORCH_CHECK(Kp == (D + PACK_WIDTH - 1) / PACK_WIDTH,
+                "bsr_delta_scan: packed width does not match D");
+
+    auto read = at::zeros(qc.sizes(), qc.options());
+    auto state = at::zeros(qc.sizes(), qc.options());
+    auto gate = at::zeros(qc.sizes(), qc.options());
+    if (B == 0 || n == 0 || Kp == 0 || D == 0) {
+        return {read, state, gate};
+    }
+
+    const uint64_t* q_ptr = reinterpret_cast<const uint64_t*>(qc.data_ptr<int64_t>());
+    const uint64_t* a_ptr = reinterpret_cast<const uint64_t*>(ac.data_ptr<int64_t>());
+    const int32_t* shifts = sc.data_ptr<int32_t>();
+    uint64_t* r_ptr = reinterpret_cast<uint64_t*>(read.data_ptr<int64_t>());
+    uint64_t* s_ptr = reinterpret_cast<uint64_t*>(state.data_ptr<int64_t>());
+    uint64_t* g_ptr = reinterpret_cast<uint64_t*>(gate.data_ptr<int64_t>());
+
+    auto run = [&](auto* erase, auto* write) {
+        at::parallel_for(0, B * Kp, ROW_GRAIN, [&](int64_t begin, int64_t end) {
+            for (int64_t item = begin; item < end; ++item) {
+                const int64_t b = item / Kp;
+                const int64_t w = item - b * Kp;
+                for (int64_t lane = 0; lane < PACK_WIDTH; ++lane) {
+                    const int64_t d = w * PACK_WIDTH + lane;
+                    if (d >= D) break;
+                    const int32_t shift = shifts[d];
+                    const int32_t erase_v = static_cast<int32_t>(erase[d]);
+                    const int32_t write_v = static_cast<int32_t>(write[d]);
+                    const uint64_t mask = uint64_t(1) << lane;
+                    int32_t A = 0;
+                    for (int64_t t = 0; t < n; ++t) {
+                        const int64_t off = (b * n + t) * Kp + w;
+                        const bool q_bit = (q_ptr[off] & mask) != 0;
+                        const bool assoc_bit = (a_ptr[off] & mask) != 0;
+                        const bool state_bit = A >= 0;
+                        if (q_bit == state_bit) r_ptr[off] |= mask;
+                        if (state_bit) s_ptr[off] |= mask;
+                        const bool gate_bit = state_bit != assoc_bit;
+                        if (gate_bit) g_ptr[off] |= mask;
+
+                        int32_t decayed = A;
+                        if (shift > 0) decayed = A - (A >> shift);
+                        if (gate_bit) {
+                            const int32_t S = state_bit ? 1 : -1;
+                            const int32_t assoc_pm1 = assoc_bit ? 1 : -1;
+                            decayed = decayed - erase_v * S + write_v * assoc_pm1;
+                        }
+                        A = std::max<int32_t>(
+                            -static_cast<int32_t>(state_clip),
+                            std::min<int32_t>(static_cast<int32_t>(state_clip), decayed));
+                    }
+                }
+            }
+        });
+    };
+
+    if (erase_by_dim.scalar_type() == at::kChar && write_by_dim.scalar_type() == at::kChar) {
+        run(ec.data_ptr<int8_t>(), wc.data_ptr<int8_t>());
+    } else if (erase_by_dim.scalar_type() == at::kChar && write_by_dim.scalar_type() == at::kInt) {
+        run(ec.data_ptr<int8_t>(), wc.data_ptr<int32_t>());
+    } else if (erase_by_dim.scalar_type() == at::kInt && write_by_dim.scalar_type() == at::kChar) {
+        run(ec.data_ptr<int32_t>(), wc.data_ptr<int8_t>());
+    } else {
+        run(ec.data_ptr<int32_t>(), wc.data_ptr<int32_t>());
+    }
+    return {read, state, gate};
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor>
+bold_update_packed(const at::Tensor& packed, const at::Tensor& m,
+                   const at::Tensor& q, int64_t beta_num, int64_t beta_den,
+                   int64_t eta, int64_t threshold, int64_t m_clip, int64_t D) {
+    TORCH_CHECK(packed.dim() >= 1, "bold_update_packed: packed must have >= 1 dim");
+    TORCH_CHECK(packed.scalar_type() == at::kLong,
+                "bold_update_packed: packed must be int64 packed storage");
+    TORCH_CHECK(m.sizes() == q.sizes(), "bold_update_packed: m/q shape mismatch");
+    TORCH_CHECK(m.dim() >= 1, "bold_update_packed: m must have >= 1 dim");
+    TORCH_CHECK(m.size(-1) == D, "bold_update_packed: m last dim must equal D");
+    TORCH_CHECK(q.size(-1) == D, "bold_update_packed: q last dim must equal D");
+    TORCH_CHECK(m.scalar_type() == at::kShort || m.scalar_type() == at::kInt,
+                "bold_update_packed: m must be int16 or int32");
+    TORCH_CHECK(q.scalar_type() == at::kShort || q.scalar_type() == at::kInt,
+                "bold_update_packed: q must be int16 or int32");
+    TORCH_CHECK(beta_den > 0, "bold_update_packed: beta_den must be positive");
+    TORCH_CHECK(eta >= 0, "bold_update_packed: eta must be non-negative");
+    TORCH_CHECK(threshold > 0, "bold_update_packed: threshold must be positive");
+    TORCH_CHECK(m_clip > 0, "bold_update_packed: m_clip must be positive");
+    TORCH_CHECK(D >= 0, "bold_update_packed: D must be non-negative");
+
+    const int64_t Kp = packed.size(-1);
+    TORCH_CHECK(Kp == (D + PACK_WIDTH - 1) / PACK_WIDTH,
+                "bold_update_packed: packed width does not match D");
+    const int64_t rows = (D == 0) ? 0 : m.numel() / D;
+    TORCH_CHECK(packed.numel() == rows * Kp,
+                "bold_update_packed: packed/logical shape mismatch");
+
+    auto pc = packed.contiguous();
+    auto mc = m.contiguous();
+    auto qc = q.contiguous();
+    auto out_packed = pc.clone();
+    auto out_m = at::empty_like(mc);
+    auto counts = at::zeros({at::get_num_threads()}, at::kLong);
+
+    const uint64_t* p_in = reinterpret_cast<const uint64_t*>(pc.data_ptr<int64_t>());
+    uint64_t* p_out = reinterpret_cast<uint64_t*>(out_packed.data_ptr<int64_t>());
+
+    auto run = [&](auto* m_in, auto* q_in, auto* m_out) {
+        using m_t = std::remove_pointer_t<decltype(m_in)>;
+        using q_t = std::remove_pointer_t<decltype(q_in)>;
+        at::parallel_for(0, rows, ROW_GRAIN, [&](int64_t begin, int64_t end) {
+            int thread_idx = at::get_thread_num();
+            int64_t local_flips = 0;
+            for (int64_t r = begin; r < end; ++r) {
+                const int64_t base = r * D;
+                const int64_t pbase = r * Kp;
+                for (int64_t w = 0; w < Kp; ++w) {
+                    const int64_t live = std::min<int64_t>(PACK_WIDTH, D - w * PACK_WIDTH);
+                    uint64_t word = p_in[pbase + w];
+                    for (int64_t lane = 0; lane < live; ++lane) {
+                        const int64_t idx = base + w * PACK_WIDTH + lane;
+                        int64_t acc = (static_cast<int64_t>(m_in[idx]) * beta_num) / beta_den;
+                        acc += static_cast<int64_t>(q_in[idx]) * eta;
+                        acc = std::max<int64_t>(-m_clip, std::min<int64_t>(m_clip, acc));
+
+                        const bool bit = ((word >> lane) & uint64_t(1)) != 0;
+                        const int64_t aligned = bit ? acc : -acc;
+                        if (aligned >= threshold) {
+                            word ^= (uint64_t(1) << lane);
+                            acc = 0;
+                            ++local_flips;
+                        }
+                        m_out[idx] = static_cast<m_t>(acc);
+                    }
+                    p_out[pbase + w] = word;
+                }
+            }
+            counts.data_ptr<int64_t>()[thread_idx] += local_flips;
+        });
+    };
+
+    if (m.scalar_type() == at::kShort && q.scalar_type() == at::kShort) {
+        run(mc.data_ptr<int16_t>(), qc.data_ptr<int16_t>(), out_m.data_ptr<int16_t>());
+    } else if (m.scalar_type() == at::kShort && q.scalar_type() == at::kInt) {
+        run(mc.data_ptr<int16_t>(), qc.data_ptr<int32_t>(), out_m.data_ptr<int16_t>());
+    } else if (m.scalar_type() == at::kInt && q.scalar_type() == at::kShort) {
+        run(mc.data_ptr<int32_t>(), qc.data_ptr<int16_t>(), out_m.data_ptr<int32_t>());
+    } else {
+        run(mc.data_ptr<int32_t>(), qc.data_ptr<int32_t>(), out_m.data_ptr<int32_t>());
+    }
+
+    return {out_packed, out_m, counts.sum()};
 }
 
 //  popcount — per-element, int32 output. Supports any integer dtype + bool.

@@ -12,11 +12,24 @@ at::Tensor  unpack_bool (const at::Tensor& packed, at::IntArrayRef logical_shape
 
 //  Matmul: A,B are uint64-packed (M,Kp),(N,Kp); K is the logical last dim.
 at::Tensor  xnor_popcount_matmul(const at::Tensor& A, const at::Tensor& B, int64_t K);
+at::Tensor  ternary_bit1_matmul(const at::Tensor& A, const at::Tensor& B, int64_t N);
 
 //  Sequence kernels.
 std::tuple<at::Tensor, at::Tensor, at::Tensor>
 bsr_scan(const at::Tensor& q, const at::Tensor& assoc,
          const at::Tensor& decay_shifts, int64_t D);
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor>
+bsr_delta_scan(const at::Tensor& q, const at::Tensor& assoc,
+               const at::Tensor& decay_shift_by_dim,
+               const at::Tensor& erase_by_dim,
+               const at::Tensor& write_by_dim,
+               int64_t state_clip, int64_t D);
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor>
+bold_update_packed(const at::Tensor& packed, const at::Tensor& m,
+                   const at::Tensor& q, int64_t beta_num, int64_t beta_den,
+                   int64_t eta, int64_t threshold, int64_t m_clip, int64_t D);
 
 //  Popcount / hamming (generic int dtype + bit1)
 at::Tensor  popcount         (const at::Tensor& x);             // per-element, int32 out

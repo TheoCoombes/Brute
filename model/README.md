@@ -1,17 +1,19 @@
-# HÆMMR Model
+# HÆMMR Model (v3)
 
 This directory contains the current HÆMMR reference implementation: a
 binary-first, concept-native autoregressive language model built on
 `brute.bit1`. The code is intentionally small enough to iterate on locally
 while keeping the core constraints visible:
 
-- packed 1-bit weights and activations for the forward path;
+- packed 1-bit weights and a **clipped integer concept highway** as the one
+  vertical-transport activation concession (`c = sign(u)`, `u ∈ [-S, S]`);
 - XNOR/popcount Boolean linears through `brute.fast.matmul`;
 - BOLD bit-flip optimisation with no floating-point latent weights;
-- position-free decoded concepts, with positions restricted to memory address
-  lanes;
-- recurrent BSR discourse state, episodic in-window recall, static Hopfield
-  priors, and binary channel mixing.
+- position-free decoded concepts, with positions restricted to the episodic
+  address lane;
+- one canonical linear-time exact-memory path (a fixed-width causal ring),
+  delta erase/write BSR for compressed discourse, static Hopfield priors, and
+  binary channel mixing — combined by the highway, **not** a majority-vote merge.
 
 Federated, MoE, tracker, and swarm machinery are out of scope for this package.
 
@@ -19,8 +21,8 @@ Federated, MoE, tracker, and swarm machinery are out of scope for this package.
 
 | File | Purpose |
 |---|---|
-| `model.py` | `HaemmrConfig`, block stack, forward/loss/backward, metrics, generation, checkpoint state |
-| `layers.py` | Boolean linears, codebook, residual gates, BSR, episodic memory, Hopfield bank |
+| `model.py` | `HaemmrConfig`, clipped integer concept highway, block stack, forward/loss/backward, metrics, generation, checkpoint state |
+| `layers.py` | Boolean linears, fixed/learned codebook, delta erase/write BSR, episodic causal-ring memory, Hopfield bank |
 | `bold.py` | BOLD parameters and integer flip-accumulator optimiser |
 | `vsa.py` | Packed VSA binding, position codes, Hamming similarity, BEF codebook initialisation |
 | `data.py` | WikiText/GPT-2-tokenizer compact-vocab data utilities |
@@ -32,29 +34,42 @@ Federated, MoE, tracker, and swarm machinery are out of scope for this package.
 
 ```text
 token ids
-  -> lexical bit codebook E(t)
-  -> input bind
-  -> [ delta BSR
-       episodic slot memory
-       Hopfield priors
-       binary channel mix ] x L
-  -> output bind
-  -> lexical Boolean projection
-  -> Hamming decode against E
-  -> optional semantic rerank
+  -> FIXED lexical bit codebook E_lex(t)
+  -> input bind                       # position-free concept c^0,  u^0 = ±1
+  -> [ c = sign(u)                    # public concept; every branch reads it
+       delta erase/write BSR          # compressed discourse
+       episodic causal ring           # exact in-window recall (read-before-write)
+       Hopfield priors                # static learned priors
+       binary channel mix
+       u' = clip_S(λ·u + Σ α_r·r_r)   # clipped integer concept highway ] x L
+  -> c^L = sign(u^L)
+  -> lexical Boolean projection -> Hamming decode against FIXED E_lex
+  -> + semantic rerank against LEARNED E_sem
+  -> + optional episodic shortlist seeding
 ```
 
-`EpisodicSlotMemory` writes one packed payload per token and retrieves from the
-active causal window by Hamming address. The current batched training form still
-forms a `(B, n, n)` score tensor, so it remains quadratic in sequence length.
-The streaming form stores key, position, and payload state as packed bit buffers
-and reads only the active ring-buffer window.
+`EpisodicSlotMemory` is one canonical fixed-width causal ring: read-before-write,
+direct Hamming search over the active window, no dense `(B, n, n)` score tensor
+and no Tier-2 register cache. Batched training is a chunked implementation of the
+**same** ring search (O(n·C)); streaming uses `episodic_causal_search` over the
+ring. Exact recall is window-bounded by design.
 
-`BSR` uses dense Boolean projections for key/value/query, packed association
-bits, and a fused `brute.bsr_scan` kernel for the forward recurrence. The scan
-uses the power-of-two shift palette in `decay_shifts` and returns packed
-read/state/gate buffers. BOLD backward lazily materialises the real-valued
-views it needs for flip signals.
+`BSR` uses dense Boolean projections for key/value/query and edits its own
+prediction with a decoupled **erase/write delta** (separate per-channel-group
+erase and write strengths) over the power-of-two `decay_shifts` palette. The
+CPU forward path uses a packed `bsr_delta_scan` kernel over a bounded integer
+accumulator, returning packed read/state/gate buffers. BOLD backward uses
+ternary Boolean variation and packed ternary-matmul kernels for Boolean linears
+and decoders on CPU; real-valued tensors are kept to explicit surrogate
+boundaries, not to latent weights or optimizer state.
+
+The **concept highway** carries an integer score field `u`; `c = sign(u)` is the
+public concept. Each block's branches all read `c` and emit a binary proposal,
+which the highway accumulates with fixed power-of-two scales (`alpha_*`) and an
+identity carry (`highway_carry`), clipping to `±highway_clip` and binarising once
+per block. The episodic branch uses a dominant `alpha_epi` so exact recall can
+override the carried concept. Multiscale horizons grow the episodic window and
+slow the BSR decay with depth.
 
 ## Training
 
@@ -72,11 +87,19 @@ Common flags:
 
 - `--D`, `--layers`, `--d-ff`: concept dimension, depth, and channel-mix width.
 - `--slots`, `--top-k`: static Hopfield prior bank.
-- `--epi-slots`, `--epi-read-k`: episodic recall window and read width.
+- `--epi-window`, `--epi-chunk`, `--epi-read-k`: episodic ring width, chunk size,
+  and read width.
+- `--epi-bonus`: episodic shortlist-seeding weight at decode time.
+- `--highway-clip`, `--highway-carry`, `--highway-nu`: concept-highway bound `S`,
+  identity carry `λ`, and boundary gate.
+- `--alpha-epi`/`--alpha-bsr`/`--alpha-hop`/`--alpha-ff`: fixed power-of-two
+  branch scales (`alpha-epi` defaults dominant for reliable exact recall).
+- `--no-multiscale`: disable per-depth window/decay scaling.
 - `--no-bsr`: disables BSR for packed-only ablation profiles.
 - `--no-position`: uses neutral all-ones episodic position codes.
-- `--no-structured-codebook`: uses random token codes instead of BEF.
-- `--sem-weight`: semantic rerank weight; `0` disables it.
+- `--no-structured-codebook`: uses random (fixed) token codes instead of BEF.
+- `--sem-weight`, `--sem-flip-scale`: semantic rerank weight (`0` disables) and
+  semantic-bank flip rate.
 - `--boundary-nu`, `--label-smoothing`, `--flip-dropout`: training stabilisers.
 - `--eta`, `--threshold`, `--m-clip`: BOLD accumulator controls.
 - `--ckpt`, `--last-ckpt`: best-validation and final checkpoint paths.
@@ -103,10 +126,11 @@ contracts.
 
 ## Known Limits
 
-- Batched episodic training is still quadratic in sequence length because it
-  constructs dense causal score matrices.
-- Multi-slot Hopfield and episodic reads still use integer vote materialisation.
+- Exact recall is window-bounded by design (fixed causal ring); there is no
+  beyond-window dynamic store in v3.
 - Decode rerank scores the full compact vocabulary rather than a fused
   shortlist.
+- The concept highway stores `u` as an int tensor clamped to ±S; production
+  should pack it bit-sliced (int4/int5).
 - The inline BEF initialiser is capped for local startup; production-scale
-  vocabularies should load a precomputed codebook.
+  vocabularies should load a precomputed (fixed) codebook.

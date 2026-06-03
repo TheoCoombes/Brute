@@ -77,7 +77,9 @@ Current model-facing fused ops:
   episodic reads.
 - `episodic_causal_search`: fused windowed Hamming scan + top-1 + payload
   gather for the streaming inference path. Returns (read, idx, score).
-- `bsr_scan`: packed BSR forward scan returning packed read/state/gate buffers.
+- `bsr_scan`: packed single-gate BSR forward scan returning packed
+  read/state/gate buffers. (The Haemmr v3 model uses a Python erase/write delta
+  scan instead; this kernel is retained as a library op.)
 
 When adding an op, update all applicable backend headers, drivers, schemas in
 `cbrute/ext.cpp`, Python fast-path helpers if needed, and tests. Avoid Python

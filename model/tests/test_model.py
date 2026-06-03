@@ -178,7 +178,7 @@ class TestLearning:
             return X, Y
 
         m = tiny_model(V=8, D=128, L=1, d_ff=256, slots=32,
-                       use_position=False, gate_open=0.05, codebook_flip_scale=0.5)
+                       use_position=False)
         opt = BoldOptimizer(m.parameters(), BoldConfig(eta=3.0, threshold=8.0))
         for _ in range(120):
             X, Y = make_batch(64)
@@ -192,14 +192,19 @@ class TestLearning:
         info = m.metrics(m.forward(X), Y)
         assert info["acc"] > 0.9, f"context disambiguation only reached {info['acc']:.3f}"
 
-    def test_epi_chunk_epi_registers_in_config(self):
-        cfg = HaemmrConfig(epi_chunk=32, epi_registers=16)
+    def test_epi_and_highway_config(self):
+        cfg = HaemmrConfig(epi_chunk=32, epi_window=128, highway_clip=7)
         assert cfg.epi_chunk == 32
-        assert cfg.epi_registers == 16
+        assert cfg.epi_window == 128
+        assert cfg.highway_clip == 7
+        assert not hasattr(cfg, "epi_registers")    # Tier-2 register cache scrapped
+        assert not hasattr(cfg, "gate_open")        # learned residual gates scrapped
         with pytest.raises(ValueError):
             HaemmrConfig(epi_chunk=0)
         with pytest.raises(ValueError):
-            HaemmrConfig(epi_registers=-1)
+            HaemmrConfig(highway_clip=0)
+        with pytest.raises(ValueError):
+            HaemmrConfig(epi_window=0)
 
     def test_induction_pattern_at_length_64(self):
         """If A is followed by B earlier, seeing A again should predict B."""
@@ -217,7 +222,7 @@ class TestLearning:
             return X, Y
 
         m = tiny_model(V=16, D=128, L=1, d_ff=256, slots=32,
-                       use_position=False, gate_open=0.05, codebook_flip_scale=0.5)
+                       use_position=False)
         opt = BoldOptimizer(m.parameters(), BoldConfig(eta=3.0, threshold=8.0))
         for _ in range(80):
             X, Y = make_batch(64)
@@ -319,9 +324,7 @@ class TestVsFPTransformer:
             return X, Y
 
         m = tiny_model(V=V, D=128, L=1, d_ff=256, slots=32,
-                       use_bsr=True, use_position=False,
-                       gate_open=0.05, codebook_flip_scale=0.5,
-                       epi_chunk=T)
+                       use_bsr=True, use_position=False,                       epi_chunk=T)
         opt = BoldOptimizer(m.parameters(), BoldConfig(eta=3.0, threshold=8.0))
         for _ in range(200):
             X, Y = make_batch(64)
@@ -365,9 +368,7 @@ class TestVsFPTransformer:
 
         # HAEMMR — episodic memory only (BSR off)
         m = tiny_model(V=V, D=128, L=1, d_ff=256, slots=32,
-                       use_bsr=False, use_position=False,
-                       gate_open=0.1, codebook_flip_scale=0.5,
-                       epi_chunk=T)
+                       use_bsr=False, use_position=False,                       epi_chunk=T)
         bold_opt = BoldOptimizer(m.parameters(), BoldConfig(eta=3.0, threshold=6.0))
         for _ in range(300):
             X, Y = make_batch(64)
