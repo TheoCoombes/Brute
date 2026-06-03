@@ -21,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import torch
 from torch import nn
 
-from bold import BoldConfig, BoldOptimizer
+from bep import BepConfig, BepOptimizer
 from model import HaemmrConfig, HaemmrLM, IGNORE_INDEX
 
 
@@ -84,11 +84,10 @@ def run_haemmr(task: str, seq_len: int, args):
     cfg = HaemmrConfig(
         vocab_size=16, D=args.D, n_layers=args.layers, d_ff=args.d_ff,
         n_slots=args.slots, top_k=args.top_k, seed=args.seed,
-        use_position=args.use_position, gate_open=args.gate_open,
-        codebook_flip_scale=args.codebook_flip_scale,
+        use_position=args.use_position, gate_open=args.gate_open, r=args.r,
     )
     model = HaemmrLM(cfg, device=args.device)
-    opt = BoldOptimizer(model.parameters(), BoldConfig(eta=args.eta, threshold=args.threshold))
+    opt = BepOptimizer(model.parameters(), BepConfig(r=args.r))
     for _ in range(args.steps):
         X, Y = make_batch(task, args.batch_size, seq_len, device=args.device)
         matched = matched_slots(task, X) if args.margin_supervision else None
@@ -149,10 +148,8 @@ def main():
     p.add_argument("--d-ff", type=int, default=256)
     p.add_argument("--slots", type=int, default=32)
     p.add_argument("--top-k", type=int, default=3)
-    p.add_argument("--eta", type=float, default=3.0)
-    p.add_argument("--threshold", type=float, default=8.0)
+    p.add_argument("--r", type=float, default=0.1, help="BEP margin trigger fraction.")
     p.add_argument("--gate-open", type=float, default=0.05)
-    p.add_argument("--codebook-flip-scale", type=float, default=0.5)
     p.add_argument("--no-position", dest="use_position", action="store_false", default=True,
                    help="disable hierarchical positions in the episodic address lane")
     p.add_argument("--no-margin-supervision", dest="margin_supervision",

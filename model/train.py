@@ -32,7 +32,7 @@ import torch
 
 import brute  # noqa: F401 — ensure the extension is importable
 
-from bold import BoldConfig, BoldOptimizer
+from bep import BepConfig, BepOptimizer
 from data import OOV_ID, make_lm_batches, wikitext
 from model import HaemmrConfig, HaemmrLM, IGNORE_INDEX
 
@@ -103,30 +103,28 @@ def main():
     p.add_argument("--seq-len", type=int, default=64)
     p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--steps", type=int, default=1500, help="number of optimiser (flip) steps.")
-    p.add_argument("--eta", type=float, default=3.0, help="BOLD accumulation rate η.")
-    p.add_argument("--threshold", type=float, default=8.0,
-                   help="integrated evidence needed to flip a bit (accumulator hysteresis).")
-    p.add_argument("--m-clip", type=int, default=127, help="int8 accumulator saturation (±).")
-    p.add_argument("--eta-decay", type=float, default=1.0)
-    p.add_argument("--eta-end", type=float, default=None,
-                   help="anneal η geometrically to this value by the last step.")
+    p.add_argument("--r", type=float, default=0.1,
+                   help="BEP margin trigger: update fires when logit[tgt] − max_other < r·D.")
+    p.add_argument("--p-r", type=float, default=0.0,
+                   help="CP+R reinforcement probability (BEP §3.3).")
+    p.add_argument("--bits", type=int, default=15, help="integer hidden-weight H bit-width.")
     p.add_argument("--log-csv", default=None, help="append the loss curve to this CSV file.")
     p.add_argument("--no-position", dest="use_position", action="store_false", default=True,
                    help="disable hierarchical position codes in the episodic address lane.")
     p.add_argument("--no-structured-codebook", dest="structured_codebook",
                    action="store_false", default=True,
                    help="use random token codes instead of the small-model BEF initializer.")
+    p.add_argument("--offline-codebook", action="store_true", default=False,
+                   help="initialise the codebook from GPT-2 pretrained embeddings "
+                        "(SimHash; semantically-structured, cached offline).")
     p.add_argument("--bef-sweeps", type=int, default=30)
     p.add_argument("--sem-weight", type=float, default=0.5,
                    help="semantic rerank weight added to lexical decode logits.")
     p.add_argument("--boundary-nu", type=float, default=None,
                    help="BEP-style boundary eligibility gate; unset disables it.")
-    p.add_argument("--label-smoothing", type=float, default=0.0)
     p.add_argument("--flip-dropout", type=float, default=0.0)
     p.add_argument("--gate-open", type=float, default=0.05,
                    help="residual-gate init openness (higher ⇒ context flows sooner).")
-    p.add_argument("--codebook-flip-scale", type=float, default=0.3,
-                   help="codebook flip-rate relative to transforms (lower = more stable).")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default=None, choices=[None, "cpu", "mps", "cuda"])
     p.add_argument("--eval-every", type=int, default=200)
@@ -157,12 +155,6 @@ def main():
           f"  vocab={V}  chunks: train={Xtr.shape[0]:,} val={Xva.shape[0]:,}")
     print(f"  baselines (val):  uniform={1.0/V:.4f}  unigram={unigram_baseline(Yva.cpu(), V):.4f}")
 
-    # Optional η annealing: explore more early, then let the integer accumulator
-    # settle into smaller, steadier evidence updates late in training.
-    eta_decay = args.eta_decay
-    if args.eta_end is not None and args.steps > 0:
-        eta_decay = (args.eta_end / args.eta) ** (1.0 / args.steps)
-
     cfg = HaemmrConfig(vocab_size=V, D=args.D, n_layers=args.layers, d_ff=args.d_ff,
                        n_slots=args.slots, top_k=args.top_k, seed=args.seed,
                        epi_slots=args.epi_slots, epi_read_k=args.epi_read_k,
@@ -170,14 +162,18 @@ def main():
                        structured_codebook=args.structured_codebook,
                        bef_sweeps=args.bef_sweeps, sem_weight=args.sem_weight,
                        boundary_nu=args.boundary_nu,
-                       label_smoothing=args.label_smoothing,
                        flip_dropout=args.flip_dropout,
-                       codebook_flip_scale=args.codebook_flip_scale,
+                       r=args.r, p_r=args.p_r, bits=args.bits,
                        )
-    model = HaemmrLM(cfg, device=device)
-    opt = BoldOptimizer(model.parameters(),
-                        BoldConfig(eta=args.eta, eta_decay=eta_decay,
-                                   threshold=args.threshold, m_clip=args.m_clip))
+    codebook_init = None
+    if args.offline_codebook:
+        from codebook import from_corpus
+        print(f"building offline GPT-2 SimHash codebook (D={args.D}) …")
+        codebook_init = from_corpus(corpus, args.D, seed=args.seed,
+                                    cache_dir=str(Path(args.data_root) / "codebook"))
+    model = HaemmrLM(cfg, device=device, codebook_init=codebook_init)
+    opt = BepOptimizer(model.parameters(),
+                       BepConfig(r=args.r, p_r=args.p_r, bits=args.bits))
     n_bits = model.num_bit_parameters()
     print(f"model: D={cfg.D} layers={cfg.n_layers} d_ff={cfg.d_ff} slots={cfg.n_slots}"
           f"  |  {n_bits:,} bit-params ≈ {n_bits/8/1e6:.2f} MB")
@@ -188,7 +184,7 @@ def main():
     if args.log_csv:
         csv_f = open(args.log_csv, "a")
         if csv_f.tell() == 0:
-            csv_f.write("step,train_ema,val_loss,val_ppl,val_acc,flip_frac,eta\n")
+            csv_f.write("step,train_ema,val_loss,val_ppl,val_acc,flip_frac\n")
 
     bs = args.batch_size
     n_chunks = Xtr.shape[0]
@@ -224,10 +220,10 @@ def main():
             dt = time.time() - t0
             print(f"step {step:5d}  train loss {tr_loss:.3f} (ema {ema:.3f}) acc {tr_acc:.4f}  |  "
                   f"val loss {va['loss']:.3f} ppl {va['ppl']:.1f} acc {va['acc']:.4f}  |  "
-                  f"flip {st['flip_frac']*100:.3f}% η{st['eta']:.2f}  ({dt:.0f}s)")
+                  f"flip {st['flip_frac']*100:.3f}%  ({dt:.0f}s)")
             if csv_f:
                 csv_f.write(f"{step},{ema:.4f},{va['loss']:.4f},{va['ppl']:.2f},"
-                            f"{va['acc']:.4f},{st['flip_frac']:.5f},{st['eta']:.4f}\n")
+                            f"{va['acc']:.4f},{st['flip_frac']:.5f}\n")
                 csv_f.flush()
 
         if args.sample_every and step % args.sample_every == 0:

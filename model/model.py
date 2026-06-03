@@ -1,8 +1,6 @@
-"""HÆMMR v2 — a binary-first, concept-native autoregressive language model.
+"""HÆMMR — a binary-first, concept-native autoregressive language model (BEP).
 
-This is the v2 architecture (the attached change set).  The headline is
-*separation of concerns* — separate memory mechanisms by job and separate
-representation subspaces by role:
+Architecture (unchanged from v2 — separation of concerns by job/role)::
 
     token → E_lex(t)  ── input-bind ──▶  position-free concept c_i
         ┌───────────────────────────────────────────────────────────────┐ ×L
@@ -12,19 +10,15 @@ representation subspaces by role:
         │  m = channel-mix(c)            # binary MLP                       │
         └───────────────────────────────────────────────────────────────┘
         ── out-bind ──▶ next-token concept ĉ  (position-free)
-        ── lex-proj ──▶ ℓ̂ ── decode against BEF codebook ──▶ logits
-                              (+ semantic rerank from ĉ)            (§C1)
+        ── lex-proj ──▶ ℓ̂ ── decode against fixed prototype codebook ──▶ logits
 
-Three structural fixes vs. v1: (A) **position never enters the decoded concept**
-— it lives only in the address lane (BSR/episodic keys), so decode is correct by
-construction (no ``next_unbind`` hack); (B1) a dedicated **episodic slot memory**
-gives exact marker/copy recall a lossy bundle cannot; (C1) the head emits a
-**concept** that is *projected* to the lexical frame and decoded against a
-**structured (BEF) codebook**, making "concept ≠ token" literal.
-
-Forward is bitwise (packed ``brute.bit1``); the only integers are signed matmul
-pre-activations and the BSR accumulator.  Training is BOLD bit-flips, with the
-borrowed BEP boundary gating and several error-floor mitigations (§D).
+Training is **BEP** (Boolean error propagation): the only large buffer per
+parameter is the integer hidden weight ``H`` (Int16); the visible weight is
+``W = sign(H)``.  The backward pass threads **binary desired activations** ``a*``
+(bit1) — never a float signal — and the head is **margin-triggered against the
+fixed prototypes** (BEP Eqs. 1-2): an update fires for a position only when
+``logit[target] − max_other < r·D``, and the desired lexical activation is the
+target's prototype ``E[target]``.  No softmax/CE on the backward path.
 """
 
 from __future__ import annotations
@@ -36,12 +30,13 @@ import torch
 
 import brute
 
-from bold import BoldParam
+import bep
+from bep import BepParam, combine_desired, mux
 from layers import (
     BSR, BooleanLinear, DiagBind, EpisodicSlotMemory, HopfieldBank,
     ResidualMerge, TokenCodebook,
 )
-from vsa import hierarchical_position_codes, to_pm1
+from vsa import hierarchical_position_codes, to_bit1
 
 
 IGNORE_INDEX = -1
@@ -54,40 +49,39 @@ class HaemmrConfig:
     n_layers: int = 2
     d_ff: int = 2048                    # channel-mix hidden width
     # episodic slot memory (§B1) — the exact-recall fix
-    epi_read_k: int = 1                 # top-k read width (1 ⇒ exact single-slot)
-    epi_slots: Optional[int] = None     # ring-buffer cap at inference; None ⇒ context length
+    epi_read_k: int = 1
+    epi_slots: Optional[int] = None
     # latent Hopfield priors (§B3)
-    n_slots: int = 256                  # learned static slots (M)
-    top_k: int = 15                     # WTA width (odd → no ties)
+    n_slots: int = 256
+    top_k: int = 15
     # delta-BSR decay palette (§B2)
-    decay_shifts: tuple = (1, 2, 3, 4, 0)   # power-of-two shifts; 0 = permanent
+    decay_shifts: tuple = (1, 2, 3, 4, 0)
     # representation / positions (§A)
-    use_position: bool = True           # positional addressing in the episodic lane
-    pos_chunk: int = 256                # hierarchical position chunk size C
+    use_position: bool = True
+    pos_chunk: int = 256
     # decode (§C1)
-    structured_codebook: bool = True    # BEF codebook (else random)
+    structured_codebook: bool = True
     bef_alpha: float = 1.0
     bef_sweeps: int = 30
-    sem_weight: float = 0.5             # semantic-rerank logit weight (0 disables)
-    hopfield_cleanup: bool = False      # §C2 one-step concept cleanup before decode
+    sem_weight: float = 0.5
+    hopfield_cleanup: bool = False
     cleanup_slots: int = 256
     cleanup_top_k: int = 7
-    # training mitigations (§D) and margin objective (§F)
-    boundary_nu: Optional[float] = None  # BEP boundary gating |z|≤νD (e.g. 0.5); None=off
-    label_smoothing: float = 0.0
-    flip_dropout: float = 0.0           # activation bit-flip rate in the training forward
-    margin_theta_pos: float = 0.5       # §F matched-pair margin (fraction of D)
-    margin_theta_neg: float = 0.0       # §F distractor margin
+    # BEP training (margin trigger + fixed prototypes, eligibility gate, reinforcement)
+    r: float = 0.1                      # margin trigger: logit[tgt] − max_other < r·D
+    boundary_nu: Optional[float] = None  # eligibility gate |z| ≤ ν·in_dim (stage-2; off)
+    p_r: float = 0.0                    # CP+R reinforcement probability (BEP §3.3)
+    bits: int = 15                      # integer hidden-weight H bit-width
+    flip_dropout: float = 0.0
+    # §F episodic address-margin objective
+    margin_theta_pos: float = 0.5
+    margin_theta_neg: float = 0.0
     margin_weight: float = 1.0
     # misc
-    logit_temp: Optional[float] = None  # train-time logit scale; default sqrt(D)
-    gate_open: float = 0.05             # residual-gate init openness
-    codebook_flip_scale: float = 0.3    # codebook flip-rate vs transforms
+    gate_open: float = 0.05
     seed: int = 0
 
     def __post_init__(self):
-        if self.logit_temp is None:
-            self.logit_temp = float(self.D) ** 0.5
         if self.D <= 0:
             raise ValueError("D must be positive")
         if self.epi_read_k <= 0:
@@ -98,8 +92,6 @@ class HaemmrConfig:
             raise ValueError("pos_chunk must be positive")
         if self.sem_weight < 0:
             raise ValueError("sem_weight must be non-negative")
-        if not 0.0 <= self.label_smoothing < 1.0:
-            raise ValueError("label_smoothing must be in [0, 1)")
         if not 0.0 <= self.flip_dropout < 1.0:
             raise ValueError("flip_dropout must be in [0, 1)")
         if self.boundary_nu is not None and self.boundary_nu < 0:
@@ -117,7 +109,7 @@ class ChannelMix:
         self.lin2 = BooleanLinear(d_ff, D, name=f"{name}.lin2", generator=generator,
                                   device=device, boundary_nu=boundary_nu)
 
-    def params(self) -> List[BoldParam]:
+    def params(self) -> List[BepParam]:
         return self.lin1.params() + self.lin2.params()
 
     def forward(self, x_bit: brute.Tensor) -> brute.Tensor:
@@ -125,10 +117,9 @@ class ChannelMix:
         m_bit, _ = self.lin2.forward(h_bit)
         return m_bit
 
-    def backward(self, S: torch.Tensor) -> torch.Tensor:
-        g = self.lin2.backward(S)
-        g = self.lin1.backward(g)
-        return g
+    def backward(self, a_star: brute.Tensor) -> brute.Tensor:
+        a_h = self.lin2.backward(a_star)
+        return self.lin1.backward(a_h)
 
 
 # ── one Boolean block ──────────────────────────────────────────────────────────
@@ -146,7 +137,7 @@ class Block:
                                       n_slots=cfg.epi_slots, generator=generator,
                                       device=device, boundary_nu=nu)
         self.merge_epi = ResidualMerge(D, name=f"{nm}.merge_epi", p_open=cfg.gate_open,
-                                       generator=generator, device=device)
+                                       value_path=True, generator=generator, device=device)
         self.hop = HopfieldBank(D, cfg.n_slots, cfg.top_k, name=f"{nm}.hop",
                                 generator=generator, device=device)
         self.merge_hop = ResidualMerge(D, name=f"{nm}.merge_hop", p_open=cfg.gate_open,
@@ -156,8 +147,9 @@ class Block:
         self.merge_mix = ResidualMerge(D, name=f"{nm}.merge_mix", p_open=cfg.gate_open,
                                        generator=generator, device=device)
         self._shape = None
+        self._cache: dict = {}
 
-    def params(self) -> List[BoldParam]:
+    def params(self) -> List[BepParam]:
         return (self.bsr.params() + self.merge_bsr.params()
                 + self.epi.params() + self.merge_epi.params()
                 + self.hop.params() + self.merge_hop.params()
@@ -166,64 +158,67 @@ class Block:
     def forward(self, c_bit: brute.Tensor, pos_bit: brute.Tensor) -> brute.Tensor:
         B, n, D = c_bit.shape
         self._shape = (B, n, D)
-        r = self.bsr.forward(c_bit)                            # discourse (B,n,D)
+        r = self.bsr.forward(c_bit)
         c1 = self.merge_bsr.forward(c_bit, r)
-        e = self.epi.forward(c1, pos_bit)                     # exact recall (B,n,D)
+        e = self.epi.forward(c1, pos_bit)
         c2 = self.merge_epi.forward(c1, e)
         h = self.hop.forward(c2.reshape(B * n, D)).reshape(B, n, D)
         c3 = self.merge_hop.forward(c2, h)
         m = self.mix.forward(c3.reshape(B * n, D)).reshape(B, n, D)
         c4 = self.merge_mix.forward(c3, m)
+        self._cache = {"c_bit": c_bit, "c1": c1, "c2": c2, "c3": c3}
         return c4
 
-    def backward(self, S_c4: torch.Tensor) -> torch.Tensor:
+    def backward(self, a_c4: brute.Tensor) -> brute.Tensor:
         B, n, D = self._shape
-        S_c3_a, S_m = self.merge_mix.backward(S_c4)
-        S_c3_b = self.mix.backward(S_m.reshape(B * n, D)).reshape(B, n, D)
-        S_c3 = S_c3_a + S_c3_b
-        S_c2_a, S_h = self.merge_hop.backward(S_c3)
-        S_c2_b = self.hop.backward(S_h.reshape(B * n, D)).reshape(B, n, D)
-        S_c2 = S_c2_a + S_c2_b
-        S_c1_a, S_e = self.merge_epi.backward(S_c2)
-        S_c1_b = self.epi.backward(S_e)
-        S_c1 = S_c1_a + S_c1_b
-        S_c_a, S_r = self.merge_bsr.backward(S_c1)
-        S_c_b = self.bsr.backward(S_r)
-        return S_c_a + S_c_b
+        c_bit, c1, c2, c3 = (self._cache["c_bit"], self._cache["c1"],
+                             self._cache["c2"], self._cache["c3"])
+        a_c3_s, a_m = self.merge_mix.backward(a_c4)
+        a_c3_t = self.mix.backward(a_m.reshape(B * n, D)).reshape(B, n, D)
+        a_c3 = combine_desired(a_c3_s, a_c3_t, c3)
+        a_c2_s, a_h = self.merge_hop.backward(a_c3)
+        self.hop.backward(a_h.reshape(B * n, D))           # no upstream signal
+        a_c2 = a_c2_s
+        a_c1_s, a_e = self.merge_epi.backward(a_c2)
+        a_c1_t = self.epi.backward(a_e)
+        a_c1 = combine_desired(a_c1_s, a_c1_t, c1)
+        a_c_s, a_r = self.merge_bsr.backward(a_c1)
+        a_c_t = self.bsr.backward(a_r)
+        return combine_desired(a_c_s, a_c_t, c_bit)
 
 
 # ── the model ────────────────────────────────────────────────────────────────
 
 class HaemmrLM:
-    def __init__(self, cfg: HaemmrConfig, *, device=None):
+    def __init__(self, cfg: HaemmrConfig, *, device=None,
+                 codebook_init: Optional[torch.Tensor] = None):
         self.cfg = cfg
         self.training = True
         self.device = torch.device(device) if device is not None else torch.device("cpu")
+        self.inv = float(cfg.D) ** -0.5                    # logit scale (logging only)
         gen = torch.Generator(device="cpu").manual_seed(int(cfg.seed))
         nu = cfg.boundary_nu
 
+        # ``codebook_init`` (V, D) ±1 floats overrides BEF/random init — e.g. an
+        # offline GPT-2 SimHash codebook (see codebook.py).
         self.codebook = TokenCodebook(cfg.vocab_size, cfg.D, name="E",
-                                      flip_scale=cfg.codebook_flip_scale,
                                       structured=cfg.structured_codebook,
                                       bef_alpha=cfg.bef_alpha, bef_sweeps=cfg.bef_sweeps,
+                                      init_pm1=codebook_init,
                                       generator=gen, device=self.device)
         self.input_bind = DiagBind(cfg.D, name="in", generator=gen, device=self.device)
         self.blocks = [Block(cfg, idx=i, generator=gen, device=self.device)
                        for i in range(cfg.n_layers)]
         self.out_bind = DiagBind(cfg.D, name="out", generator=gen, device=self.device)
-        # concept → lexical frame projection (§C1)
         self.lex_proj = BooleanLinear(cfg.D, cfg.D, name="lex", generator=gen,
                                       device=self.device, boundary_nu=nu)
-        # semantic view of the concept for rerank (§C1)
         self.sem_bind = DiagBind(cfg.D, name="sem", generator=gen, device=self.device)
-        # optional concept cleanup bank (§C2)
         if cfg.hopfield_cleanup:
             self.cleanup_hop = HopfieldBank(cfg.D, cfg.cleanup_slots, cfg.cleanup_top_k,
                                             name="clean", generator=gen, device=self.device)
             self.cleanup_merge = ResidualMerge(cfg.D, name="clean.merge", p_open=cfg.gate_open,
                                                generator=gen, device=self.device)
 
-        # two orthogonal position bases for hierarchical codes (address lane only)
         self.pos_chunk_base = (torch.randint(0, 2, (cfg.D,), generator=gen).float() * 2 - 1).to(self.device)
         self.pos_offset_base = (torch.randint(0, 2, (cfg.D,), generator=gen).float() * 2 - 1).to(self.device)
         self._pos_cache: dict = {}
@@ -231,7 +226,7 @@ class HaemmrLM:
         self._fwd_cache: dict = {}
 
     # ── parameters / checkpoint ──────────────────────────────────────────────
-    def parameters(self) -> List[BoldParam]:
+    def parameters(self) -> List[BepParam]:
         ps = self.codebook.params() + self.input_bind.params()
         for b in self.blocks:
             ps += b.params()
@@ -242,6 +237,10 @@ class HaemmrLM:
 
     def num_bit_parameters(self) -> int:
         return sum(int(torch.tensor(p.shape).prod().item()) for p in self.parameters())
+
+    def param_bytes(self) -> int:
+        """Total bytes held by trainable parameters (the integer ``H`` buffers)."""
+        return sum(p.param_bytes() for p in self.parameters())
 
     def state_dict(self) -> dict:
         return {
@@ -270,12 +269,6 @@ class HaemmrLM:
         return self._pos_cache["bit"][:n]
 
     def _position_lane(self, n: int):
-        """Address-lane position codes.
-
-        ``use_position=False`` turns the positional part of episodic addressing
-        into a neutral all-ones role rather than disabling the slot path.  The
-        memory remains content-addressed and receives a valid packed tensor.
-        """
         if self.cfg.use_position:
             return self._positions(n)
         if self._neutral_pos_cache.get("n", -1) < n:
@@ -291,109 +284,104 @@ class HaemmrLM:
         rate = self.cfg.flip_dropout
         if not self.training or rate <= 0:
             return c_bit, None
-        flip = torch.rand(c_bit.shape, device=self.device) < rate         # bool mask
+        flip = torch.rand(c_bit.shape, device=self.device) < rate
         flip_bit = brute.as_tensor(flip, dtype=brute.bit1).to(self.device)
-        # XOR a bit means *flip* it; bind with ¬flip would xnor — use xor on packed
         noised = brute.fast.bitwise_xor(c_bit, flip_bit)
-        mask_pm1 = torch.where(flip, -1.0, 1.0)                            # un-flip factor
-        return noised, mask_pm1
+        return noised, flip_bit
 
     # ── forward ────────────────────────────────────────────────────────────
     def forward(self, ids: torch.Tensor) -> torch.Tensor:
-        """``ids`` (B, n) long → logits (B*n, V) signed similarities."""
         ids = ids.to(self.device)
         B, n = ids.shape
         D = self.cfg.D
         pos_bit = self._position_lane(n)
 
-        emb = self.codebook.embed(ids)                          # (B,n,D) position-free
-        c = self.input_bind.forward(emb)                        # learned concept dressing
+        emb = self.codebook.embed(ids)
+        c = self.input_bind.forward(emb)
         flip_masks = []
         for blk in self.blocks:
-            c, mpm1 = self._flip_noise(c)
-            flip_masks.append(mpm1)
+            c, fbit = self._flip_noise(c)
+            flip_masks.append(fbit)
             c = blk.forward(c, pos_bit)
-        chat = self.out_bind.forward(c)                         # next-token concept ĉ
+        chat = self.out_bind.forward(c)
 
         cleanup_cache = None
         if self.cfg.hopfield_cleanup:
             hc = self.cleanup_hop.forward(chat.reshape(B * n, D)).reshape(B, n, D)
-            chat_clean = self.cleanup_merge.forward(chat, hc)
+            chat = self.cleanup_merge.forward(chat, hc)
             cleanup_cache = True
-            chat = chat_clean
 
         chat_flat = chat.reshape(B * n, D)
-        ell_bit, _ = self.lex_proj.forward(chat_flat)           # ℓ̂ lexical frame
-        lex_logits = self.codebook.decode(ell_bit)              # ⟨ℓ̂, E⟩
-        ell_pm1 = to_pm1(ell_bit)
+        ell_bit, _ = self.lex_proj.forward(chat_flat)
+        lex_logits = self.codebook.decode(ell_bit)
 
-        sem_pm1 = None
+        sem_bit = None
         if self.cfg.sem_weight > 0:
-            sem_bit = self.sem_bind.forward(chat_flat)          # ĉ ⊗ W_sem
+            sem_bit = self.sem_bind.forward(chat_flat)
             sem_logits = self.codebook.decode(sem_bit)
-            sem_pm1 = to_pm1(sem_bit)
             logits = lex_logits.float() + self.cfg.sem_weight * sem_logits.float()
         else:
             logits = lex_logits.float()
 
         self._fwd_cache = {
-            "B": B, "n": n, "ell_pm1": ell_pm1, "sem_pm1": sem_pm1,
-            "flip_masks": flip_masks, "cleanup": cleanup_cache,
+            "B": B, "n": n, "ell_bit": ell_bit, "sem_bit": sem_bit,
+            "chat_flat": chat_flat, "flip_masks": flip_masks, "cleanup": cleanup_cache,
         }
         return logits
 
-    # ── loss + BOLD backward ─────────────────────────────────────────────────
+    # ── loss + BEP backward (margin trigger + fixed prototypes) ───────────────
     def loss_and_backward(self, logits: torch.Tensor, targets: torch.Tensor,
                           matched: Optional[torch.Tensor] = None) -> dict:
-        """CE loss + BOLD backward.  ``matched`` (B,n) optionally supplies the §F
-        episodic margin supervision (slot id each query should retrieve, -1 = none)."""
         cfg = self.cfg
         B, n = self._fwd_cache["B"], self._fwd_cache["n"]
-        D = cfg.D
-        V = cfg.vocab_size
-        inv = 1.0 / float(cfg.logit_temp)
-        tgt = targets.to(self.device).reshape(-1).long()        # (B*n,)
+        D, V = cfg.D, cfg.vocab_size
+        M = B * n
+        tgt = targets.to(self.device).reshape(-1).long()
         valid = tgt != IGNORE_INDEX
         n_valid = int(valid.sum().item())
-
-        scaled = logits.float() * inv
-        logp = torch.log_softmax(scaled, dim=1)
-        p = logp.exp()
         safe_tgt = tgt.clamp_min(0)
+
+        # logging only (no role in the backward path)
+        scaled = logits.float() * self.inv
+        logp = torch.log_softmax(scaled, dim=1)
         nll = -logp.gather(1, safe_tgt.unsqueeze(1)).squeeze(1)[valid]
         loss = float(nll.mean().item()) if n_valid else 0.0
         pred = scaled.argmax(dim=1)
         acc = float((pred[valid] == tgt[valid]).float().mean().item()) if n_valid else 0.0
 
-        # target distribution with optional label smoothing (§D)
-        eps = cfg.label_smoothing
-        onehot = torch.zeros_like(p)
-        onehot.scatter_(1, safe_tgt.unsqueeze(1), 1.0)
-        if eps > 0:
-            target = (1 - eps) * onehot + eps / V
-        else:
-            target = onehot
-        S_logits = (p - target) * (inv / max(n_valid, 1))
-        S_logits[~valid] = 0.0
+        # BEP margin trigger (Eqs. 1-2): fire where logit[tgt] − max_other < r·D
+        logit_tgt = logits.gather(1, safe_tgt.unsqueeze(1)).squeeze(1)
+        other = logits.clone()
+        other.scatter_(1, safe_tgt.unsqueeze(1), float("-inf"))
+        max_other = other.max(dim=1).values
+        trigger = valid & ((logit_tgt - max_other) < cfg.r * D)
+        trig_rate = float(trigger.float().mean().item()) if M else 0.0
 
-        # decode backward (lexical + optional semantic), both into the concept ĉ
-        ell_pm1 = self._fwd_cache["ell_pm1"]
-        g_ell = self.codebook.decode_backward(S_logits, ell_pm1)
-        g_chat = self.lex_proj.backward(g_ell)                  # (B*n, D)
-        sem_pm1 = self._fwd_cache["sem_pm1"]
-        if sem_pm1 is not None:
-            g_sem = self.codebook.decode_backward(S_logits * cfg.sem_weight, sem_pm1)
-            g_chat = g_chat + self.sem_bind.backward(g_sem)
+        # desired lexical activation = target prototype where triggered, else current
+        proto = self.codebook.prototype(safe_tgt)          # (M, D) bit1
+        sel = to_bit1(trigger.unsqueeze(1).expand(M, D))
+        ell_bit = self._fwd_cache["ell_bit"]
+        ell_des = mux(sel, proto, ell_bit)
+        chat_flat = self._fwd_cache["chat_flat"]
+        # only triggered positions inject a backward signal (BEP); the rest carry
+        # no opinion (desired = current activation, no weight update).
+        bep.set_active(trigger)
+        g_chat = self.lex_proj.backward(ell_des)
+
+        sem_bit = self._fwd_cache["sem_bit"]
+        if sem_bit is not None:
+            sem_des = mux(sel, proto, sem_bit)
+            g_chat_sem = self.sem_bind.backward(sem_des)
+            g_chat = combine_desired(g_chat, g_chat_sem, chat_flat)
         g_chat = g_chat.reshape(B, n, D)
 
         if self._fwd_cache["cleanup"]:
             g_chat_skip, g_hc = self.cleanup_merge.backward(g_chat)
-            self.cleanup_hop.backward(g_hc.reshape(B * n, D))   # priors: zero query grad
+            self.cleanup_hop.backward(g_hc.reshape(B * n, D))
             g_chat = g_chat_skip
 
-        g_c = self.out_bind.backward(g_chat)                    # (B,n,D)
+        g_c = self.out_bind.backward(g_chat)
 
-        # §F margin objective on every block's episodic address lane (uses fwd cache)
         margin_val = 0.0
         if matched is not None and cfg.margin_weight > 0:
             for blk in self.blocks:
@@ -402,24 +390,24 @@ class HaemmrLM:
                     theta_neg=cfg.margin_theta_neg, weight=cfg.margin_weight)
 
         flip_masks = self._fwd_cache["flip_masks"]
-        for blk, mpm1 in zip(reversed(self.blocks), reversed(flip_masks)):
+        for blk, fbit in zip(reversed(self.blocks), reversed(flip_masks)):
             g_c = blk.backward(g_c)
-            if mpm1 is not None:                                # un-flip the dropout noise
-                g_c = g_c * mpm1
-        g_emb = self.input_bind.backward(g_c)                   # (B,n,D)
+            if fbit is not None:
+                g_c = brute.fast.bitwise_xor(g_c, fbit)    # un-flip the dropout noise
+        g_emb = self.input_bind.backward(g_c)
         self.codebook.backward_embed(g_emb)
+        bep.set_active(None)
 
         return {"loss": loss, "acc": acc, "n_valid": n_valid, "margin": margin_val,
+                "trigger_rate": trig_rate,
                 "ppl": float(torch.exp(torch.tensor(loss)).item()) if n_valid else float("inf")}
 
     @torch.no_grad()
     def metrics(self, logits: torch.Tensor, targets: torch.Tensor) -> dict:
-        """Cross-entropy / accuracy / perplexity with no backward pass (eval)."""
-        inv = 1.0 / float(self.cfg.logit_temp)
         tgt = targets.to(self.device).reshape(-1).long()
         valid = tgt != IGNORE_INDEX
         n_valid = int(valid.sum().item())
-        scaled = logits.float() * inv
+        scaled = logits.float() * self.inv
         logp = torch.log_softmax(scaled, dim=1)
         safe = tgt.clamp_min(0)
         nll = -logp.gather(1, safe.unsqueeze(1)).squeeze(1)[valid]
@@ -431,10 +419,9 @@ class HaemmrLM:
     # ── sampling / inference ─────────────────────────────────────────────────
     @torch.no_grad()
     def logits_last(self, ids: torch.Tensor) -> torch.Tensor:
-        """Return the (B, V) decode similarities for the last position only."""
         B, n = ids.shape
         was_training = self.training
-        self.training = False                                   # disable flip-dropout
+        self.training = False
         logits = self.forward(ids).reshape(B, n, self.cfg.vocab_size)
         self.training = was_training
         return logits[:, -1, :].float()
@@ -443,18 +430,10 @@ class HaemmrLM:
     def generate(self, ids: torch.Tensor, n_new: int, *, temperature: float = 1.0,
                  top_k: int = 0, ban_ids: Optional[List[int]] = None,
                  repetition_window: int = 0, max_ctx: int = 256) -> torch.Tensor:
-        """Autoregressive min-Hamming / Boltzmann decoding (§C1).
-
-        Recomputes the (linear-time) forward pass on the growing context each
-        step; the streaming BSR/episodic state caches exist and are parity-tested
-        but are not wired into this convenience path.
-        """
         ids = ids.to(self.device)
-        inv = 1.0 / float(self.cfg.logit_temp)
         for _ in range(n_new):
             ctx = ids[:, -max_ctx:]
-            sim = self.logits_last(ctx)                         # (B, V) similarities
-            sim = sim * inv / max(temperature, 1e-4)
+            sim = self.logits_last(ctx) * self.inv / max(temperature, 1e-4)
             if ban_ids:
                 sim[:, ban_ids] = float("-inf")
             if repetition_window > 0:
@@ -465,8 +444,7 @@ class HaemmrLM:
                 kk = min(top_k, sim.shape[1])
                 topv, topi = torch.topk(sim, kk, dim=1)
                 probs = torch.softmax(topv, dim=1)
-                pick = torch.multinomial(probs, 1)
-                nxt = topi.gather(1, pick)
+                nxt = topi.gather(1, torch.multinomial(probs, 1))
             else:
                 probs = torch.softmax(sim, dim=1)
                 nxt = torch.multinomial(probs, 1)

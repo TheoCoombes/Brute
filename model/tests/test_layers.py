@@ -1,13 +1,19 @@
-"""Layer tests — bitwise forward correctness vs ±1 reference + backward wiring."""
+"""Layer tests — bitwise forward correctness vs ±1 reference + BEP backward wiring.
+
+Forward math is unchanged (compared to a ±1 reference); backward now threads
+**binary desired activations** (bit1) and accumulates **integer** ``ΔH`` into the
+parameters' hidden weights ``H`` (no float ``q``).
+"""
 import torch
 import pytest
 
 import brute
-from bold import BoldConfig, BoldOptimizer
+import bep
+from bep import BepConfig, BepOptimizer, pm1_int
 from layers import (BSR, BooleanLinear, DiagBind, EpisodicSlotMemory,
                     HopfieldBank, ResidualMerge, TokenCodebook, bind_mask,
-                    pow2_decay_palette)
-from vsa import bind, hamming_similarity, random_hypervectors, to_bit1, to_pm1
+                    pow2_decay_palette, pow2_decay_shifts)
+from vsa import bind, hamming_similarity, random_hypervectors, to_bit1
 
 
 def _rand_bits(*shape, seed=0):
@@ -20,41 +26,44 @@ class TestBooleanLinear:
         lin = BooleanLinear(96, 48, name="lin", generator=torch.Generator().manual_seed(1))
         x = _rand_bits(10, 96, seed=2)
         out, z = lin.forward(x)
-        z_ref = to_pm1(x) @ lin.W.pm1.t()
+        z_ref = pm1_int(x, torch.int32).float() @ pm1_int(lin.W.bit, torch.int32).float().t()
         assert z.dtype == torch.int32
         assert torch.equal(z.float(), z_ref)
-        assert torch.equal(to_pm1(out), torch.where(z_ref >= 0, 1.0, -1.0))
+        assert torch.equal(pm1_int(out).float(), torch.where(z_ref >= 0, 1.0, -1.0))
 
-    def test_backward_shapes_and_signal(self):
+    def test_backward_binary_desired_and_integer_update(self):
         lin = BooleanLinear(96, 48, name="lin", generator=torch.Generator().manual_seed(1))
         x = _rand_bits(10, 96, seed=2)
         lin.forward(x)
-        S = torch.randn(10, 48)
-        g = lin.backward(S)
-        assert g.shape == (10, 96)
-        assert torch.any(lin.W.q != 0)          # accumulated weight flip-signal
-        # q_W = Sᵀ · a_pm1
-        assert torch.allclose(lin.W.q, S.t() @ to_pm1(x), atol=1e-4)
+        a_star = _rand_bits(10, 48, seed=3)
+        H0 = lin.W.H.clone()
+        a_in = lin.backward(a_star)
+        assert a_in.dtype == brute.bit1 and a_in.shape == (10, 96)
+        assert torch.any(lin.W.H != H0)
+        dref = 2 * (pm1_int(a_star, torch.int32).t() @ pm1_int(x, torch.int32))
+        assert torch.equal((lin.W.H - H0).to(torch.int32), dref)
 
     def test_learns_supervised_binary_projection(self):
         torch.manual_seed(0)
         g = torch.Generator().manual_seed(21)
         x = random_hypervectors(256, 96, generator=g)
-        teacher = random_hypervectors(8, 96, generator=g)
-        y = hamming_similarity(x, teacher).argmax(dim=1)
-        lin = BooleanLinear(96, 8, name="lin", generator=torch.Generator().manual_seed(22))
-        opt = BoldOptimizer(lin.params(), BoldConfig(eta=3.0, threshold=8.0))
-        inv = 1.0 / (96 ** 0.5)
-        for _ in range(80):
-            _, z = lin.forward(x)
-            logits = z.float() * inv
-            p = logits.softmax(dim=1)
-            oh = torch.zeros_like(p)
-            oh.scatter_(1, y.unsqueeze(1), 1.0)
-            lin.backward((p - oh) * (inv / x.shape[0]))
+        proto = random_hypervectors(8, 96, generator=g)
+        y = hamming_similarity(x, proto).argmax(dim=1)
+        lin = BooleanLinear(96, 96, name="lin", generator=torch.Generator().manual_seed(22))
+        opt = BepOptimizer(lin.params(), BepConfig())
+        from bep import mux
+        for _ in range(100):
+            ell, _ = lin.forward(x)
+            logits = brute.fast.matmul(ell, proto)          # (256, 8)
+            logit_t = logits.gather(1, y.unsqueeze(1)).squeeze(1)
+            other = logits.clone().float(); other.scatter_(1, y.unsqueeze(1), float("-inf"))
+            trig = (logit_t - other.max(1).values) < 0.1 * 96
+            sel = to_bit1(trig.unsqueeze(1).expand(256, 96))
+            des = mux(sel, proto[y], ell)                   # desired ℓ̂ = target prototype
+            bep.set_active(trig); lin.backward(des); bep.set_active(None)
             opt.step()
-        _, z = lin.forward(x)
-        acc = float((z.argmax(dim=1) == y).float().mean())
+        ell, _ = lin.forward(x)
+        acc = float((brute.fast.matmul(ell, proto).argmax(1) == y).float().mean())
         assert acc > 0.75
 
 
@@ -63,13 +72,24 @@ class TestDiagBind:
         db = DiagBind(128, name="db", generator=torch.Generator().manual_seed(3))
         c = _rand_bits(6, 128, seed=4)
         out = db.forward(c)
-        assert torch.equal(to_pm1(out), to_pm1(c) * db.m.pm1)
+        assert torch.equal(pm1_int(out), pm1_int(c) * pm1_int(db.m.bit))
+
+    def test_backward_returns_binary_concept_and_updates_mask(self):
+        db = DiagBind(64, name="db", generator=torch.Generator().manual_seed(3))
+        c = _rand_bits(5, 64, seed=4)
+        db.forward(c)
+        a_star = _rand_bits(5, 64, seed=7)
+        H0 = db.m.H.clone()
+        g_c = db.backward(a_star)
+        assert g_c.dtype == brute.bit1 and g_c.shape == (5, 64)
+        assert torch.equal(pm1_int(g_c), pm1_int(a_star) * pm1_int(db.m.bit))
+        assert torch.any(db.m.H != H0)
 
     def test_bind_mask_broadcasts(self):
         c = _rand_bits(4, 200, seed=5)
         m = random_hypervectors(1, 200, generator=torch.Generator().manual_seed(6))[0]
         out = bind_mask(c, m)
-        assert torch.equal(to_pm1(out), to_pm1(c) * to_pm1(m))
+        assert torch.equal(pm1_int(out), pm1_int(c) * pm1_int(m))
 
 
 class TestResidualMerge:
@@ -79,9 +99,9 @@ class TestResidualMerge:
         skip = _rand_bits(5, 128, seed=8)
         trans = _rand_bits(5, 128, seed=9)
         out = rm.forward(skip, trans)
-        g_open = rm.g.pm1 > 0
-        ref = torch.where(g_open, to_pm1(trans), to_pm1(skip))
-        assert torch.equal(to_pm1(out), ref)
+        g_open = pm1_int(rm.g.bit) > 0
+        ref = torch.where(g_open, pm1_int(trans), pm1_int(skip))
+        assert torch.equal(pm1_int(out), ref)
 
     def test_identity_when_all_gates_closed(self):
         rm = ResidualMerge(128, name="rm", p_open=0.0,
@@ -89,30 +109,32 @@ class TestResidualMerge:
         skip = _rand_bits(5, 128, seed=8)
         trans = _rand_bits(5, 128, seed=9)
         out = rm.forward(skip, trans)
-        assert torch.equal(to_pm1(out), to_pm1(skip))   # block ≈ identity at init
+        assert torch.equal(pm1_int(out), pm1_int(skip))   # block ≈ identity at init
 
-    def test_backward_routes_signal_by_gate(self):
+    def test_backward_routes_desired_to_both_branches(self):
         rm = ResidualMerge(64, name="rm", p_open=0.5,
                            generator=torch.Generator().manual_seed(7))
         skip = _rand_bits(3, 64, seed=8)
         trans = _rand_bits(3, 64, seed=9)
         rm.forward(skip, trans)
-        S = torch.randn(3, 64)
-        g_skip, g_trans = rm.backward(S)
-        g_open = rm.g.pm1 > 0
-        assert torch.equal(g_trans, S * g_open)
-        assert torch.equal(g_skip, S * (~g_open))
+        a_star = _rand_bits(3, 64, seed=10)
+        a_skip, a_trans = rm.backward(a_star)
+        # the transform keeps learning even where its gate is closed
+        assert torch.equal(pm1_int(a_skip), pm1_int(a_star))
+        assert torch.equal(pm1_int(a_trans), pm1_int(a_star))
 
     def test_gate_opens_when_transform_is_better(self):
         rm = ResidualMerge(64, name="rm", p_open=0.0,
                            generator=torch.Generator().manual_seed(7))
         skip = _rand_bits(8, 64, seed=8)
         trans = _rand_bits(8, 64, seed=9)
-        target = to_pm1(trans)
-        out = rm.forward(skip, trans)
-        rm.backward(to_pm1(out) - target)
-        n = rm.g.apply(eta=5.0, threshold=1.0)
-        assert n > 0
+        rm.forward(skip, trans)
+        before = pm1_int(rm.g.bit).clone()
+        rm.backward(trans)                      # desired == transform → gate should open
+        opt = BepOptimizer(rm.params(), BepConfig())
+        for _ in range(20):
+            rm.forward(skip, trans); rm.backward(trans); opt.step()
+        assert int((pm1_int(rm.g.bit) != before).sum()) > 0
 
 
 class TestBSR:
@@ -127,38 +149,35 @@ class TestBSR:
         c = random_hypervectors(2 * 12, 128,
                                 generator=torch.Generator().manual_seed(11)).reshape(2, 12, 128)
         r = bsr.forward(c)
-        # reference ±1 recurrence using the cached Boolean projections
-        k = bsr._cache["k_pm1"]
-        v = bsr._cache["v_pm1"]
-        q = bsr._cache["q_pm1"]
+        k = pm1_int(bsr._cache["k_bit"], torch.int32)
+        v = pm1_int(bsr._cache["v_bit"], torch.int32)
+        q = pm1_int(bsr._cache["q_bit"], torch.int32)
         assoc = k * v
-        A = torch.zeros(2, 128)
-        S = torch.empty(2, 12, 128)
-        gate = torch.empty(2, 12, 128)
+        shifts = pow2_decay_shifts(128)
+        A = torch.zeros(2, 128, dtype=torch.int32)
+        S = torch.empty(2, 12, 128, dtype=torch.int32)
+        gate = torch.empty(2, 12, 128, dtype=torch.bool)
         for i in range(12):
-            S[:, i, :] = torch.where(A >= 0, 1.0, -1.0)
+            S[:, i, :] = torch.where(A >= 0, 1, -1)
             pred = k[:, i, :] * S[:, i, :]
-            gate[:, i, :] = (pred != v[:, i, :]).float()
-            A = bsr.decay * A + gate[:, i, :] * assoc[:, i, :]
+            gate[:, i, :] = pred != v[:, i, :]
+            shifted = torch.bitwise_right_shift(A, shifts)
+            decayed = torch.where(shifts == 0, A, A - shifted)
+            A = decayed + gate[:, i, :].to(torch.int32) * assoc[:, i, :]
         r_ref = q * S
         assert torch.equal(bsr._cache["gate"], gate)
-        assert torch.equal(to_pm1(r), r_ref)
+        assert torch.equal(pm1_int(r, torch.int32), r_ref)
 
     def test_recurrence_is_sensitive_to_prefix_content(self):
-        """Identical query position, different prefix token → different BSR read.
-
-        This catches the degenerate diagonal K/V case where
-        (c⊗W_K)⊗(c⊗W_V) cancels c and the state cannot store content.
-        """
         bsr = BSR(128, name="bsr", generator=torch.Generator().manual_seed(10))
         hv = random_hypervectors(3, 128, generator=torch.Generator().manual_seed(11))
         c_pm1 = torch.stack([
-            torch.stack([to_pm1(hv[0]), to_pm1(hv[2])]),
-            torch.stack([to_pm1(hv[1]), to_pm1(hv[2])]),
+            torch.stack([pm1_int(hv[0]).float(), pm1_int(hv[2]).float()]),
+            torch.stack([pm1_int(hv[1]).float(), pm1_int(hv[2]).float()]),
         ])
         c = to_bit1(c_pm1)
         r = bsr.forward(c)
-        same_query_reads = to_pm1(r)[:, 1, :]
+        same_query_reads = pm1_int(r)[:, 1, :]
         assert not torch.equal(same_query_reads[0], same_query_reads[1])
 
     def test_streaming_matches_batched_forward(self):
@@ -168,28 +187,30 @@ class TestBSR:
         batched = bsr.forward(c)
         bsr.reset_stream(2)
         streamed = [bsr.step(c[:, i, :]) for i in range(16)]
-        streamed = to_bit1(torch.stack([to_pm1(x) for x in streamed], dim=1))
-        assert torch.equal(to_pm1(streamed), to_pm1(batched))
+        streamed = to_bit1(torch.stack([pm1_int(x).float() for x in streamed], dim=1))
+        assert torch.equal(pm1_int(streamed), pm1_int(batched))
 
     @pytest.mark.parametrize("length", [8, 16, 32, 64])
     def test_long_prefix_changes_late_read(self, length):
         bsr = BSR(128, name="bsr", generator=torch.Generator().manual_seed(10))
         hv = random_hypervectors(4, 128, generator=torch.Generator().manual_seed(11))
-        seq_a = torch.stack([to_pm1(hv[0])] * (length - 1) + [to_pm1(hv[3])])
-        seq_b = torch.stack([to_pm1(hv[1])] * (length - 1) + [to_pm1(hv[3])])
+        seq_a = torch.stack([pm1_int(hv[0]).float()] * (length - 1) + [pm1_int(hv[3]).float()])
+        seq_b = torch.stack([pm1_int(hv[1]).float()] * (length - 1) + [pm1_int(hv[3]).float()])
         c = to_bit1(torch.stack([seq_a, seq_b]))
         r = bsr.forward(c)
-        assert not torch.equal(to_pm1(r)[0, -1], to_pm1(r)[1, -1])
+        assert not torch.equal(pm1_int(r)[0, -1], pm1_int(r)[1, -1])
 
     def test_backward_returns_concept_signal(self):
         bsr = BSR(64, name="bsr", generator=torch.Generator().manual_seed(10))
         c = random_hypervectors(2 * 8, 64,
                                 generator=torch.Generator().manual_seed(11)).reshape(2, 8, 64)
         bsr.forward(c)
-        g = bsr.backward(torch.randn(2, 8, 64))
-        assert g.shape == (2, 8, 64)
-        for p in bsr.params():
-            assert torch.any(p.q != 0)
+        a_star = random_hypervectors(2 * 8, 64,
+                                     generator=torch.Generator().manual_seed(12)).reshape(2, 8, 64)
+        H0 = [p.H.clone() for p in bsr.params()]
+        g = bsr.backward(a_star)
+        assert g.dtype == brute.bit1 and g.shape == (2, 8, 64)
+        assert any(torch.any(p.H != h0) for p, h0 in zip(bsr.params(), H0))
 
 
 class _FixedProjection:
@@ -198,10 +219,10 @@ class _FixedProjection:
 
     def forward(self, a_bit):
         flat = self.out_bit.reshape(a_bit.shape[0], a_bit.shape[-1])
-        return flat, torch.zeros(a_bit.shape[0], a_bit.shape[-1])
+        return flat, torch.zeros(a_bit.shape[0], a_bit.shape[-1], dtype=torch.int32)
 
-    def backward(self, S):
-        return torch.zeros_like(S)
+    def backward(self, a_star):
+        return a_star
 
     def params(self):
         return []
@@ -214,21 +235,19 @@ class TestEpisodicSlotMemory:
         payload = random_hypervectors(n, D, generator=g).reshape(1, n, D)
         keys = random_hypervectors(n, D, generator=g).reshape(1, n, D)
         queries = random_hypervectors(n, D, generator=g).reshape(1, n, D)
-        queries_pm1 = to_pm1(queries)
-        queries_pm1[0, 3] = to_pm1(keys)[0, 1]    # t=3 should retrieve slot 1
-        queries = to_bit1(queries_pm1)
+        q_pm1 = pm1_int(queries).float()
+        q_pm1[0, 3] = pm1_int(keys).float()[0, 1]
+        queries = to_bit1(q_pm1)
         pos = to_bit1(torch.ones(n, D))
-        neutral = to_bit1(torch.ones(1, n, D))
 
         mem = EpisodicSlotMemory(D, name="epi", read_k=1)
         mem.Kc = _FixedProjection(keys)
         mem.Qc = _FixedProjection(queries)
-        mem.Qp = _FixedProjection(neutral)
+        mem.Qp = _FixedProjection(to_bit1(torch.ones(1, n, D)))
 
         out = mem.forward(payload, pos)
-        out_pm1 = to_pm1(out)
-        assert torch.equal(out_pm1[0, 0], to_pm1(payload)[0, 0])  # no prior slot -> identity
-        assert torch.equal(out_pm1[0, 3], to_pm1(payload)[0, 1])
+        assert torch.equal(pm1_int(out)[0, 0], pm1_int(payload)[0, 0])
+        assert torch.equal(pm1_int(out)[0, 3], pm1_int(payload)[0, 1])
 
     def test_batched_read_respects_configured_window(self):
         D, n = 64, 4
@@ -236,19 +255,18 @@ class TestEpisodicSlotMemory:
         payload = random_hypervectors(n, D, generator=g).reshape(1, n, D)
         keys = random_hypervectors(n, D, generator=g).reshape(1, n, D)
         queries = random_hypervectors(n, D, generator=g).reshape(1, n, D)
-        queries_pm1 = to_pm1(queries)
-        queries_pm1[0, 3] = to_pm1(keys)[0, 1]    # outside a one-slot window at t=3
-        queries = to_bit1(queries_pm1)
+        q_pm1 = pm1_int(queries).float()
+        q_pm1[0, 3] = pm1_int(keys).float()[0, 1]
+        queries = to_bit1(q_pm1)
         pos = to_bit1(torch.ones(n, D))
-        neutral = to_bit1(torch.ones(1, n, D))
 
         mem = EpisodicSlotMemory(D, name="epi", read_k=1, n_slots=1)
         mem.Kc = _FixedProjection(keys)
         mem.Qc = _FixedProjection(queries)
-        mem.Qp = _FixedProjection(neutral)
+        mem.Qp = _FixedProjection(to_bit1(torch.ones(1, n, D)))
 
         out = mem.forward(payload, pos)
-        assert not torch.equal(to_pm1(out)[0, 3], to_pm1(payload)[0, 1])
+        assert not torch.equal(pm1_int(out)[0, 3], pm1_int(payload)[0, 1])
 
     def test_streaming_matches_batched_forward(self):
         D, n = 96, 12
@@ -260,8 +278,8 @@ class TestEpisodicSlotMemory:
         batched = mem.forward(c, pos)
         mem.reset_stream(2, n)
         streamed = [mem.step(c[:, i, :], pos[i], n) for i in range(n)]
-        streamed = to_bit1(torch.stack([to_pm1(x) for x in streamed], dim=1))
-        assert torch.equal(to_pm1(streamed), to_pm1(batched))
+        streamed = to_bit1(torch.stack([pm1_int(x).float() for x in streamed], dim=1))
+        assert torch.equal(pm1_int(streamed), pm1_int(batched))
 
     def test_backward_and_margin_update_address_projections(self):
         D, n = 64, 5
@@ -270,14 +288,13 @@ class TestEpisodicSlotMemory:
         c = random_hypervectors(2 * n, D, generator=g).reshape(2, n, D)
         pos = random_hypervectors(n, D, generator=g)
         mem.forward(c, pos)
-        g_c = mem.backward(torch.randn(2, n, D))
-        assert g_c.shape == (2, n, D)
+        g_c = mem.backward(random_hypervectors(2 * n, D, generator=g).reshape(2, n, D))
+        assert g_c.dtype == brute.bit1 and g_c.shape == (2, n, D)
+        H0 = {p.name: p.H.clone() for p in mem.params()}
         matched = torch.tensor([[-1, 0, 1, 2, 3], [-1, 0, 1, 2, 3]])
         margin = mem.margin_loss(matched, theta_pos=1.0, theta_neg=-1.0)
         assert margin >= 0.0
-        assert torch.any(mem.Kc.W.q != 0)
-        assert torch.any(mem.Qc.W.q != 0)
-        assert torch.any(mem.Qp.W.q != 0)
+        assert any(torch.any(p.H != H0[p.name]) for p in mem.params())
 
 
 class TestHopfield:
@@ -288,17 +305,18 @@ class TestHopfield:
         r1 = hb.forward(q)
         r2 = hb.forward(q)
         assert r1.shape == (7, 96) and r1.dtype == brute.bit1
-        assert torch.equal(to_pm1(r1), to_pm1(r2))
+        assert torch.equal(pm1_int(r1), pm1_int(r2))
 
     def test_backward_trains_bank_not_query(self):
         hb = HopfieldBank(96, n_slots=32, top_k=5, name="hop",
                           generator=torch.Generator().manual_seed(12))
         q = _rand_bits(7, 96, seed=13)
         hb.forward(q)
-        g_q = hb.backward(torch.randn(7, 96))
-        assert torch.equal(g_q, torch.zeros_like(g_q))   # hard selection ⇒ no query signal
-        assert torch.any(hb.U.q != 0)                    # payloads get loss signal
-        assert torch.any(hb.P.q != 0)                    # keys get Hebbian signal
+        U0, P0 = hb.U.H.clone(), hb.P.H.clone()
+        g_q = hb.backward(_rand_bits(7, 96, seed=15))
+        assert g_q is None                                   # hard selection ⇒ no query signal
+        assert torch.any(hb.U.H != U0)                       # payloads get loss signal
+        assert torch.any(hb.P.H != P0)                       # keys get Hebbian signal
 
     def test_controlled_slot_retrieval(self):
         hb = HopfieldBank(128, n_slots=8, top_k=1, name="hop",
@@ -306,11 +324,9 @@ class TestHopfield:
         keys = random_hypervectors(8, 128, generator=torch.Generator().manual_seed(13))
         payloads = random_hypervectors(8, 128, generator=torch.Generator().manual_seed(14))
         hb.P.bit = keys
-        hb.P._pm1 = None
         hb.U.bit = payloads
-        hb.U._pm1 = None
         out = hb.forward(keys[3:4])
-        assert torch.equal(to_pm1(out), to_pm1(payloads[3:4]))
+        assert torch.equal(pm1_int(out), pm1_int(payloads[3:4]))
 
 
 class TestCodebook:
@@ -321,7 +337,6 @@ class TestCodebook:
         assert emb.shape == (3, 9, 128) and emb.dtype == brute.bit1
         logits = cb.decode(emb.reshape(27, 128))
         assert logits.shape == (27, 40) and logits.dtype == torch.int32
-        # a token's embedding is maximally similar to its own codebook row
         single = cb.decode(cb.E.bit[5:6])
         assert int(single.argmax().item()) == 5
 

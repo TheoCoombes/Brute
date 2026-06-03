@@ -1,9 +1,9 @@
-"""End-to-end HÆMMR model tests — forward, BOLD backward, learning, sampling."""
+"""End-to-end HÆMMR model tests — forward, BEP backward, learning, sampling."""
 import torch
 import pytest
 
 import brute
-from bold import BoldConfig, BoldOptimizer
+from bep import BepConfig, BepOptimizer
 from data import make_lm_batches, repeating_sequence
 from model import HaemmrConfig, HaemmrLM, IGNORE_INDEX
 
@@ -23,7 +23,8 @@ class TestForward:
         m.forward(ids)
         assert "decode_pos_pm1" not in m._fwd_cache
         assert "pos_pm1" not in m._fwd_cache
-        assert m._fwd_cache["ell_pm1"].shape == (12, m.cfg.D)
+        assert m._fwd_cache["ell_bit"].shape == (12, m.cfg.D)
+        assert m._fwd_cache["ell_bit"].dtype == brute.bit1
 
     def test_content_only_mode_keeps_neutral_episodic_position_lane(self):
         m = tiny_model(use_position=False)
@@ -45,13 +46,14 @@ class TestForward:
         with pytest.raises(ValueError):
             HaemmrConfig(epi_read_k=0)
         with pytest.raises(ValueError):
-            HaemmrConfig(label_smoothing=1.0)
+            HaemmrConfig(flip_dropout=1.0)
 
     def test_all_params_are_bit1(self):
         m = tiny_model()
         for p in m.parameters():
             assert p.bit.dtype == brute.bit1
             assert p.bit._packed_buf is not None
+            assert p.H.dtype == torch.int16
 
     def test_param_count_reasonable(self):
         m = tiny_model()
@@ -60,15 +62,18 @@ class TestForward:
 
 
 class TestBackward:
-    def test_loss_finite_and_signals_flow(self):
+    def test_loss_finite_and_bits_move(self):
         m = tiny_model()
+        opt = BepOptimizer(m.parameters(), BepConfig(r=0.5))
         ids = torch.randint(0, 16, (4, 12))
         tgt = torch.randint(0, 16, (4, 12))
-        info = m.loss_and_backward(m.forward(ids), tgt)
+        opt.step()                                   # baseline sign snapshot
+        flips = 0
+        for _ in range(3):
+            info = m.loss_and_backward(m.forward(ids), tgt)
+            flips += opt.step()["n_flip"]
         assert torch.isfinite(torch.tensor(info["loss"]))
-        # every parameter received a flip-signal
-        n_with_signal = sum(int((p.q != 0).any()) for p in m.parameters())
-        assert n_with_signal == len(m.parameters())
+        assert flips > 0                             # some bits flipped across steps
 
     def test_ignore_index_masks_targets(self):
         m = tiny_model()
@@ -78,8 +83,8 @@ class TestBackward:
         assert info["n_valid"] == 0
         assert info["loss"] == 0.0
 
-    def test_label_smoothing_and_margin_supervision_run(self):
-        m = tiny_model(label_smoothing=0.1, margin_weight=0.5)
+    def test_margin_supervision_runs(self):
+        m = tiny_model(margin_weight=0.5)
         ids = torch.randint(0, 16, (2, 6))
         tgt = torch.randint(0, 16, (2, 6))
         matched = torch.tensor([[-1, 0, 1, 2, 3, 4], [-1, 0, 1, 2, 3, 4]])
@@ -89,9 +94,10 @@ class TestBackward:
 
     def test_optimizer_step_flips_bits(self):
         m = tiny_model()
-        opt = BoldOptimizer(m.parameters(), BoldConfig(eta=1.0, threshold=1.0))
+        opt = BepOptimizer(m.parameters(), BepConfig(r=0.5))
         ids = torch.randint(0, 16, (4, 12))
         tgt = torch.randint(0, 16, (4, 12))
+        opt.step()                                   # snapshot baseline
         m.loss_and_backward(m.forward(ids), tgt)
         st = opt.step()
         assert st["n_flip"] > 0
@@ -100,13 +106,12 @@ class TestBackward:
 class TestLearning:
     @pytest.mark.parametrize("L", [0, 1])
     def test_learns_deterministic_next_token(self, L):
-        """Memorise next=(x+1)%cycle — must beat the uniform baseline decisively."""
         torch.manual_seed(0)
         cycle, V = 8, 16
         ids = repeating_sequence(cycle=cycle, n_tokens=8192)
         X, Y = make_lm_batches(ids, seq_len=16, mask_oov=False, shuffle=True)
         m = tiny_model(V=V, D=256, L=L, d_ff=512)
-        opt = BoldOptimizer(m.parameters(), BoldConfig(eta=1.0, threshold=4.0))
+        opt = BepOptimizer(m.parameters(), BepConfig(r=0.1))
         bs = 32
         for step in range(180):
             i = (step * bs) % (X.shape[0] - bs)
@@ -115,7 +120,6 @@ class TestLearning:
         assert info["acc"] > 0.8, f"L={L}: only reached acc {info['acc']:.3f}"
 
     def test_block_uses_previous_token_context(self):
-        """Same query token and position; previous marker decides the answer."""
         torch.manual_seed(0)
 
         def make_batch(bs):
@@ -130,8 +134,8 @@ class TestLearning:
             return X, Y
 
         m = tiny_model(V=8, D=128, L=1, d_ff=256, slots=32,
-                       use_position=False, gate_open=0.05, codebook_flip_scale=0.5)
-        opt = BoldOptimizer(m.parameters(), BoldConfig(eta=3.0, threshold=8.0))
+                       use_position=False, gate_open=0.05)
+        opt = BepOptimizer(m.parameters(), BepConfig(r=0.1))
         for _ in range(120):
             X, Y = make_batch(64)
             m.loss_and_backward(m.forward(X), Y)
@@ -145,7 +149,6 @@ class TestLearning:
         assert info["acc"] > 0.9, f"context disambiguation only reached {info['acc']:.3f}"
 
     def test_induction_pattern_at_length_64(self):
-        """If A is followed by B earlier, seeing A again should predict B."""
         torch.manual_seed(0)
 
         def make_batch(bs, seq_len=64):
@@ -160,8 +163,8 @@ class TestLearning:
             return X, Y
 
         m = tiny_model(V=16, D=128, L=1, d_ff=256, slots=32,
-                       use_position=False, gate_open=0.05, codebook_flip_scale=0.5)
-        opt = BoldOptimizer(m.parameters(), BoldConfig(eta=3.0, threshold=8.0))
+                       use_position=False, gate_open=0.05)
+        opt = BepOptimizer(m.parameters(), BepConfig(r=0.1))
         for _ in range(80):
             X, Y = make_batch(64)
             m.loss_and_backward(m.forward(X), Y)
@@ -178,7 +181,7 @@ class TestSamplingAndCheckpoint:
         ids = torch.randint(0, 16, (1, 5))
         out = m.generate(ids, n_new=7, temperature=0.9, top_k=4)
         assert out.shape == (1, 12)
-        assert out[:, :5].equal(ids)               # prompt preserved
+        assert out[:, :5].equal(ids)
 
     def test_state_dict_roundtrip_preserves_forward(self):
         m = tiny_model()

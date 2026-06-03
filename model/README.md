@@ -108,6 +108,22 @@ The inline BEF initializer is intentionally capped for interactive startup; for
 large vocabularies it falls back to random balanced codes. A production-scale
 BEF should be precomputed offline and loaded as the codebook.
 
+### Offline GPT-2 codebook
+
+`--offline-codebook` (see `codebook.py`) replaces the semantically-blind BEF with
+codes derived from GPT-2's *pretrained* token embeddings: each kept token's
+768-d embedding is folded to a balanced `D`-bit code by SimHash (sign random
+projection), which is locality-sensitive, so tokens with similar GPT-2
+embeddings get low-Hamming codes. The decode codebook therefore starts with real
+lexical structure instead of a blank equiangular frame. The result is keyed by
+`(gpt2 ids, D, seed)` and cached under `<data-root>/codebook/`; only the first
+build touches `transformers` (a one-off embedding download), every later run
+loads the cached `.pt`.
+
+```bash
+./.venv/bin/python model/train.py --offline-codebook --D 512 --vocab-cap 1024 --steps 500
+```
+
 ## Tests
 
 The pytest suite covers:
