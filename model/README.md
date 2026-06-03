@@ -1,136 +1,141 @@
-# HÆMMR Model (v3)
+# HÆMMR v2 — binary-first, concept-native LM on `brute`
 
-This directory contains the current HÆMMR reference implementation: a
-binary-first, concept-native autoregressive language model built on
-`brute.bit1`. The code is intentionally small enough to iterate on locally
-while keeping the core constraints visible:
+This directory is a self-contained reference implementation of the HÆMMR v2
+single-model architecture. It keeps the original mission constraints:
+packed 1-bit weights and activations, CPU-first XNOR/popcount kernels, O(n)
+sequence mixing, autoregressive training, latent attention rather than a
+growing KV cache, and BOLD bit-flip optimization.
 
-- packed 1-bit weights and a **clipped integer concept highway** as the one
-  vertical-transport activation concession (`c = sign(u)`, `u ∈ [-S, S]`);
-- XNOR/popcount Boolean linears through `brute.fast.matmul`;
-- BOLD bit-flip optimisation with no floating-point latent weights;
-- position-free decoded concepts, with positions restricted to the episodic
-  address lane;
-- one canonical linear-time exact-memory path (a fixed-width causal ring),
-  delta erase/write BSR for compressed discourse, static Hopfield priors, and
-  binary channel mixing — combined by the highway, **not** a majority-vote merge.
+The v2 change is separation of concerns:
 
-Federated, MoE, tracker, and swarm machinery are out of scope for this package.
+* the decoded stream is a position-free concept vector;
+* positions live only in the memory address lane;
+* exact in-window recall uses a runtime episodic slot memory;
+* BSR is narrowed to compressed discourse state;
+* the Hopfield bank is narrowed to learned static priors;
+* decode is concept -> lexical projection -> Hamming codebook match, with an
+  optional semantic rerank.
 
-## Files
-
-| File | Purpose |
-|---|---|
-| `model.py` | `HaemmrConfig`, clipped integer concept highway, block stack, forward/loss/backward, metrics, generation, checkpoint state |
-| `layers.py` | Boolean linears, fixed/learned codebook, delta erase/write BSR, episodic causal-ring memory, Hopfield bank |
-| `bold.py` | BOLD parameters and integer flip-accumulator optimiser |
-| `vsa.py` | Packed VSA binding, position codes, Hamming similarity, BEF codebook initialisation |
-| `data.py` | WikiText/GPT-2-tokenizer compact-vocab data utilities |
-| `train.py` | WikiText training entry point |
-| `sample.py` | Checkpoint sampling entry point |
-| `tests/` | Model, layer, VSA, BOLD, and efficiency-contract tests |
+Federated/MoE/swarm machinery remains out of scope here.
 
 ## Architecture
 
-```text
+```
 token ids
-  -> FIXED lexical bit codebook E_lex(t)
-  -> input bind                       # position-free concept c^0,  u^0 = ±1
-  -> [ c = sign(u)                    # public concept; every branch reads it
-       delta erase/write BSR          # compressed discourse
-       episodic causal ring           # exact in-window recall (read-before-write)
-       Hopfield priors                # static learned priors
-       binary channel mix
-       u' = clip_S(λ·u + Σ α_r·r_r)   # clipped integer concept highway ] x L
-  -> c^L = sign(u^L)
-  -> lexical Boolean projection -> Hamming decode against FIXED E_lex
-  -> + semantic rerank against LEARNED E_sem
-  -> + optional episodic shortlist seeding
+  -> E_lex(t)                              # packed 1-bit lexical codebook
+  -> input bind                            # position-free concept c_i
+  -> [ delta BSR
+       episodic slot memory
+       latent Hopfield priors
+       binary channel mix ] x L
+  -> output bind                           # next-token concept c_hat
+  -> lexical Boolean projection
+  -> Hamming decode against E_lex
+  -> optional semantic rerank
 ```
 
-`EpisodicSlotMemory` is one canonical fixed-width causal ring: read-before-write,
-direct Hamming search over the active window, no dense `(B, n, n)` score tensor
-and no Tier-2 register cache. Batched training is a chunked implementation of the
-**same** ring search (O(n·C)); streaming uses `episodic_causal_search` over the
-ring. Exact recall is window-bounded by design.
+Key v2 components:
 
-`BSR` uses dense Boolean projections for key/value/query and edits its own
-prediction with a decoupled **erase/write delta** (separate per-channel-group
-erase and write strengths) over the power-of-two `decay_shifts` palette. The
-CPU forward path uses a packed `bsr_delta_scan` kernel over a bounded integer
-accumulator, returning packed read/state/gate buffers. BOLD backward uses
-ternary Boolean variation and packed ternary-matmul kernels for Boolean linears
-and decoders on CPU; real-valued tensors are kept to explicit surrogate
-boundaries, not to latent weights or optimizer state.
+| Component | File | Role |
+|---|---|---|
+| `TokenCodebook` | `layers.py` | shared packed lexical embeddings and Hamming decoder; small models can initialize with an inline BEF codebook |
+| `EpisodicSlotMemory` | `layers.py` | causal direct Hamming slot lookup for exact marker/copy-style recall |
+| `BSR` | `layers.py` | delta-corrected recurrent bundle with a power-of-two decay palette |
+| `HopfieldBank` | `layers.py` | static learned key/payload priors, no runtime copy writes |
+| `BooleanLinear`, `DiagBind`, `ResidualMerge` | `layers.py` | bitwise projections, binding masks, and gated binary residual paths |
+| `HaemmrLM` | `model.py` | v2 block stack, decode split, BOLD loss/backward, generation |
 
-The **concept highway** carries an integer score field `u`; `c = sign(u)` is the
-public concept. Each block's branches all read `c` and emit a binary proposal,
-which the highway accumulates with fixed power-of-two scales (`alpha_*`) and an
-identity carry (`highway_carry`), clipping to `±highway_clip` and binarising once
-per block. The episodic branch uses a dominant `alpha_epi` so exact recall can
-override the carried concept. Multiscale horizons grow the episodic window and
-slow the BSR decay with depth.
+Positions are generated by `hierarchical_position_codes` in `vsa.py`. They are
+never bound into the decoded concept. If `use_position=False`, the episodic lane
+uses a neutral all-ones role, so memory remains content-addressed.
 
 ## Training
 
-Run from the repository root after installing `brute` in editable mode:
+Training uses BOLD (`bold.py`):
+
+* parameters are canonical `brute.bit1` tensors;
+* each parameter has a small integer accumulator for flip evidence;
+* a bit flips when accumulated evidence agrees with the current bit and crosses
+  the threshold;
+* BOLD signals are real-valued backward signals, but there are no floating-point
+  latent weights.
+
+v2 training options implemented here:
+
+* label smoothing on decode loss;
+* activation flip-dropout during training;
+* BEP-style boundary eligibility gating for Boolean linears;
+* local Hamming-margin supervision for episodic addresses via
+  `loss_and_backward(..., matched=...)`.
+
+## Run
+
+Use the workspace venv from the repo root:
 
 ```bash
+cd "/Users/theocoombes/Documents/Programming Projects/Binary LLM/Implementation"
+
+# test the model package
 ./.venv/bin/python -m pytest model/tests -q
 
+# train a small WikiText demo
 ./.venv/bin/python model/train.py \
   --steps 500 --D 512 --layers 2 --vocab-cap 1024 \
-  --max-train-tokens 500000 --seq-len 48 --no-position
-```
+  --max-train-tokens 500000 --seq-len 48
 
-Common flags:
-
-- `--D`, `--layers`, `--d-ff`: concept dimension, depth, and channel-mix width.
-- `--slots`, `--top-k`: static Hopfield prior bank.
-- `--epi-window`, `--epi-chunk`, `--epi-read-k`: episodic ring width, chunk size,
-  and read width.
-- `--epi-bonus`: episodic shortlist-seeding weight at decode time.
-- `--highway-clip`, `--highway-carry`, `--highway-nu`: concept-highway bound `S`,
-  identity carry `λ`, and boundary gate.
-- `--alpha-epi`/`--alpha-bsr`/`--alpha-hop`/`--alpha-ff`: fixed power-of-two
-  branch scales (`alpha-epi` defaults dominant for reliable exact recall).
-- `--no-multiscale`: disable per-depth window/decay scaling.
-- `--no-bsr`: disables BSR for packed-only ablation profiles.
-- `--no-position`: uses neutral all-ones episodic position codes.
-- `--no-structured-codebook`: uses random (fixed) token codes instead of BEF.
-- `--sem-weight`, `--sem-flip-scale`: semantic rerank weight (`0` disables) and
-  semantic-bank flip rate.
-- `--boundary-nu`, `--label-smoothing`, `--flip-dropout`: training stabilisers.
-- `--eta`, `--threshold`, `--m-clip`: BOLD accumulator controls.
-- `--ckpt`, `--last-ckpt`: best-validation and final checkpoint paths.
-
-Sample from a checkpoint:
-
-```bash
+# sample from a checkpoint
 ./.venv/bin/python model/sample.py \
   --ckpt haemmr.pt --prompt "The history of" --n 60 --temperature 0.8
+
+# inspect packed-forward operation counts
+./.venv/bin/python model/profile_bitwise.py --D 512 --layers 2 --iters 20
 ```
+
+Useful flags:
+
+* `--D`: concept hypervector dimension.
+* `--layers`, `--d-ff`: block depth and channel-mix width.
+* `--slots`, `--top-k`: static Hopfield prior bank.
+* `--epi-slots`, `--epi-read-k`: exact-recall window and read width.
+* `--no-position`: disables hierarchical position codes in the address lane.
+* `--no-structured-codebook`: use random token codes instead of inline BEF.
+* `--sem-weight`: semantic rerank weight.
+* `--boundary-nu`, `--label-smoothing`, `--flip-dropout`: v2 training
+  mitigations.
+* `--eta`, `--threshold`, `--m-clip`: BOLD flip accumulator controls.
+
+The inline BEF initializer is intentionally capped for interactive startup; for
+large vocabularies it falls back to random balanced codes. A production-scale
+BEF should be precomputed offline and loaded as the codebook.
 
 ## Tests
 
-The maintained suite is:
+The pytest suite covers:
+
+* VSA binding, unbinding, Hamming similarity, hierarchical positions, and BEF
+  initialization;
+* Boolean layer forward/backward wiring;
+* delta-BSR recurrence and streaming parity;
+* episodic slot read causality, configured window limits, streaming parity, and
+  address-margin signals;
+* v2 model forward/loss/generation/checkpoint behavior;
+* BOLD flip-rule and optimizer behavior;
+* source-level packed-kernel contracts.
+
+Current verification command:
 
 ```bash
 ./.venv/bin/python -m pytest model/tests -q
 ```
 
-Coverage includes VSA primitives, BOLD flip rules, layer forward/backward
-wiring, packed BSR recurrence parity, episodic streaming parity, model
-forward/loss/generation/checkpoint behavior, and source-level efficiency
-contracts.
+## Deliberate Simplifications
 
-## Known Limits
-
-- Exact recall is window-bounded by design (fixed causal ring); there is no
-  beyond-window dynamic store in v3.
-- Decode rerank scores the full compact vocabulary rather than a fused
-  shortlist.
-- The concept highway stores `u` as an int tensor clamped to ±S; production
-  should pack it bit-sliced (int4/int5).
-- The inline BEF initialiser is capped for local startup; production-scale
-  vocabularies should load a precomputed (fixed) codebook.
+* No federated tracker, MoE routing, or swarm accumulator.
+* The BSR accumulator is still represented as a transient float tensor in this
+  Python reference; the architecture uses a shift-friendly decay palette so it
+  can be replaced by a bit-sliced packed counter kernel.
+* Episodic memory uses direct Hamming search. Product-key addressing is not
+  implemented because direct search is simpler and robust at the tested window
+  sizes.
+* Decode rerank is a full-vocabulary semantic score in this reference rather
+  than a fused shortlist kernel.

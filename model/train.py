@@ -33,7 +33,7 @@ import torch
 import brute  # noqa: F401 — ensure the extension is importable
 
 from bold import BoldConfig, BoldOptimizer
-from data import OOV_ID, make_lm_batches, wikitext, tiny_shakespeare
+from data import OOV_ID, make_lm_batches, wikitext
 from model import HaemmrConfig, HaemmrLM, IGNORE_INDEX
 
 
@@ -59,8 +59,7 @@ def unigram_baseline(targets: torch.Tensor, V: int) -> float:
 @torch.no_grad()
 def evaluate(model, X, Y, batch_size, max_batches=40):
     tot_loss = tot_acc = tot = 0
-    total_batches = (X.shape[0] + batch_size - 1) // batch_size
-    nb = total_batches if max_batches is None or max_batches <= 0 else min(total_batches, max_batches)
+    nb = min((X.shape[0] + batch_size - 1) // batch_size, max_batches)
     for b in range(nb):
         s = b * batch_size
         xb, yb = X[s:s + batch_size], Y[s:s + batch_size]
@@ -74,57 +73,33 @@ def evaluate(model, X, Y, batch_size, max_batches=40):
             "ppl": float(torch.exp(torch.tensor(loss)).item())}
 
 
-def save_checkpoint(path, model, opt, V, corpus, *, step, metrics):
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    torch.save({
-        "model": model.state_dict(),
-        "opt": opt.state_dict(),
-        "vocab_size": V,
-        "compact_to_gpt2": corpus.compact_to_gpt2,
-        "step": int(step),
-        "metrics": dict(metrics),
-    }, path)
-
-
-def sample_demo(model, corpus, prompt, n_new, *, temperature, top_k, ban_oov,
-                rep_window, sentence, min_new, clean):
+def sample_demo(model, corpus, prompt, n_new, *, temperature, top_k, ban_oov, rep_window):
     ids = corpus.encode(prompt).unsqueeze(0).to(model.device)
-    ban = corpus.sample_ban_ids(clean=clean) if ban_oov or clean else None
-    stop = corpus.sentence_end_ids() if sentence else None
+    ban = [OOV_ID] if ban_oov else None
     out = model.generate(ids, n_new, temperature=temperature, top_k=top_k,
-                         ban_ids=ban, repetition_window=rep_window,
-                         stop_ids=stop, min_new=min_new)
-    show_ids = out[0] if sentence else out[0, ids.shape[1]:]
-    text = corpus.decode(show_ids.cpu()).strip().replace("\n", "\\n")
+                         ban_ids=ban, repetition_window=rep_window)
+    new_ids = out[0, ids.shape[1]:].cpu()
+    text = corpus.decode(new_ids).replace("\n", "\\n")
     return text
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--dataset", default="wikitext-2",
-                   choices=["wikitext-2", "wikitext-103", "tiny-shakespeare"])
+    p.add_argument("--dataset", default="wikitext-2", choices=["wikitext-2", "wikitext-103"])
     p.add_argument("--data-root", default="./.data")
     p.add_argument("--vocab-cap", type=int, default=2048)
     p.add_argument("--max-train-tokens", type=int, default=None,
-                   help="Truncate the returned training stream after building the vocab.")
+                   help="Truncate the training stream (faster local demo).")
     p.add_argument("--D", type=int, default=1024, help="Concept hypervector dim.")
     p.add_argument("--layers", type=int, default=2)
     p.add_argument("--d-ff", type=int, default=2048)
     p.add_argument("--slots", type=int, default=256, help="Hopfield bank slots M.")
     p.add_argument("--top-k", type=int, default=15, help="Hopfield WTA width (odd).")
-    p.add_argument("--no-bsr", dest="use_bsr", action="store_false", default=True,
-                   help="disable BSR accumulator path for packed-only hardware profiles.")
-    p.add_argument("--epi-window", type=int, default=None,
-                   help="fixed episodic ring width W (None = chunk-bounded).")
+    p.add_argument("--epi-slots", type=int, default=None,
+                   help="episodic exact-recall window; default = full sequence during training.")
     p.add_argument("--epi-read-k", type=int, default=1,
                    help="episodic top-k read width (1 = exact single-slot).")
-    p.add_argument("--epi-chunk", type=int, default=64,
-                   help="episodic chunk size C for the chunked ring search.")
-    p.add_argument("--epi-bonus", type=float, default=0.0,
-                   help="episodic shortlist-seeding weight at decode time (0 = off).")
-    p.add_argument("--no-multiscale", dest="multiscale", action="store_false", default=True,
-                   help="disable per-depth scaling of episodic windows and BSR decay.")
     p.add_argument("--seq-len", type=int, default=64)
     p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--steps", type=int, default=1500, help="number of optimiser (flip) steps.")
@@ -145,78 +120,42 @@ def main():
     p.add_argument("--sem-weight", type=float, default=0.5,
                    help="semantic rerank weight added to lexical decode logits.")
     p.add_argument("--boundary-nu", type=float, default=None,
-                   help="BEP-style per-linear boundary eligibility gate; unset disables it.")
-    p.add_argument("--highway-clip", type=int, default=15,
-                   help="clipped integer concept-highway bound |u| ≤ S (int4/int5).")
-    p.add_argument("--highway-carry", type=int, default=1,
-                   help="λ identity-carry coefficient of the concept highway.")
-    p.add_argument("--alpha-epi", type=int, default=4,
-                   help="episodic branch scale (dominant so exact recall can override).")
-    p.add_argument("--alpha-bsr", type=int, default=1)
-    p.add_argument("--alpha-hop", type=int, default=1)
-    p.add_argument("--alpha-ff", type=int, default=1)
-    p.add_argument("--highway-nu", type=float, default=None,
-                   help="highway boundary gate: only |u| ≤ ν·S bits propagate (None = off).")
+                   help="BEP-style boundary eligibility gate; unset disables it.")
     p.add_argument("--label-smoothing", type=float, default=0.0)
     p.add_argument("--flip-dropout", type=float, default=0.0)
-    p.add_argument("--sem-flip-scale", type=float, default=0.5,
-                   help="semantic-bank flip-rate relative to transforms.")
+    p.add_argument("--gate-open", type=float, default=0.05,
+                   help="residual-gate init openness (higher ⇒ context flows sooner).")
+    p.add_argument("--codebook-flip-scale", type=float, default=0.3,
+                   help="codebook flip-rate relative to transforms (lower = more stable).")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default=None, choices=[None, "cpu", "mps", "cuda"])
     p.add_argument("--eval-every", type=int, default=200)
-    p.add_argument("--eval-max-batches", type=int, default=40,
-                   help="validation batches per eval; <=0 evaluates the full validation split.")
     p.add_argument("--sample-every", type=int, default=500)
-    p.add_argument("--prompt", default=None,
-                   help="sampling prompt; defaults to 'The history of' for WikiText "
-                        "and 'ROMEO:\\n' for TinyShakespeare.")
+    p.add_argument("--prompt", default="The history of")
     p.add_argument("--sample-len", type=int, default=40)
-    p.add_argument("--sample-min-len", type=int, default=12)
-    p.add_argument("--sentence-sample", action="store_true",
-                   help="include the prompt and stop samples at sentence punctuation when possible.")
-    p.add_argument("--clean-sample", action="store_true",
-                   help="ban OOV, control, non-ASCII, and continuation-fragment tokens while sampling.")
     p.add_argument("--temperature", type=float, default=0.8)
     p.add_argument("--sample-top-k", type=int, default=20)
     p.add_argument("--rep-window", type=int, default=3)
     p.add_argument("--ckpt", default="./haemmr.pt")
-    p.add_argument("--last-ckpt", default=None,
-                   help="optional path for the final-step checkpoint; --ckpt stores the best validation model.")
     args = p.parse_args()
 
     device = auto_device(args.device)
     torch.manual_seed(args.seed)
     print(f"device: {device}")
 
-    print(f"loading {args.dataset} …")
-    if args.dataset == "tiny-shakespeare":
-        corpus = tiny_shakespeare(data_root=args.data_root,
-                                  max_train_tokens=args.max_train_tokens)
-    else:
-        print(f"  vocab cap {args.vocab_cap}")
-        corpus = wikitext(name=args.dataset, data_root=args.data_root,
-                          vocab_cap=args.vocab_cap, max_train_tokens=args.max_train_tokens)
+    print(f"loading {args.dataset} (vocab cap {args.vocab_cap}) …")
+    corpus = wikitext(name=args.dataset, data_root=args.data_root,
+                      vocab_cap=args.vocab_cap, max_train_tokens=args.max_train_tokens)
     V = corpus.vocab_size
     Xtr, Ytr = make_lm_batches(corpus.train_ids, seq_len=args.seq_len, mask_oov=True,
                                seed=args.seed, shuffle=True)
     Xva, Yva = make_lm_batches(corpus.val_ids, seq_len=args.seq_len, mask_oov=True,
                                seed=args.seed, shuffle=False)
-    train_oov = float((corpus.train_ids == OOV_ID).float().mean().item())
-    val_oov = float((corpus.val_ids == OOV_ID).float().mean().item())
-    train_valid = float((Ytr != IGNORE_INDEX).float().mean().item())
-    val_valid = float((Yva != IGNORE_INDEX).float().mean().item())
     Xtr, Ytr = Xtr.to(device), Ytr.to(device)
     Xva, Yva = Xva.to(device), Yva.to(device)
     print(f"  train tokens={corpus.train_ids.numel():,}  val tokens={corpus.val_ids.numel():,}"
           f"  vocab={V}  chunks: train={Xtr.shape[0]:,} val={Xva.shape[0]:,}")
-    print(f"  OOV rate: train={train_oov:.1%} val={val_oov:.1%}"
-          f"  |  valid targets: train={train_valid:.1%} val={val_valid:.1%}")
-    print(f"  acc baselines (val valid targets):"
-          f"  uniform={1.0/V:.4f}  unigram={unigram_baseline(Yva.cpu(), V):.4f}")
-    if val_oov > 0.2:
-        print("  warning: high OOV rate; this is a lossy frequent-token demo, not full WikiText LM training.")
-    eval_scope = "full" if args.eval_max_batches <= 0 else f"first {args.eval_max_batches} batches"
-    print(f"  eval scope: {eval_scope}")
+    print(f"  baselines (val):  uniform={1.0/V:.4f}  unigram={unigram_baseline(Yva.cpu(), V):.4f}")
 
     # Optional η annealing: explore more early, then let the integer accumulator
     # settle into smaller, steadier evidence updates late in training.
@@ -226,21 +165,14 @@ def main():
 
     cfg = HaemmrConfig(vocab_size=V, D=args.D, n_layers=args.layers, d_ff=args.d_ff,
                        n_slots=args.slots, top_k=args.top_k, seed=args.seed,
-                       use_bsr=args.use_bsr,
-                       epi_window=args.epi_window, epi_read_k=args.epi_read_k,
-                       epi_chunk=args.epi_chunk, epi_bonus_weight=args.epi_bonus,
-                       multiscale=args.multiscale,
-                       highway_clip=args.highway_clip, highway_carry=args.highway_carry,
-                       alpha_epi=args.alpha_epi, alpha_bsr=args.alpha_bsr,
-                       alpha_hop=args.alpha_hop, alpha_ff=args.alpha_ff,
-                       highway_nu=args.highway_nu,
-                       use_position=args.use_position,
+                       epi_slots=args.epi_slots, epi_read_k=args.epi_read_k,
+                       use_position=args.use_position, gate_open=args.gate_open,
                        structured_codebook=args.structured_codebook,
                        bef_sweeps=args.bef_sweeps, sem_weight=args.sem_weight,
-                       sem_flip_scale=args.sem_flip_scale,
                        boundary_nu=args.boundary_nu,
                        label_smoothing=args.label_smoothing,
                        flip_dropout=args.flip_dropout,
+                       codebook_flip_scale=args.codebook_flip_scale,
                        )
     model = HaemmrLM(cfg, device=device)
     opt = BoldOptimizer(model.parameters(),
@@ -249,9 +181,7 @@ def main():
     n_bits = model.num_bit_parameters()
     print(f"model: D={cfg.D} layers={cfg.n_layers} d_ff={cfg.d_ff} slots={cfg.n_slots}"
           f"  |  {n_bits:,} bit-params ≈ {n_bits/8/1e6:.2f} MB")
-    init = evaluate(model, Xva, Yva, args.batch_size, max_batches=args.eval_max_batches)
-    best = {"step": 0, **init}
-    save_checkpoint(args.ckpt, model, opt, V, corpus, step=0, metrics=best)
+    init = evaluate(model, Xva, Yva, args.batch_size)
     print(f"step 0    val loss {init['loss']:.3f}  ppl {init['ppl']:.1f}  acc {init['acc']:.4f}")
 
     csv_f = None
@@ -286,44 +216,30 @@ def main():
         run_n += step_n
         ema = b_loss if ema is None else 0.98 * ema + 0.02 * b_loss
 
-        do_eval = (args.eval_every > 0 and step % args.eval_every == 0) or step == args.steps
-        if do_eval:
+        if step % args.eval_every == 0 or step == args.steps:
             tr_loss = run_loss / max(run_n, 1)
             tr_acc = run_acc / max(run_n, 1)
             run_loss = run_acc = run_n = 0.0
-            va = evaluate(model, Xva, Yva, bs, max_batches=args.eval_max_batches)
-            improved = va["loss"] < best["loss"]
-            if improved:
-                best = {"step": step, **va}
-                save_checkpoint(args.ckpt, model, opt, V, corpus, step=step, metrics=best)
+            va = evaluate(model, Xva, Yva, bs)
             dt = time.time() - t0
-            best_mark = "  *best*" if improved else ""
             print(f"step {step:5d}  train loss {tr_loss:.3f} (ema {ema:.3f}) acc {tr_acc:.4f}  |  "
                   f"val loss {va['loss']:.3f} ppl {va['ppl']:.1f} acc {va['acc']:.4f}  |  "
-                  f"flip {st['flip_frac']*100:.3f}% η{st['eta']:.2f}  ({dt:.0f}s){best_mark}")
+                  f"flip {st['flip_frac']*100:.3f}% η{st['eta']:.2f}  ({dt:.0f}s)")
             if csv_f:
                 csv_f.write(f"{step},{ema:.4f},{va['loss']:.4f},{va['ppl']:.2f},"
                             f"{va['acc']:.4f},{st['flip_frac']:.5f},{st['eta']:.4f}\n")
                 csv_f.flush()
 
         if args.sample_every and step % args.sample_every == 0:
-            prompt = args.prompt or (
-                "ROMEO:\n" if args.dataset == "tiny-shakespeare" else "The history of")
-            txt = sample_demo(model, corpus, prompt, args.sample_len,
+            txt = sample_demo(model, corpus, args.prompt, args.sample_len,
                               temperature=args.temperature, top_k=args.sample_top_k,
-                              ban_oov=True, rep_window=args.rep_window,
-                              sentence=args.sentence_sample,
-                              min_new=args.sample_min_len,
-                              clean=args.clean_sample)
+                              ban_oov=True, rep_window=args.rep_window)
             print(f"  sample[{args.prompt!r}]: {txt}")
 
-    if args.last_ckpt:
-        final_metrics = va if args.steps > 0 and "va" in locals() else init
-        save_checkpoint(args.last_ckpt, model, opt, V, corpus,
-                        step=args.steps, metrics={"step": args.steps, **final_metrics})
-        print(f"saved final checkpoint → {args.last_ckpt}")
-    print(f"saved best checkpoint → {args.ckpt}"
-          f"  (step {best['step']}, val loss {best['loss']:.3f}, acc {best['acc']:.4f})")
+    torch.save({"model": model.state_dict(), "opt": opt.state_dict(),
+                "vocab_size": V, "compact_to_gpt2": corpus.compact_to_gpt2},
+               args.ckpt)
+    print(f"saved checkpoint → {args.ckpt}")
     if csv_f:
         csv_f.close()
 

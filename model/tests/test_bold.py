@@ -18,12 +18,12 @@ def test_flip_rule_on_agreeing_signal():
     assert p.pm1.tolist() == [-1.0, +1.0, +1.0, -1.0]
 
 
-def test_accumulator_is_integer_and_gates_subtle_flips():
+def test_accumulator_is_int8_and_gates_subtle_flips():
     """Nothing is discarded: a small consistent signal accumulates and *eventually*
     flips once it crosses the threshold (no flip on the first step)."""
     bit = brute.as_tensor(torch.tensor([True, True, True, True]), dtype=brute.bit1)
     p = BoldParam(bit, name="w")
-    assert p.m.dtype == torch.int16                 # integer tracker buffer
+    assert p.m.dtype == torch.int8                  # integer tracker buffer
     # small agreeing signal (pm1 = +1): one step adds ≈eta, threshold=10 ⇒ no flip yet
     p.add_signal(torch.ones(4)); n1 = p.apply(eta=3.0, threshold=10.0)
     assert n1 == 0 and p.pm1.tolist() == [1, 1, 1, 1]
@@ -52,11 +52,7 @@ def test_signal_scale():
 
 
 def test_bold_learns_classifier_teacher():
-    """End-to-end: BOLD trains the (learned) semantic bank to imitate a teacher.
-
-    v3 freezes the lexical codebook; the trainable per-token bank is ``E_sem``,
-    so the codebook-learning check trains through the semantic decode path.
-    """
+    """End-to-end: BOLD trains a codebook to imitate a fixed argmax-teacher."""
     torch.manual_seed(0)
     N, D, C = 512, 256, 8
     g = torch.Generator().manual_seed(1)
@@ -64,19 +60,19 @@ def test_bold_learns_classifier_teacher():
     teacher = random_hypervectors(C, D, generator=g)
     y = (chat @ teacher).argmax(dim=1)
 
-    cb = TokenCodebook(C, D, name="E", sem=True, generator=torch.Generator().manual_seed(2))
+    cb = TokenCodebook(C, D, name="E", generator=torch.Generator().manual_seed(2))
     opt = BoldOptimizer(cb.params(), BoldConfig(eta=1.0, threshold=6.0))
     inv = 1.0 / (D ** 0.5)
 
     def acc():
-        return float(((cb.decode_sem(chat).float() * inv).argmax(1) == y).float().mean())
+        return float(((cb.decode(chat).float() * inv).argmax(1) == y).float().mean())
 
     a0 = acc()
     for _ in range(120):
-        logits = cb.decode_sem(chat).float() * inv
+        logits = cb.decode(chat).float() * inv
         p = logits.softmax(1)
         oh = torch.zeros_like(p); oh.scatter_(1, y.unsqueeze(1), 1.0)
-        cb.decode_sem_backward((p - oh) * (inv / N), to_pm1(chat))
+        cb.decode_backward((p - oh) * (inv / N), to_pm1(chat))
         opt.step()
     a1 = acc()
     assert a1 > a0 + 0.4, f"BOLD failed to learn: {a0:.3f} → {a1:.3f}"

@@ -34,7 +34,6 @@ from typing import Sequence
 import torch
 
 import brute
-from brute.tensor import Tensor as _BT
 
 
 # ── bit1 <-> ±1 conversions ───────────────────────────────────────────────────
@@ -57,23 +56,13 @@ def to_pm1(x: brute.Tensor) -> torch.Tensor:
     return x.unpack_pm1()
 
 
-def to_i8_pm1(x: brute.Tensor) -> torch.Tensor:
-    """Decode a ``brute.bit1`` tensor to an int8 ±1 tensor (+1 / -1)."""
-    bits = x.bool().as_subclass(torch.Tensor)
-    return bits.to(torch.int8) * 2 - 1
-
-
 def sign_to_bit1(z: torch.Tensor) -> brute.Tensor:
     """Threshold an integer/real tensor to bit1 with the ``sign(0) = +1`` rule.
 
     This is the forward Boolean activation ``y = T iff z >= 0`` (BOLD §3.1,
     Def. 3.3 adapted so that the binary state is never 0).
     """
-    if z.dim() >= 1 and z.dtype in (torch.int32, torch.float32):
-        return brute.fast.sign(z)
-    mask = z >= 0
-    packed = torch.ops.brute.pack_bool(mask)
-    return _BT._make_bit1_from_packed(packed, list(mask.shape))
+    return brute.as_tensor(z >= 0, dtype=brute.bit1)
 
 
 # ── Binding (⊗) — XNOR ─────────────────────────────────────────────────────────
@@ -86,7 +75,7 @@ def bind(a: brute.Tensor, b: brute.Tensor) -> brute.Tensor:
 def unbind(a: brute.Tensor, b: brute.Tensor) -> brute.Tensor:
     """``a ⊘ b`` — the inverse of binding.  XNOR is its own inverse, so this is
     literally :func:`bind`; the alias exists so call-sites that *recover* a
-    position-free value from a bound key read clearly."""
+    position-free value from a bound key (HÆMMR v2 §A) read clearly."""
     return brute.fast.eq(a, b)
 
 
@@ -139,7 +128,7 @@ def position_codes(base_pm1: torch.Tensor, n: int) -> brute.Tensor:
 
 def hierarchical_position_codes(chunk_base_pm1: torch.Tensor, offset_base_pm1: torch.Tensor,
                                 n: int, *, chunk: int = 256) -> brute.Tensor:
-    """Hierarchical positional binding for the episodic address lane.
+    """Gemini's hierarchical positional binding (HÆMMR v2 §A).
 
     Factor ``i = b·C + o`` (chunk ``b``, offset ``o``) over two *orthogonal*
     bases and bind::
@@ -171,15 +160,6 @@ def random_hypervectors(num: int, D: int, *, generator: torch.Generator | None =
     return hv.to(device) if device is not None else hv
 
 
-def packed_majority_vote(rows: brute.Tensor, k: int, D: int) -> brute.Tensor:
-    """Majority vote over ``k`` packed binary rows → packed bit1 output.
-
-    Thin wrapper around ``brute.fast.majority`` for use in the model layers.
-    ``rows`` is ``(batch, k, D)`` bit1; returns ``(batch, D)`` bit1.
-    """
-    return brute.fast.majority(rows, k, D)
-
-
 def hamming_similarity(q_bit: brute.Tensor, keys_bit: brute.Tensor) -> torch.Tensor:
     """Signed similarity ``<q, key> = D - 2·Hamming`` for every key (XNOR+popcount).
 
@@ -202,7 +182,7 @@ def binary_equiangular_frame(C: int, D: int, *, alpha: float = 1.0, n_sweeps: in
     greedy coordinate flips: the first term pushes every pair toward maximal
     Hamming separation (negative inner product), the second makes the spacing
     *uniform* (equiangular).  Replacing HÆMMR's random token codebook with a BEF
-    removes the anomalously-close pairs that drive decode collisions.
+    removes the anomalously-close pairs that drive decode collisions (v2 §C1).
 
     Returns a ``(C, D)`` float ±1 tensor.  This inline implementation is meant
     for tests and small local models; production-scale vocabularies should use

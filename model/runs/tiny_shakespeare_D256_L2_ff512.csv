@@ -1,2 +1,0 @@
-step,train_ema,val_loss,val_ppl,val_acc,flip_frac,eta
-200,4.1760,4.1583,63.96,0.0828,0.00460,3.0000

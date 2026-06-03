@@ -3,9 +3,9 @@ import torch
 import pytest
 
 import brute
-from bold import BoldConfig, BoldOptimizer, BoldParam
+from bold import BoldConfig, BoldOptimizer
 from layers import (BSR, BooleanLinear, DiagBind, EpisodicSlotMemory,
-                    HopfieldBank, TokenCodebook, bind_mask,
+                    HopfieldBank, ResidualMerge, TokenCodebook, bind_mask,
                     pow2_decay_palette)
 from vsa import bind, hamming_similarity, random_hypervectors, to_bit1, to_pm1
 
@@ -17,24 +17,11 @@ def _rand_bits(*shape, seed=0):
 
 class TestBooleanLinear:
     def test_forward_matches_pm1_reference(self):
-        """When boundary_nu is None, fused path returns z=None but same bit1 output."""
         lin = BooleanLinear(96, 48, name="lin", generator=torch.Generator().manual_seed(1))
         x = _rand_bits(10, 96, seed=2)
         out, z = lin.forward(x)
-        # fused path: z is None (no int32 intermediate materialised)
-        assert z is None
         z_ref = to_pm1(x) @ lin.W.pm1.t()
-        assert torch.equal(to_pm1(out), torch.where(z_ref >= 0, 1.0, -1.0))
-
-    def test_forward_with_boundary_nu_returns_int32_z(self):
-        """When boundary_nu is set, the int32 pre-activation z must be returned."""
-        lin = BooleanLinear(96, 48, name="lin", generator=torch.Generator().manual_seed(1),
-                            boundary_nu=0.5)
-        x = _rand_bits(10, 96, seed=2)
-        out, z = lin.forward(x)
-        assert z is not None
         assert z.dtype == torch.int32
-        z_ref = to_pm1(x) @ lin.W.pm1.t()
         assert torch.equal(z.float(), z_ref)
         assert torch.equal(to_pm1(out), torch.where(z_ref >= 0, 1.0, -1.0))
 
@@ -46,9 +33,8 @@ class TestBooleanLinear:
         g = lin.backward(S)
         assert g.shape == (10, 96)
         assert torch.any(lin.W.q != 0)          # accumulated weight flip-signal
-        # q_W stores the ternary direction of the aggregated Boolean vote.
-        ref = torch.sign(torch.sign(S).t() @ to_pm1(x)).to(lin.W.q.dtype)
-        assert torch.equal(lin.W.q, ref)
+        # q_W = Sᵀ · a_pm1
+        assert torch.allclose(lin.W.q, S.t() @ to_pm1(x), atol=1e-4)
 
     def test_learns_supervised_binary_projection(self):
         torch.manual_seed(0)
@@ -56,25 +42,18 @@ class TestBooleanLinear:
         x = random_hypervectors(256, 96, generator=g)
         teacher = random_hypervectors(8, 96, generator=g)
         y = hamming_similarity(x, teacher).argmax(dim=1)
-        # Use boundary_nu to force the int32-z path (logits needed for training loop).
-        lin = BooleanLinear(96, 8, name="lin", generator=torch.Generator().manual_seed(22),
-                            boundary_nu=None)
-        opt = BoldOptimizer(lin.params(), BoldConfig(eta=2.0, threshold=8.0))
+        lin = BooleanLinear(96, 8, name="lin", generator=torch.Generator().manual_seed(22))
+        opt = BoldOptimizer(lin.params(), BoldConfig(eta=3.0, threshold=8.0))
         inv = 1.0 / (96 ** 0.5)
         for _ in range(80):
-            lin.forward(x)
-            z = brute.fast.matmul(x, lin.W.bit)   # (256, 8) int32 for logits
+            _, z = lin.forward(x)
             logits = z.float() * inv
-            pred = logits.argmax(dim=1)
-            S = torch.zeros_like(logits, dtype=torch.int8)
-            wrong = pred != y
-            rows = wrong.nonzero(as_tuple=False).squeeze(1)
-            if rows.numel():
-                S[rows, pred[rows]] = 1
-                S[rows, y[rows]] = -1
-            lin.backward(S)
+            p = logits.softmax(dim=1)
+            oh = torch.zeros_like(p)
+            oh.scatter_(1, y.unsqueeze(1), 1.0)
+            lin.backward((p - oh) * (inv / x.shape[0]))
             opt.step()
-        z = brute.fast.matmul(x, lin.W.bit)
+        _, z = lin.forward(x)
         acc = float((z.argmax(dim=1) == y).float().mean())
         assert acc > 0.75
 
@@ -93,30 +72,47 @@ class TestDiagBind:
         assert torch.equal(to_pm1(out), to_pm1(c) * to_pm1(m))
 
 
-class TestConceptHighway:
-    """The clipped integer concept highway replaces majority-vote residual merge."""
+class TestResidualMerge:
+    def test_mux_selects_per_gate(self):
+        rm = ResidualMerge(128, name="rm", p_open=0.5,
+                           generator=torch.Generator().manual_seed(7))
+        skip = _rand_bits(5, 128, seed=8)
+        trans = _rand_bits(5, 128, seed=9)
+        out = rm.forward(skip, trans)
+        g_open = rm.g.pm1 > 0
+        ref = torch.where(g_open, to_pm1(trans), to_pm1(skip))
+        assert torch.equal(to_pm1(out), ref)
 
-    def test_block_accumulates_clipped_integer_highway(self):
-        import torch as _t
-        from model import HaemmrConfig, HaemmrLM
-        cfg = HaemmrConfig(vocab_size=16, D=128, n_layers=2, d_ff=128, n_slots=16,
-                           top_k=3, highway_clip=7, seed=0)
-        m = HaemmrLM(cfg, device="cpu")
-        ids = _t.randint(0, 16, (2, 6))
-        m.forward(ids)
-        for blk in m.blocks:
-            u_pre = blk._cache["u_pre"]
-            u = blk._cache["u"]
-            # highway carries an integer-valued field, never re-majority-voted
-            assert u.dtype == _t.int8
-            assert u_pre.dtype == _t.int16
-            assert _t.equal(u, u.round())
-            # the block input is bounded by the clip from the previous block
-            assert float(u.abs().max()) <= cfg.highway_clip
+    def test_identity_when_all_gates_closed(self):
+        rm = ResidualMerge(128, name="rm", p_open=0.0,
+                           generator=torch.Generator().manual_seed(7))
+        skip = _rand_bits(5, 128, seed=8)
+        trans = _rand_bits(5, 128, seed=9)
+        out = rm.forward(skip, trans)
+        assert torch.equal(to_pm1(out), to_pm1(skip))   # block ≈ identity at init
 
-    def test_no_residual_merge_symbol(self):
-        import layers
-        assert not hasattr(layers, "ResidualMerge")
+    def test_backward_routes_signal_by_gate(self):
+        rm = ResidualMerge(64, name="rm", p_open=0.5,
+                           generator=torch.Generator().manual_seed(7))
+        skip = _rand_bits(3, 64, seed=8)
+        trans = _rand_bits(3, 64, seed=9)
+        rm.forward(skip, trans)
+        S = torch.randn(3, 64)
+        g_skip, g_trans = rm.backward(S)
+        g_open = rm.g.pm1 > 0
+        assert torch.equal(g_trans, S * g_open)
+        assert torch.equal(g_skip, S * (~g_open))
+
+    def test_gate_opens_when_transform_is_better(self):
+        rm = ResidualMerge(64, name="rm", p_open=0.0,
+                           generator=torch.Generator().manual_seed(7))
+        skip = _rand_bits(8, 64, seed=8)
+        trans = _rand_bits(8, 64, seed=9)
+        target = to_pm1(trans)
+        out = rm.forward(skip, trans)
+        rm.backward(to_pm1(out) - target)
+        n = rm.g.apply(eta=5.0, threshold=1.0)
+        assert n > 0
 
 
 class TestBSR:
@@ -131,41 +127,22 @@ class TestBSR:
         c = random_hypervectors(2 * 12, 128,
                                 generator=torch.Generator().manual_seed(11)).reshape(2, 12, 128)
         r = bsr.forward(c)
-        # reference ±1 erase/write delta recurrence using the cached projections
+        # reference ±1 recurrence using the cached Boolean projections
         k = bsr._cache["k_pm1"]
         v = bsr._cache["v_pm1"]
         q = bsr._cache["q_pm1"]
         assoc = k * v
-        erase = bsr.erase_by_dim
-        write = bsr.write_by_dim
-        clip = bsr.state_clip
-        A = torch.zeros(2, 128, dtype=torch.int8)
-        S = torch.empty(2, 12, 128, dtype=torch.int8)
-        gate = torch.empty(2, 12, 128, dtype=torch.int8)
-        shifts = bsr.decay_shift_by_dim
+        A = torch.zeros(2, 128)
+        S = torch.empty(2, 12, 128)
+        gate = torch.empty(2, 12, 128)
         for i in range(12):
-            S[:, i, :] = torch.where(A >= 0, 1, -1).to(torch.int8)
-            d = (S[:, i, :] != assoc[:, i, :]).to(torch.int8)
-            gate[:, i, :] = d
-            decayed = A.clone()
-            for s in bsr.decay_shift_values:
-                if s > 0:
-                    mask = shifts == s
-                    decayed[:, mask] = A[:, mask] - (A[:, mask] >> s)
-            A_new = decayed - erase * d * S[:, i, :] + write * d * assoc[:, i, :]
-            A = A_new.clamp(-clip, clip).to(torch.int8)
+            S[:, i, :] = torch.where(A >= 0, 1.0, -1.0)
+            pred = k[:, i, :] * S[:, i, :]
+            gate[:, i, :] = (pred != v[:, i, :]).float()
+            A = bsr.decay * A + gate[:, i, :] * assoc[:, i, :]
         r_ref = q * S
         assert torch.equal(bsr._cache["gate"], gate)
-        assert bsr._cache["state_bit"].dtype == brute.bit1
-        assert bsr._cache["gate_bit"].dtype == brute.bit1
-        assert torch.equal(to_pm1(r), r_ref.float())
-
-    def test_separate_erase_write_strengths(self):
-        """Erase and write are separate per-channel-group masks."""
-        bsr = BSR(64, name="bsr", erase=(2, 0), write=(1, 3),
-                  generator=torch.Generator().manual_seed(10))
-        assert int(bsr.erase_by_dim[0]) == 2 and int(bsr.erase_by_dim[-1]) == 0
-        assert int(bsr.write_by_dim[0]) == 1 and int(bsr.write_by_dim[-1]) == 3
+        assert torch.equal(to_pm1(r), r_ref)
 
     def test_recurrence_is_sensitive_to_prefix_content(self):
         """Identical query position, different prefix token → different BSR read.
@@ -230,98 +207,6 @@ class _FixedProjection:
         return []
 
 
-class TestEpisodicChunked:
-    """Tests that verify the chunked causal-ring episodic memory properties."""
-
-    def test_single_chunk_matches_full_sequence(self):
-        """When n ≤ C the chunked forward is identical to the original full-n causal read."""
-        D, n = 64, 16
-        C = 64    # chunk size >= n → single chunk
-        g = torch.Generator().manual_seed(55)
-        mem_new = EpisodicSlotMemory(D, name="epi", read_k=1, epi_chunk=C,
-                                     generator=g)
-        # old-style (large chunk, no registers): should be same as epi_chunk=n
-        mem_old = EpisodicSlotMemory(D, name="epi_ref", read_k=1, epi_chunk=n * 2, generator=torch.Generator().manual_seed(55))
-        c   = random_hypervectors(2 * n, D, generator=torch.Generator().manual_seed(56)
-                                  ).reshape(2, n, D)
-        pos = random_hypervectors(n, D, generator=torch.Generator().manual_seed(57))
-
-        # Copy weights so both see the same projections.
-        for p_n, p_o in zip(mem_new.params(), mem_old.params()):
-            p_o.bit = p_n.bit
-            p_o._pm1 = None
-
-        out_new = mem_new.forward(c, pos)
-        out_old = mem_old.forward(c, pos)
-        assert torch.equal(to_pm1(out_new), to_pm1(out_old)), \
-            "single-chunk chunked forward differs from full-sequence forward"
-
-    def test_chunked_forward_shape(self):
-        D, n = 64, 80   # n > C (two chunks)
-        C = 64
-        g = torch.Generator().manual_seed(60)
-        mem = EpisodicSlotMemory(D, name="epi", read_k=1, epi_chunk=C,
-                                 generator=g)
-        c   = random_hypervectors(2 * n, D, generator=torch.Generator().manual_seed(61)
-                                  ).reshape(2, n, D)
-        pos = random_hypervectors(n, D, generator=torch.Generator().manual_seed(62))
-        out = mem.forward(c, pos)
-        assert out.shape == (2, n, D)
-        assert out.dtype == brute.bit1
-
-    def test_chunked_backward_shapes(self):
-        D, n = 64, 80
-        C = 64
-        g = torch.Generator().manual_seed(63)
-        mem = EpisodicSlotMemory(D, name="epi", read_k=1, epi_chunk=C,
-                                 generator=g)
-        c   = random_hypervectors(2 * n, D, generator=torch.Generator().manual_seed(64)
-                                  ).reshape(2, n, D)
-        pos = random_hypervectors(n, D, generator=torch.Generator().manual_seed(65))
-        mem.forward(c, pos)
-        S = torch.randn(2, n, D)
-        g_c = mem.backward(S)
-        assert g_c.shape == (2, n, D)
-        for p in mem.params():
-            assert torch.any(p.q != 0), f"{p.name} has no signal"
-
-    def test_chunked_streaming_matches_batched(self):
-        """streaming step() parity for n ≤ C (single-chunk case)."""
-        D, n = 96, 12
-        C = 64    # chunk >= n → single-chunk ring; streaming parity holds
-        g = torch.Generator().manual_seed(43)
-        mem = EpisodicSlotMemory(D, name="epi", read_k=1, epi_chunk=C,
-                                 generator=g)
-        c   = random_hypervectors(2 * n, D, generator=torch.Generator().manual_seed(44)
-                                  ).reshape(2, n, D)
-        pos = random_hypervectors(n, D, generator=torch.Generator().manual_seed(45))
-
-        batched = mem.forward(c, pos)
-        mem.reset_stream(2, n)
-        streamed = [mem.step(c[:, i, :], pos[i], n) for i in range(n)]
-        streamed = to_bit1(torch.stack([to_pm1(x) for x in streamed], dim=1))
-        assert torch.equal(to_pm1(streamed), to_pm1(batched))
-
-    def test_linearity_no_nn_buffer_for_n_gt_C(self):
-        """The chunked forward must not allocate any (B, n, n) intermediate."""
-        import sys
-        D, n, C = 64, 128, 64   # n = 2C: two chunks
-        g = torch.Generator().manual_seed(80)
-        mem = EpisodicSlotMemory(D, name="epi", read_k=1, epi_chunk=C,
-                                 generator=g)
-        c   = random_hypervectors(n, D, generator=torch.Generator().manual_seed(81)
-                                  ).reshape(1, n, D)
-        pos = random_hypervectors(n, D, generator=torch.Generator().manual_seed(82))
-
-        # Inspect that chunk scores are at most (1, C, 2C), not (1, n, n).
-        mem.forward(c, pos)
-        scores = mem._cache["chunk_scores"]
-        for sg in scores:
-            B, q_cnt, w_cnt = sg.shape
-            assert q_cnt <= C and w_cnt <= 2 * C, \
-                f"chunk score matrix too large: {sg.shape} (should be ≤ (B, C, 2C))"
-
-
 class TestEpisodicSlotMemory:
     def test_controlled_top1_read_is_causal_and_exact(self):
         D, n = 64, 4
@@ -368,9 +253,7 @@ class TestEpisodicSlotMemory:
     def test_streaming_matches_batched_forward(self):
         D, n = 96, 12
         g = torch.Generator().manual_seed(43)
-        # epi_chunk >= n so single chunk
-        mem = EpisodicSlotMemory(D, name="epi", read_k=1, epi_chunk=64,
-                                 generator=g)
+        mem = EpisodicSlotMemory(D, name="epi", read_k=1, generator=g)
         c = random_hypervectors(2 * n, D, generator=g).reshape(2, n, D)
         pos = random_hypervectors(n, D, generator=g)
 
@@ -396,39 +279,6 @@ class TestEpisodicSlotMemory:
         assert torch.any(mem.Qc.W.q != 0)
         assert torch.any(mem.Qp.W.q != 0)
 
-    def test_margin_loss_finite_for_out_of_window_matched(self):
-        """Matched slots outside the ring window must be skipped, not blow up."""
-        import math
-        D, n = 64, 20
-        g = torch.Generator().manual_seed(46)
-        mem = EpisodicSlotMemory(D, name="epi", read_k=1, n_slots=4, epi_chunk=8, generator=g)
-        c = random_hypervectors(n, D, generator=g).reshape(1, n, D)
-        pos = random_hypervectors(n, D, generator=g)
-        mem.forward(c, pos)
-        matched = (torch.arange(n) - 10).reshape(1, n)   # many far-back / negative
-        val = mem.margin_loss(matched, theta_pos=1.0, theta_neg=-1.0)
-        assert math.isfinite(val)
-
-
-class TestHopfieldMajority:
-    def test_topk_read_matches_pm1_vote(self):
-        """Multi-slot Hopfield read == sign(sum ±1 payloads) for the same top-k set."""
-        D, n_slots, top_k = 64, 32, 5
-        hb = HopfieldBank(D, n_slots=n_slots, top_k=top_k, name="hop",
-                          generator=torch.Generator().manual_seed(20))
-        q = _rand_bits(4, D, seed=21)
-        out_packed = hb.forward(q)
-
-        # Reproduce what old code did: pm1 sum → sign
-        sim = brute.fast.matmul(q, hb.P.bit)
-        _, idx = torch.topk(sim, k=top_k, dim=1)
-        U_pm1 = hb.U.pm1
-        sel   = U_pm1[idx]                          # (4, top_k, D)
-        vote  = sel.sum(dim=1)                      # (4, D)
-        ref   = torch.where(vote >= 0, 1.0, -1.0)
-
-        assert torch.equal(to_pm1(out_packed), ref)
-
 
 class TestHopfield:
     def test_read_shape_and_determinism(self):
@@ -450,21 +300,6 @@ class TestHopfield:
         assert torch.any(hb.U.q != 0)                    # payloads get loss signal
         assert torch.any(hb.P.q != 0)                    # keys get Hebbian signal
 
-    def test_hebbian_key_signal_pulls_selected_key_toward_query(self):
-        hb = HopfieldBank(64, n_slots=1, top_k=1, name="hop",
-                          generator=torch.Generator().manual_seed(12))
-        q = _rand_bits(1, 64, seed=13)
-        hb.P.bit = _rand_bits(1, 64, seed=14)
-        hb.P._pm1 = None
-        hb.forward(q)
-        hb.backward(torch.zeros(1, 64))
-        q_pm1 = to_pm1(q)
-        p_pm1 = hb.P.pm1
-        disagree = p_pm1 != q_pm1
-        agree = ~disagree
-        assert torch.equal(hb.P.q[disagree], p_pm1[disagree])
-        assert torch.equal(hb.P.q[agree], -p_pm1[agree])
-
     def test_controlled_slot_retrieval(self):
         hb = HopfieldBank(128, n_slots=8, top_k=1, name="hop",
                           generator=torch.Generator().manual_seed(12))
@@ -480,31 +315,21 @@ class TestHopfield:
 
 class TestCodebook:
     def test_embed_and_decode_roundtrip_shapes(self):
-        cb = TokenCodebook(40, 128, name="E", structured=False,
-                           generator=torch.Generator().manual_seed(14))
+        cb = TokenCodebook(40, 128, name="E", generator=torch.Generator().manual_seed(14))
         ids = torch.randint(0, 40, (3, 9))
         emb = cb.embed(ids)
         assert emb.shape == (3, 9, 128) and emb.dtype == brute.bit1
         logits = cb.decode(emb.reshape(27, 128))
         assert logits.shape == (27, 40) and logits.dtype == torch.int32
-        # a token's (fixed) lexical code is maximally similar to its own row
-        single = cb.decode(cb.E_lex[5:6])
+        # a token's embedding is maximally similar to its own codebook row
+        single = cb.decode(cb.E.bit[5:6])
         assert int(single.argmax().item()) == 5
 
-    def test_lexical_codebook_is_fixed(self):
-        """E_lex is not a BOLD parameter — only the semantic bank is trainable."""
-        cb = TokenCodebook(40, 128, name="E", structured=False, sem=True,
-                           generator=torch.Generator().manual_seed(14))
-        assert not isinstance(cb.E_lex, (BoldParam,))
-        names = [p.name for p in cb.params()]
-        assert names == ["E.sem"]               # only the semantic bank trains
-
     def test_positioned_code_decodes_after_unbind(self):
-        cb = TokenCodebook(64, 1024, name="E", structured=False,
-                           generator=torch.Generator().manual_seed(14))
+        cb = TokenCodebook(64, 1024, name="E", generator=torch.Generator().manual_seed(14))
         base = (torch.randint(0, 2, (1024,), generator=torch.Generator().manual_seed(15)) * 2 - 1).float()
         pos = to_bit1(torch.roll(base, 7).unsqueeze(0))
-        dressed = bind(cb.E_lex[11:12], pos)
+        dressed = bind(cb.E.bit[11:12], pos)
         raw_target_sim = int(cb.decode(dressed)[0, 11].item())
         recovered = bind(dressed, pos)
         assert int(cb.decode(recovered).argmax().item()) == 11

@@ -16,14 +16,11 @@
 #include "kernels/popcount.cuh"
 #include "kernels/matmul_fallback.cuh"
 #include "kernels/matmul_cutlass.cuh"
-#include "kernels/fused_ops.cuh"
 
 #include <ATen/cuda/CUDAContext.h>
-#include <ATen/Dispatch.h>
 #include <c10/cuda/CUDAStream.h>
 #include <torch/torch.h>
 #include <cuda_runtime.h>
-#include <tuple>
 
 namespace cbrute { namespace cuda {
 
@@ -88,35 +85,6 @@ at::Tensor pack_bool(const at::Tensor& input) {
             reinterpret_cast<const uint8_t*>(inp.data_ptr<bool>()),
             as_u8(output), ld, row_bytes);
     }
-    return output;
-}
-
-at::Tensor pack_sign(const at::Tensor& input) {
-    TORCH_CHECK(input.dim() >= 1, "pack_sign: input must have >= 1 dim");
-    TORCH_CHECK(input.scalar_type() != at::kBool,
-                "pack_sign: input must be numeric, not torch.bool");
-
-    const auto inp = input.contiguous();
-    const int64_t ld = inp.size(-1);
-
-    auto out_shape = inp.sizes().vec();
-    if (ld == 0) {
-        out_shape.back() = 0;
-        return at::zeros(out_shape, inp.options().dtype(at::kLong));
-    }
-
-    const int64_t pd_words  = (ld + PACK_WIDTH - 1) / PACK_WIDTH;
-    const int64_t row_bytes = pd_words * (PACK_WIDTH / 8);
-    const int64_t batch     = inp.numel() / ld;
-    out_shape.back() = pd_words;
-
-    auto output = at::zeros(out_shape, inp.options().dtype(at::kLong));
-    const int chunks = (int)((ld + 31) / 32);
-    dim3 grid((unsigned)chunks, (unsigned)batch);
-    AT_DISPATCH_ALL_TYPES(inp.scalar_type(), "pack_sign", [&] {
-        kernels::k_pack_sign_warp<scalar_t><<<grid, 32, 0, cur_stream()>>>(
-            inp.data_ptr<scalar_t>(), as_u8(output), ld, row_bytes);
-    });
     return output;
 }
 
@@ -251,43 +219,6 @@ at::Tensor xnor_popcount_matmul(const at::Tensor& A, const at::Tensor& B, int64_
     return C;
 }
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor>
-bsr_scan(const at::Tensor& q, const at::Tensor& assoc,
-         const at::Tensor& decay_shifts, int64_t D) {
-    TORCH_CHECK(q.dim() == 3 && assoc.dim() == 3,
-                "bsr_scan: q and assoc must be packed tensors with shape (B, n, Kp)");
-    TORCH_CHECK(q.sizes() == assoc.sizes(), "bsr_scan: q/assoc shape mismatch");
-    TORCH_CHECK(q.scalar_type() == at::kLong && assoc.scalar_type() == at::kLong,
-                "bsr_scan: q and assoc must be int64 packed buffers");
-    TORCH_CHECK(decay_shifts.dim() == 1 && decay_shifts.scalar_type() == at::kInt,
-                "bsr_scan: decay_shifts must be a 1-D int32 tensor");
-    TORCH_CHECK(D >= 0, "bsr_scan: D must be non-negative");
-
-    const auto qc = q.contiguous();
-    const auto ac = assoc.contiguous();
-    const auto sc = decay_shifts.contiguous();
-    const int64_t B = qc.size(0), n = qc.size(1), Kp = qc.size(2);
-    TORCH_CHECK(Kp == (D + PACK_WIDTH - 1) / PACK_WIDTH,
-                "bsr_scan: packed width does not match D");
-    const int64_t groups = sc.numel();
-    TORCH_CHECK(groups > 0, "bsr_scan: decay_shifts must be non-empty");
-
-    auto read = at::zeros(qc.sizes(), qc.options());
-    auto state = at::zeros(qc.sizes(), qc.options());
-    auto gate = at::zeros(qc.sizes(), qc.options());
-    if (B == 0 || n == 0 || Kp == 0 || D == 0) {
-        return {read, state, gate};
-    }
-
-    const int chunks = (int)((D + 31) / 32);
-    dim3 grid((unsigned)chunks, (unsigned)B);
-    kernels::k_bsr_scan_chunked<<<grid, 32, 0, cur_stream()>>>(
-        as_u64(qc), as_u64(ac), sc.data_ptr<int32_t>(),
-        as_u8(read), as_u8(state), as_u8(gate),
-        n, Kp, D, (int)groups);
-    return {read, state, gate};
-}
-
 //  popcount — per-element int32, supports any integer dtype + bool.
 at::Tensor popcount(const at::Tensor& x) {
     const auto p = x.contiguous();
@@ -386,90 +317,6 @@ at::Tensor bit1_hamming_total(const at::Tensor& A, const at::Tensor& B) {
 }
 
 at::Tensor& randomize_bits(at::Tensor& out) { out.random_(); return out; }
-
-// ── Fused sign ops ──────────────────────────────────────────────────────────
-
-at::Tensor xnor_popcount_matmul_sign(const at::Tensor& A, const at::Tensor& B, int64_t K) {
-    TORCH_CHECK(A.dim() == 2 && B.dim() == 2,
-                "xnor_popcount_matmul_sign: inputs must be 2-D");
-    const int64_t M = A.size(0), N = B.size(0), Kp = A.size(1);
-    TORCH_CHECK(Kp == B.size(1), "xnor_popcount_matmul_sign: packed K mismatch");
-
-    const int64_t Np = (N + 63) / 64;
-    auto Ac = A.contiguous();
-    auto Bc = B.contiguous();
-    auto C  = at::zeros({M, Np}, A.options().dtype(at::kLong));
-
-    const int32_t K_logical = (int32_t)K;
-    // One thread per (m, n); threads write bits via atomicOr.
-    dim3 block(16, 16);
-    dim3 grid((unsigned)((N + 15) / 16), (unsigned)((M + 15) / 16));
-    kernels::k_xnor_popcount_matmul_sign<<<grid, block, 0, cur_stream()>>>(
-        as_u64(Ac), as_u64(Bc),
-        reinterpret_cast<uint64_t*>(C.data_ptr<int64_t>()),
-        (int)M, (int)N, (int)Kp, K_logical, (int)Np);
-    return C;
-}
-
-at::Tensor packed_majority(const at::Tensor& rows, int64_t k, int64_t D) {
-    TORCH_CHECK(rows.dim() == 3, "packed_majority: rows must be 3-D");
-    TORCH_CHECK(rows.scalar_type() == at::kLong);
-    TORCH_CHECK(k > 0 && D > 0);
-
-    const int64_t batch = rows.size(0);
-    const int64_t Kp    = rows.size(2);
-    TORCH_CHECK(rows.size(1) == k);
-    TORCH_CHECK(Kp == (D + 63) / 64, "packed_majority: Kp mismatch with D");
-
-    const int n_bits   = (k == 1) ? 1
-        : (int)std::ceil(std::log2((double)k + 1.0));
-    const int threshold = (int)(k / 2) + 1;
-
-    auto rc  = rows.contiguous();
-    auto out = at::zeros({batch, Kp}, rc.options());
-
-    const int64_t total = batch * Kp;
-    dim3 block(256);
-    dim3 grid((unsigned)((total + 255) / 256));
-    kernels::k_packed_majority<<<grid, block, 0, cur_stream()>>>(
-        as_u64(rc), reinterpret_cast<uint64_t*>(out.data_ptr<int64_t>()),
-        (int)batch, (int)k, (int)Kp, threshold, n_bits, (int)D);
-    return out;
-}
-
-std::tuple<at::Tensor, at::Tensor, at::Tensor>
-episodic_causal_search(const at::Tensor& qc, const at::Tensor& kc_buf,
-                        const at::Tensor& qp, const at::Tensor& pos_buf,
-                        const at::Tensor& payload, const at::Tensor& cnt,
-                        int64_t D) {
-    TORCH_CHECK(qc.dim() == 2 && qp.dim() == 2);
-    TORCH_CHECK(kc_buf.dim() == 3 && pos_buf.dim() == 3 && payload.dim() == 3);
-    TORCH_CHECK(cnt.dim() == 1 && cnt.scalar_type() == at::kInt);
-    TORCH_CHECK(D > 0);
-
-    const int64_t B  = qc.size(0);
-    const int64_t Kp = qc.size(1);
-    const int64_t N  = kc_buf.size(1);
-
-    auto qcc  = qc.contiguous(),   qpc  = qp.contiguous();
-    auto kcc  = kc_buf.contiguous(), psc  = pos_buf.contiguous();
-    auto payc = payload.contiguous(), cntc = cnt.contiguous();
-
-    auto read      = at::zeros({B, Kp}, qcc.options());
-    auto idx_out   = at::full({B}, int32_t(-1), qcc.options().dtype(at::kInt));
-    auto score_out = at::full({B}, int32_t(-(int32_t)D * 2 - 2),
-                              qcc.options().dtype(at::kInt));
-
-    dim3 block(256);
-    dim3 grid((unsigned)((B + 255) / 256));
-    kernels::k_episodic_causal_search<<<grid, block, 0, cur_stream()>>>(
-        as_u64(qcc), as_u64(kcc), as_u64(qpc), as_u64(psc), as_u64(payc),
-        cntc.data_ptr<int32_t>(),
-        reinterpret_cast<uint64_t*>(read.data_ptr<int64_t>()),
-        idx_out.data_ptr<int32_t>(), score_out.data_ptr<int32_t>(),
-        (int)N, (int)Kp, (int)D);
-    return {read, idx_out, score_out};
-}
 
 }} // cbrute::cuda
 #endif // HAVE_CUDA
