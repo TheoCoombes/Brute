@@ -34,6 +34,7 @@ from typing import Sequence
 import torch
 
 import brute
+from brute.tensor import Tensor as _BT
 
 
 # ── bit1 <-> ±1 conversions ───────────────────────────────────────────────────
@@ -62,7 +63,11 @@ def sign_to_bit1(z: torch.Tensor) -> brute.Tensor:
     This is the forward Boolean activation ``y = T iff z >= 0`` (BOLD §3.1,
     Def. 3.3 adapted so that the binary state is never 0).
     """
-    return brute.as_tensor(z >= 0, dtype=brute.bit1)
+    if z.dim() >= 1 and z.dtype in (torch.int32, torch.float32):
+        return brute.fast.sign(z)
+    mask = z >= 0
+    packed = torch.ops.brute.pack_bool(mask)
+    return _BT._make_bit1_from_packed(packed, list(mask.shape))
 
 
 # ── Binding (⊗) — XNOR ─────────────────────────────────────────────────────────
@@ -75,7 +80,7 @@ def bind(a: brute.Tensor, b: brute.Tensor) -> brute.Tensor:
 def unbind(a: brute.Tensor, b: brute.Tensor) -> brute.Tensor:
     """``a ⊘ b`` — the inverse of binding.  XNOR is its own inverse, so this is
     literally :func:`bind`; the alias exists so call-sites that *recover* a
-    position-free value from a bound key (HÆMMR v2 §A) read clearly."""
+    position-free value from a bound key read clearly."""
     return brute.fast.eq(a, b)
 
 
@@ -128,7 +133,7 @@ def position_codes(base_pm1: torch.Tensor, n: int) -> brute.Tensor:
 
 def hierarchical_position_codes(chunk_base_pm1: torch.Tensor, offset_base_pm1: torch.Tensor,
                                 n: int, *, chunk: int = 256) -> brute.Tensor:
-    """Gemini's hierarchical positional binding (HÆMMR v2 §A).
+    """Hierarchical positional binding for the episodic address lane.
 
     Factor ``i = b·C + o`` (chunk ``b``, offset ``o``) over two *orthogonal*
     bases and bind::
@@ -182,7 +187,7 @@ def binary_equiangular_frame(C: int, D: int, *, alpha: float = 1.0, n_sweeps: in
     greedy coordinate flips: the first term pushes every pair toward maximal
     Hamming separation (negative inner product), the second makes the spacing
     *uniform* (equiangular).  Replacing HÆMMR's random token codebook with a BEF
-    removes the anomalously-close pairs that drive decode collisions (v2 §C1).
+    removes the anomalously-close pairs that drive decode collisions.
 
     Returns a ``(C, D)`` float ±1 tensor.  This inline implementation is meant
     for tests and small local models; production-scale vocabularies should use

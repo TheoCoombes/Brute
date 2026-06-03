@@ -1,9 +1,9 @@
 """Source-level contracts for the binary-first implementation."""
 from pathlib import Path
 
-from model import HaemmrConfig
+import torch
 
-
+from model import HaemmrConfig, HaemmrLM
 ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -25,7 +25,7 @@ def test_hot_forward_uses_brute_fast_matmul():
     assert "sim = brute.fast.matmul(q_bit, self.P.bit)" in layers
 
 
-def test_v2_removed_position_bound_decode_mode():
+def test_no_position_bound_decode_mode():
     model_py = _text("model.py")
     train_py = _text("train.py")
     cfg = HaemmrConfig(use_position=True)
@@ -33,3 +33,31 @@ def test_v2_removed_position_bound_decode_mode():
     assert "position_decode" not in model_py
     assert "--position-decode" not in train_py
     assert "decode_pos" not in model_py
+
+
+def test_packed_hardware_forward_has_no_unpack_or_pm1_cache():
+    cfg = HaemmrConfig(
+        vocab_size=128,
+        D=128,
+        n_layers=1,
+        d_ff=256,
+        n_slots=32,
+        top_k=1,
+        epi_read_k=1,
+        use_bsr=False,
+        use_position=False,
+        sem_weight=0.0,
+        seed=0,
+    )
+    model = HaemmrLM(cfg, device="cpu")
+    ids = torch.randint(0, cfg.vocab_size, (2, 16))
+
+    from profile_helpers import count_hot_ops
+
+    with count_hot_ops() as counts:
+        logits = model.forward(ids)
+
+    assert logits.shape == (32, cfg.vocab_size)
+    assert counts["unpack_pm1"] == 0
+    assert counts["as_tensor_bit1_pack"] == 0
+    assert sum(1 for p in model.parameters() if p._pm1 is not None) == 0

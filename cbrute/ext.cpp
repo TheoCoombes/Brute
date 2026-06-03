@@ -44,11 +44,15 @@ at::Tensor bit1_not_packed_composite(const at::Tensor& A, int64_t last_dim_bits)
 TORCH_LIBRARY(brute, m) {
     // packing / unpacking
     m.def("pack_bool(Tensor input) -> Tensor");
+    m.def("pack_sign(Tensor input) -> Tensor");
     m.def("unpack_bits(Tensor packed, int[] logical_shape) -> Tensor");
     m.def("unpack_bool(Tensor packed, int[] logical_shape) -> Tensor");
 
     // matmul
     m.def("xnor_popcount_matmul(Tensor A, Tensor B, int K) -> Tensor");
+
+    // sequence kernels
+    m.def("bsr_scan(Tensor q, Tensor assoc, Tensor decay_shifts, int D) -> (Tensor, Tensor, Tensor)");
 
     // popcount / hamming
     m.def("popcount(Tensor x) -> Tensor");
@@ -71,9 +75,11 @@ TORCH_LIBRARY_IMPL(brute, CompositeExplicitAutograd, m) {
 //  CPU
 TORCH_LIBRARY_IMPL(brute, CPU, m) {
     m.impl("pack_bool",            cbrute::cpu::pack_bool);
+    m.impl("pack_sign",            cbrute::cpu::pack_sign);
     m.impl("unpack_bits",          cbrute::cpu::unpack_bits);
     m.impl("unpack_bool",          cbrute::cpu::unpack_bool);
     m.impl("xnor_popcount_matmul", cbrute::cpu::xnor_popcount_matmul);
+    m.impl("bsr_scan",             cbrute::cpu::bsr_scan);
     m.impl("popcount",             cbrute::cpu::popcount);
     m.impl("packed_popcount",      cbrute::cpu::packed_popcount);
     m.impl("hamming_distance",     cbrute::cpu::hamming_distance);
@@ -85,9 +91,11 @@ TORCH_LIBRARY_IMPL(brute, CPU, m) {
 #ifdef HAVE_MPS
 TORCH_LIBRARY_IMPL(brute, MPS, m) {
     m.impl("pack_bool",            cbrute::mps::pack_bool);
+    m.impl("pack_sign",            cbrute::mps::pack_sign);
     m.impl("unpack_bits",          cbrute::mps::unpack_bits);
     m.impl("unpack_bool",          cbrute::mps::unpack_bool);
     m.impl("xnor_popcount_matmul", cbrute::mps::xnor_popcount_matmul);
+    m.impl("bsr_scan",             cbrute::mps::bsr_scan);
     m.impl("popcount",             cbrute::mps::popcount);
     m.impl("packed_popcount",      cbrute::mps::packed_popcount);
     m.impl("hamming_distance",     cbrute::mps::hamming_distance);
@@ -100,9 +108,11 @@ TORCH_LIBRARY_IMPL(brute, MPS, m) {
 #ifdef HAVE_CUDA
 TORCH_LIBRARY_IMPL(brute, CUDA, m) {
     m.impl("pack_bool",            cbrute::cuda::pack_bool);
+    m.impl("pack_sign",            cbrute::cuda::pack_sign);
     m.impl("unpack_bits",          cbrute::cuda::unpack_bits);
     m.impl("unpack_bool",          cbrute::cuda::unpack_bool);
     m.impl("xnor_popcount_matmul", cbrute::cuda::xnor_popcount_matmul);
+    m.impl("bsr_scan",             cbrute::cuda::bsr_scan);
     m.impl("popcount",             cbrute::cuda::popcount);
     m.impl("packed_popcount",      cbrute::cuda::packed_popcount);
     m.impl("hamming_distance",     cbrute::cuda::hamming_distance);

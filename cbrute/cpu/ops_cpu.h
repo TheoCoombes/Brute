@@ -6,11 +6,17 @@ namespace cbrute { namespace cpu {
 
 //  Packing / unpacking — bit1 is uint64-packed (64 bits per int64 word).
 at::Tensor  pack_bool   (const at::Tensor& input);                               // bool →packed
+at::Tensor  pack_sign   (const at::Tensor& input);                               // sign(x)>=0 →packed
 at::Tensor  unpack_bits (const at::Tensor& packed, at::IntArrayRef logical_shape); // packed→±1 f32
 at::Tensor  unpack_bool (const at::Tensor& packed, at::IntArrayRef logical_shape); // packed→bool
 
 //  Matmul: A,B are uint64-packed (M,Kp),(N,Kp); K is the logical last dim.
 at::Tensor  xnor_popcount_matmul(const at::Tensor& A, const at::Tensor& B, int64_t K);
+
+//  Sequence kernels.
+std::tuple<at::Tensor, at::Tensor, at::Tensor>
+bsr_scan(const at::Tensor& q, const at::Tensor& assoc,
+         const at::Tensor& decay_shifts, int64_t D);
 
 //  Popcount / hamming (generic int dtype + bit1)
 at::Tensor  popcount         (const at::Tensor& x);             // per-element, int32 out

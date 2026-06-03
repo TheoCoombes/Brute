@@ -71,6 +71,78 @@ __global__ inline void k_pack_bool_persistent(const uint8_t* __restrict__ in_boo
     }
 }
 
+template <typename scalar_t>
+__global__ inline void k_pack_sign_warp(const scalar_t* __restrict__ input,
+                                        uint8_t* __restrict__ out_bytes,
+                                        int64_t ld, int64_t row_bytes) {
+    const int chunk_idx = blockIdx.x;
+    const int64_t row   = blockIdx.y;
+    const int lane      = threadIdx.x;
+    const int64_t bit_in_row = (int64_t)chunk_idx * 32 + lane;
+
+    const bool b = (bit_in_row < ld)
+        ? (__ldg(input + row * ld + bit_in_row) >= scalar_t(0))
+        : false;
+    const unsigned mask = __ballot_sync(0xFFFFFFFFu, b);
+    if (lane == 0) {
+        const int64_t out_off = row * row_bytes + (int64_t)chunk_idx * 4;
+        *reinterpret_cast<unsigned*>(out_bytes + out_off) = mask;
+    }
+}
+
+__global__ inline void k_bsr_scan_chunked(const uint64_t* __restrict__ q,
+                                          const uint64_t* __restrict__ assoc,
+                                          const int32_t* __restrict__ shifts,
+                                          uint8_t* __restrict__ read,
+                                          uint8_t* __restrict__ state,
+                                          uint8_t* __restrict__ gate,
+                                          int64_t n, int64_t Kp, int64_t D,
+                                          int groups) {
+    const int chunk_idx = blockIdx.x;
+    const int64_t row   = blockIdx.y;
+    const int lane      = threadIdx.x;
+    const int64_t d     = (int64_t)chunk_idx * 32 + lane;
+    const bool active   = d < D;
+    const int word_idx  = (int)(d >> 6);
+    const int bit_idx   = (int)(d & 63);
+    const uint64_t bit_mask = uint64_t(1) << bit_idx;
+    const int shift = active ? shifts[(d * (int64_t)groups) / D] : 0;
+    const int64_t row_bytes = Kp * 8;
+    int32_t A = 0;
+
+    for (int64_t t = 0; t < n; ++t) {
+        bool q_bit = false;
+        bool assoc_bit = false;
+        bool state_bit = false;
+        bool gate_bit = false;
+        if (active) {
+            const int64_t off = (row * n + t) * Kp + word_idx;
+            q_bit = (q[off] & bit_mask) != 0;
+            assoc_bit = (assoc[off] & bit_mask) != 0;
+            state_bit = A >= 0;
+            gate_bit = state_bit != assoc_bit;
+        }
+
+        const bool read_bit = active && (q_bit == state_bit);
+        const unsigned read_mask = __ballot_sync(0xFFFFFFFFu, read_bit);
+        const unsigned state_mask = __ballot_sync(0xFFFFFFFFu, active && state_bit);
+        const unsigned gate_mask = __ballot_sync(0xFFFFFFFFu, active && gate_bit);
+        if (lane == 0) {
+            const int64_t out_off = (row * n + t) * row_bytes + (int64_t)chunk_idx * 4;
+            *reinterpret_cast<unsigned*>(read + out_off) = read_mask;
+            *reinterpret_cast<unsigned*>(state + out_off) = state_mask;
+            *reinterpret_cast<unsigned*>(gate + out_off) = gate_mask;
+        }
+
+        if (active) {
+            int32_t decayed = A;
+            if (shift > 0) decayed = A - (A >> shift);
+            const int32_t update = gate_bit ? (assoc_bit ? 1 : -1) : 0;
+            A = decayed + update;
+        }
+    }
+}
+
 //  unpack: one warp reads one 32-bit chunk, broadcasts to all lanes, each
 //  lane writes its own bit-expanded element. Grid: (chunks_per_row, batch).
 __global__ inline void k_unpack_bool_warp(const uint8_t* __restrict__ in_bytes,

@@ -17,7 +17,7 @@ def tiny_model(**over):
 
 
 class TestForward:
-    def test_v2_has_position_free_decode_path(self):
+    def test_has_position_free_decode_path(self):
         m = tiny_model(use_position=True)
         ids = torch.randint(0, 16, (2, 6))
         m.forward(ids)

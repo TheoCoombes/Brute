@@ -59,7 +59,8 @@ def unigram_baseline(targets: torch.Tensor, V: int) -> float:
 @torch.no_grad()
 def evaluate(model, X, Y, batch_size, max_batches=40):
     tot_loss = tot_acc = tot = 0
-    nb = min((X.shape[0] + batch_size - 1) // batch_size, max_batches)
+    total_batches = (X.shape[0] + batch_size - 1) // batch_size
+    nb = total_batches if max_batches is None or max_batches <= 0 else min(total_batches, max_batches)
     for b in range(nb):
         s = b * batch_size
         xb, yb = X[s:s + batch_size], Y[s:s + batch_size]
@@ -73,13 +74,28 @@ def evaluate(model, X, Y, batch_size, max_batches=40):
             "ppl": float(torch.exp(torch.tensor(loss)).item())}
 
 
-def sample_demo(model, corpus, prompt, n_new, *, temperature, top_k, ban_oov, rep_window):
+def save_checkpoint(path, model, opt, V, corpus, *, step, metrics):
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    torch.save({
+        "model": model.state_dict(),
+        "opt": opt.state_dict(),
+        "vocab_size": V,
+        "compact_to_gpt2": corpus.compact_to_gpt2,
+        "step": int(step),
+        "metrics": dict(metrics),
+    }, path)
+
+
+def sample_demo(model, corpus, prompt, n_new, *, temperature, top_k, ban_oov,
+                rep_window, sentence, min_new, clean):
     ids = corpus.encode(prompt).unsqueeze(0).to(model.device)
-    ban = [OOV_ID] if ban_oov else None
+    ban = corpus.sample_ban_ids(clean=clean) if ban_oov or clean else None
+    stop = corpus.sentence_end_ids() if sentence else None
     out = model.generate(ids, n_new, temperature=temperature, top_k=top_k,
-                         ban_ids=ban, repetition_window=rep_window)
-    new_ids = out[0, ids.shape[1]:].cpu()
-    text = corpus.decode(new_ids).replace("\n", "\\n")
+                         ban_ids=ban, repetition_window=rep_window,
+                         stop_ids=stop, min_new=min_new)
+    show_ids = out[0] if sentence else out[0, ids.shape[1]:]
+    text = corpus.decode(show_ids.cpu()).strip().replace("\n", "\\n")
     return text
 
 
@@ -90,12 +106,14 @@ def main():
     p.add_argument("--data-root", default="./.data")
     p.add_argument("--vocab-cap", type=int, default=2048)
     p.add_argument("--max-train-tokens", type=int, default=None,
-                   help="Truncate the training stream (faster local demo).")
+                   help="Truncate the returned training stream after building the vocab.")
     p.add_argument("--D", type=int, default=1024, help="Concept hypervector dim.")
     p.add_argument("--layers", type=int, default=2)
     p.add_argument("--d-ff", type=int, default=2048)
     p.add_argument("--slots", type=int, default=256, help="Hopfield bank slots M.")
     p.add_argument("--top-k", type=int, default=15, help="Hopfield WTA width (odd).")
+    p.add_argument("--no-bsr", dest="use_bsr", action="store_false", default=True,
+                   help="disable BSR accumulator path for packed-only hardware profiles.")
     p.add_argument("--epi-slots", type=int, default=None,
                    help="episodic exact-recall window; default = full sequence during training.")
     p.add_argument("--epi-read-k", type=int, default=1,
@@ -130,13 +148,22 @@ def main():
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default=None, choices=[None, "cpu", "mps", "cuda"])
     p.add_argument("--eval-every", type=int, default=200)
+    p.add_argument("--eval-max-batches", type=int, default=40,
+                   help="validation batches per eval; <=0 evaluates the full validation split.")
     p.add_argument("--sample-every", type=int, default=500)
     p.add_argument("--prompt", default="The history of")
     p.add_argument("--sample-len", type=int, default=40)
+    p.add_argument("--sample-min-len", type=int, default=12)
+    p.add_argument("--sentence-sample", action="store_true",
+                   help="include the prompt and stop samples at sentence punctuation when possible.")
+    p.add_argument("--clean-sample", action="store_true",
+                   help="ban OOV, control, non-ASCII, and continuation-fragment tokens while sampling.")
     p.add_argument("--temperature", type=float, default=0.8)
     p.add_argument("--sample-top-k", type=int, default=20)
     p.add_argument("--rep-window", type=int, default=3)
     p.add_argument("--ckpt", default="./haemmr.pt")
+    p.add_argument("--last-ckpt", default=None,
+                   help="optional path for the final-step checkpoint; --ckpt stores the best validation model.")
     args = p.parse_args()
 
     device = auto_device(args.device)
@@ -151,11 +178,22 @@ def main():
                                seed=args.seed, shuffle=True)
     Xva, Yva = make_lm_batches(corpus.val_ids, seq_len=args.seq_len, mask_oov=True,
                                seed=args.seed, shuffle=False)
+    train_oov = float((corpus.train_ids == OOV_ID).float().mean().item())
+    val_oov = float((corpus.val_ids == OOV_ID).float().mean().item())
+    train_valid = float((Ytr != IGNORE_INDEX).float().mean().item())
+    val_valid = float((Yva != IGNORE_INDEX).float().mean().item())
     Xtr, Ytr = Xtr.to(device), Ytr.to(device)
     Xva, Yva = Xva.to(device), Yva.to(device)
     print(f"  train tokens={corpus.train_ids.numel():,}  val tokens={corpus.val_ids.numel():,}"
           f"  vocab={V}  chunks: train={Xtr.shape[0]:,} val={Xva.shape[0]:,}")
-    print(f"  baselines (val):  uniform={1.0/V:.4f}  unigram={unigram_baseline(Yva.cpu(), V):.4f}")
+    print(f"  OOV rate: train={train_oov:.1%} val={val_oov:.1%}"
+          f"  |  valid targets: train={train_valid:.1%} val={val_valid:.1%}")
+    print(f"  acc baselines (val valid targets):"
+          f"  uniform={1.0/V:.4f}  unigram={unigram_baseline(Yva.cpu(), V):.4f}")
+    if val_oov > 0.2:
+        print("  warning: high OOV rate; this is a lossy frequent-token demo, not full WikiText LM training.")
+    eval_scope = "full" if args.eval_max_batches <= 0 else f"first {args.eval_max_batches} batches"
+    print(f"  eval scope: {eval_scope}")
 
     # Optional η annealing: explore more early, then let the integer accumulator
     # settle into smaller, steadier evidence updates late in training.
@@ -165,6 +203,7 @@ def main():
 
     cfg = HaemmrConfig(vocab_size=V, D=args.D, n_layers=args.layers, d_ff=args.d_ff,
                        n_slots=args.slots, top_k=args.top_k, seed=args.seed,
+                       use_bsr=args.use_bsr,
                        epi_slots=args.epi_slots, epi_read_k=args.epi_read_k,
                        use_position=args.use_position, gate_open=args.gate_open,
                        structured_codebook=args.structured_codebook,
@@ -181,7 +220,9 @@ def main():
     n_bits = model.num_bit_parameters()
     print(f"model: D={cfg.D} layers={cfg.n_layers} d_ff={cfg.d_ff} slots={cfg.n_slots}"
           f"  |  {n_bits:,} bit-params ≈ {n_bits/8/1e6:.2f} MB")
-    init = evaluate(model, Xva, Yva, args.batch_size)
+    init = evaluate(model, Xva, Yva, args.batch_size, max_batches=args.eval_max_batches)
+    best = {"step": 0, **init}
+    save_checkpoint(args.ckpt, model, opt, V, corpus, step=0, metrics=best)
     print(f"step 0    val loss {init['loss']:.3f}  ppl {init['ppl']:.1f}  acc {init['acc']:.4f}")
 
     csv_f = None
@@ -216,15 +257,21 @@ def main():
         run_n += step_n
         ema = b_loss if ema is None else 0.98 * ema + 0.02 * b_loss
 
-        if step % args.eval_every == 0 or step == args.steps:
+        do_eval = (args.eval_every > 0 and step % args.eval_every == 0) or step == args.steps
+        if do_eval:
             tr_loss = run_loss / max(run_n, 1)
             tr_acc = run_acc / max(run_n, 1)
             run_loss = run_acc = run_n = 0.0
-            va = evaluate(model, Xva, Yva, bs)
+            va = evaluate(model, Xva, Yva, bs, max_batches=args.eval_max_batches)
+            improved = va["loss"] < best["loss"]
+            if improved:
+                best = {"step": step, **va}
+                save_checkpoint(args.ckpt, model, opt, V, corpus, step=step, metrics=best)
             dt = time.time() - t0
+            best_mark = "  *best*" if improved else ""
             print(f"step {step:5d}  train loss {tr_loss:.3f} (ema {ema:.3f}) acc {tr_acc:.4f}  |  "
                   f"val loss {va['loss']:.3f} ppl {va['ppl']:.1f} acc {va['acc']:.4f}  |  "
-                  f"flip {st['flip_frac']*100:.3f}% η{st['eta']:.2f}  ({dt:.0f}s)")
+                  f"flip {st['flip_frac']*100:.3f}% η{st['eta']:.2f}  ({dt:.0f}s){best_mark}")
             if csv_f:
                 csv_f.write(f"{step},{ema:.4f},{va['loss']:.4f},{va['ppl']:.2f},"
                             f"{va['acc']:.4f},{st['flip_frac']:.5f},{st['eta']:.4f}\n")
@@ -233,13 +280,19 @@ def main():
         if args.sample_every and step % args.sample_every == 0:
             txt = sample_demo(model, corpus, args.prompt, args.sample_len,
                               temperature=args.temperature, top_k=args.sample_top_k,
-                              ban_oov=True, rep_window=args.rep_window)
+                              ban_oov=True, rep_window=args.rep_window,
+                              sentence=args.sentence_sample,
+                              min_new=args.sample_min_len,
+                              clean=args.clean_sample)
             print(f"  sample[{args.prompt!r}]: {txt}")
 
-    torch.save({"model": model.state_dict(), "opt": opt.state_dict(),
-                "vocab_size": V, "compact_to_gpt2": corpus.compact_to_gpt2},
-               args.ckpt)
-    print(f"saved checkpoint → {args.ckpt}")
+    if args.last_ckpt:
+        final_metrics = va if args.steps > 0 and "va" in locals() else init
+        save_checkpoint(args.last_ckpt, model, opt, V, corpus,
+                        step=args.steps, metrics={"step": args.steps, **final_metrics})
+        print(f"saved final checkpoint → {args.last_ckpt}")
+    print(f"saved best checkpoint → {args.ckpt}"
+          f"  (step {best['step']}, val loss {best['loss']:.3f}, acc {best['acc']:.4f})")
     if csv_f:
         csv_f.close()
 

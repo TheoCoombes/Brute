@@ -17,7 +17,10 @@
 
 #include <ATen/Parallel.h>
 #include <ATen/Dispatch.h>
+#include <algorithm>
 #include <cstdint>
+#include <tuple>
+#include <type_traits>
 
 namespace hnk = cbrute::cpu::HWY_NAMESPACE;
 
@@ -63,6 +66,51 @@ at::Tensor pack_bool(const at::Tensor& input) {
         for (int64_t r = s; r < e; ++r) {
             hnk::PackBoolBytesToBits(in_bool + r * ld, out_b + r * row_bytes, (size_t)ld);
         }
+    });
+    return output;
+}
+
+//  pack_sign — numeric input → packed bits, sign(x) >= 0 maps to bit 1.
+at::Tensor pack_sign(const at::Tensor& input) {
+    TORCH_CHECK(input.dim() >= 1, "pack_sign: input must have >= 1 dim");
+    TORCH_CHECK(input.scalar_type() != at::kBool,
+                "pack_sign: input must be numeric, not torch.bool");
+
+    const auto inp = input.contiguous();
+    const int64_t ld = inp.size(-1);
+
+    auto out_shape = inp.sizes().vec();
+    if (ld == 0) {
+        out_shape.back() = 0;
+        return at::zeros(out_shape, inp.options().dtype(at::kLong));
+    }
+
+    const int64_t pd_words = (ld + PACK_WIDTH - 1) / PACK_WIDTH;
+    const int64_t batch = inp.numel() / ld;
+    out_shape.back() = pd_words;
+
+    auto output = at::zeros(out_shape, inp.options().dtype(at::kLong));
+    uint64_t* out = reinterpret_cast<uint64_t*>(output.data_ptr<int64_t>());
+
+    AT_DISPATCH_ALL_TYPES(inp.scalar_type(), "pack_sign", [&] {
+        const scalar_t* in = inp.data_ptr<scalar_t>();
+        at::parallel_for(0, batch, ROW_GRAIN, [&](int64_t s, int64_t e) {
+            for (int64_t r = s; r < e; ++r) {
+                const scalar_t* row = in + r * ld;
+                uint64_t* out_row = out + r * pd_words;
+                for (int64_t w = 0; w < pd_words; ++w) {
+                    uint64_t word = 0;
+                    const int64_t base = w * PACK_WIDTH;
+                    const int64_t live = std::min<int64_t>(PACK_WIDTH, ld - base);
+                    for (int64_t bit = 0; bit < live; ++bit) {
+                        const auto v = row[base + bit];
+                        const bool positive = v >= scalar_t(0);
+                        if (positive) word |= (uint64_t(1) << bit);
+                    }
+                    out_row[w] = word;
+                }
+            }
+        });
     });
     return output;
 }
@@ -153,6 +201,72 @@ at::Tensor xnor_popcount_matmul(const at::Tensor& A, const at::Tensor& B, int64_
         }
     });
     return C;
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor>
+bsr_scan(const at::Tensor& q, const at::Tensor& assoc,
+         const at::Tensor& decay_shifts, int64_t D) {
+    TORCH_CHECK(q.dim() == 3 && assoc.dim() == 3,
+                "bsr_scan: q and assoc must be packed tensors with shape (B, n, Kp)");
+    TORCH_CHECK(q.sizes() == assoc.sizes(), "bsr_scan: q/assoc shape mismatch");
+    TORCH_CHECK(q.scalar_type() == at::kLong && assoc.scalar_type() == at::kLong,
+                "bsr_scan: q and assoc must be int64 packed buffers");
+    TORCH_CHECK(decay_shifts.dim() == 1 && decay_shifts.scalar_type() == at::kInt,
+                "bsr_scan: decay_shifts must be a 1-D int32 tensor");
+    TORCH_CHECK(D >= 0, "bsr_scan: D must be non-negative");
+
+    const auto qc = q.contiguous();
+    const auto ac = assoc.contiguous();
+    const auto sc = decay_shifts.contiguous();
+    const int64_t B = qc.size(0), n = qc.size(1), Kp = qc.size(2);
+    TORCH_CHECK(Kp == (D + PACK_WIDTH - 1) / PACK_WIDTH,
+                "bsr_scan: packed width does not match D");
+    const int64_t groups = sc.numel();
+    TORCH_CHECK(groups > 0, "bsr_scan: decay_shifts must be non-empty");
+
+    auto read = at::zeros(qc.sizes(), qc.options());
+    auto state = at::zeros(qc.sizes(), qc.options());
+    auto gate = at::zeros(qc.sizes(), qc.options());
+    if (B == 0 || n == 0 || Kp == 0 || D == 0) {
+        return {read, state, gate};
+    }
+
+    const uint64_t* q_ptr = reinterpret_cast<const uint64_t*>(qc.data_ptr<int64_t>());
+    const uint64_t* a_ptr = reinterpret_cast<const uint64_t*>(ac.data_ptr<int64_t>());
+    const int32_t* shifts = sc.data_ptr<int32_t>();
+    uint64_t* r_ptr = reinterpret_cast<uint64_t*>(read.data_ptr<int64_t>());
+    uint64_t* s_ptr = reinterpret_cast<uint64_t*>(state.data_ptr<int64_t>());
+    uint64_t* g_ptr = reinterpret_cast<uint64_t*>(gate.data_ptr<int64_t>());
+
+    at::parallel_for(0, B * Kp, ROW_GRAIN, [&](int64_t begin, int64_t end) {
+        for (int64_t item = begin; item < end; ++item) {
+            const int64_t b = item / Kp;
+            const int64_t w = item - b * Kp;
+            for (int64_t lane = 0; lane < PACK_WIDTH; ++lane) {
+                const int64_t d = w * PACK_WIDTH + lane;
+                if (d >= D) break;
+                const int64_t group = (d * groups) / std::max<int64_t>(D, 1);
+                const int32_t shift = shifts[group];
+                const uint64_t mask = uint64_t(1) << lane;
+                int32_t A = 0;
+                for (int64_t t = 0; t < n; ++t) {
+                    const int64_t off = (b * n + t) * Kp + w;
+                    const bool q_bit = (q_ptr[off] & mask) != 0;
+                    const bool assoc_bit = (a_ptr[off] & mask) != 0;
+                    const bool state_bit = A >= 0;
+                    if (q_bit == state_bit) r_ptr[off] |= mask;
+                    if (state_bit) s_ptr[off] |= mask;
+                    const bool gate_bit = state_bit != assoc_bit;
+                    if (gate_bit) g_ptr[off] |= mask;
+                    int32_t decayed = A;
+                    if (shift > 0) decayed = A - (A >> shift);
+                    const int32_t update = gate_bit ? (assoc_bit ? 1 : -1) : 0;
+                    A = decayed + update;
+                }
+            }
+        }
+    });
+    return {read, state, gate};
 }
 
 //  popcount — per-element, int32 output. Supports any integer dtype + bool.

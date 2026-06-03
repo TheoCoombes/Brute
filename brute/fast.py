@@ -111,6 +111,31 @@ def matmul(a: Tensor, b_t: Tensor) -> torch.Tensor:
         a._packed_buf, b_t._packed_buf, K)
 
 
+def sign(a: torch.Tensor) -> Tensor:
+    """Pack ``a >= 0`` directly into bit1 storage without a bool temporary."""
+    return Tensor._make_bit1_from_packed(
+        torch.ops.brute.pack_sign(a),
+        list(a.shape),
+    )
+
+
+def bsr_scan(q: Tensor, assoc: Tensor, decay_shifts: torch.Tensor) -> tuple[Tensor, Tensor, Tensor]:
+    """Fused packed BSR forward scan.
+
+    Returns ``(read, state, gate)`` as bit1 tensors. ``state`` is the recurrent
+    sign before each write; ``gate`` is true where the delta write fires.
+    """
+    D = int(q.shape[-1])
+    read, state, gate = torch.ops.brute.bsr_scan(
+        q._packed_buf, assoc._packed_buf, decay_shifts, D)
+    shape = list(q.shape)
+    return (
+        Tensor._make_bit1_from_packed(read, shape),
+        Tensor._make_bit1_from_packed(state, shape),
+        Tensor._make_bit1_from_packed(gate, shape),
+    )
+
+
 # ── Packed-buffer arithmetic for the truly performance-paranoid ─────────
 
 def xor_packed(a_buf: torch.Tensor, b_buf: torch.Tensor) -> torch.Tensor:
@@ -139,6 +164,6 @@ __all__ = [
     'bitwise_xor', 'bitwise_and', 'bitwise_or', 'bitwise_not',
     'eq', 'ne',
     'popcount', 'hamming',
-    'matmul',
+    'matmul', 'sign', 'bsr_scan',
     'xor_packed', 'and_packed', 'or_packed', 'matmul_packed',
 ]

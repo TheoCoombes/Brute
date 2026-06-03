@@ -27,20 +27,89 @@ class Corpus:
     tokenizer: object
 
     def decode(self, ids: torch.Tensor) -> str:
-        gpt2_ids = self.compact_to_gpt2[ids.long().cpu()].tolist()
-        return self.tokenizer.decode(gpt2_ids)
+        return decode_compact(ids, self.tokenizer, self.compact_to_gpt2)
 
     def encode(self, text: str) -> torch.Tensor:
         """Encode a prompt to compact ids (unknown tokens → OOV)."""
-        gpt2_ids = self.tokenizer.encode(text)
-        table = torch.full((int(self.compact_to_gpt2.max().item()) + 1,),
-                           OOV_ID, dtype=torch.long)
-        table[self.compact_to_gpt2] = torch.arange(self.vocab_size, dtype=torch.long)
+        return encode_compact(text, self.tokenizer, self.compact_to_gpt2)
+
+    def sample_ban_ids(self, *, clean: bool = False) -> list[int]:
+        return sample_ban_ids(self.compact_to_gpt2, self.tokenizer, clean=clean)
+
+    def sentence_end_ids(self) -> list[int]:
+        return sentence_end_ids(self.compact_to_gpt2, self.tokenizer)
+
+
+def _compact_table(compact_to_gpt2: torch.Tensor) -> torch.Tensor:
+    table = torch.full((int(compact_to_gpt2.max().item()) + 1,), OOV_ID, dtype=torch.long)
+    table[compact_to_gpt2.long().cpu()] = torch.arange(compact_to_gpt2.numel(), dtype=torch.long)
+    return table
+
+
+def encode_compact(text: str, tokenizer, compact_to_gpt2: torch.Tensor,
+                   *, prefix_fallback: bool = True) -> torch.Tensor:
+    """Encode text to compact GPT-2 ids, preferring fewer OOV prompt tokens.
+
+    GPT-2 has separate ids for initial words (``"The"``) and space-prefixed words
+    (``" The"``).  WikiText mostly trains on the latter, so capped demos often
+    know ``" The"`` but not ``"The"``.  For prompts only, a leading-space retry is
+    a better context than silently feeding OOV.
+    """
+    table = _compact_table(compact_to_gpt2)
+
+    def convert(txt: str) -> torch.Tensor:
+        gpt2_ids = tokenizer.encode(txt)
         gi = torch.tensor(gpt2_ids, dtype=torch.long).clamp_max(table.numel() - 1)
         ids = table[gi]
         if ids.numel() == 0:
             ids = torch.tensor([1], dtype=torch.long)
         return ids
+
+    ids = convert(text)
+    if prefix_fallback and text and not text[0].isspace():
+        prefixed = convert(" " + text)
+        if int((prefixed == OOV_ID).sum().item()) < int((ids == OOV_ID).sum().item()):
+            ids = prefixed
+    return ids
+
+
+def decode_compact(ids: torch.Tensor, tokenizer, compact_to_gpt2: torch.Tensor) -> str:
+    gpt2_ids = compact_to_gpt2[ids.long().cpu()].tolist()
+    return tokenizer.decode(gpt2_ids)
+
+
+def sample_ban_ids(compact_to_gpt2: torch.Tensor, tokenizer, *, clean: bool = False) -> list[int]:
+    bad = {OOV_ID}
+    if not clean:
+        return sorted(bad)
+    allowed_punct = set(".,!?;:'\"()-")
+    allowed_word_chars = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 .,!?;:'\"()-")
+    for i, gpt2_id in enumerate(compact_to_gpt2.long().cpu().tolist()):
+        text = tokenizer.decode([gpt2_id])
+        stripped = text.strip()
+        if not stripped:
+            bad.add(i)
+        elif "<|" in text or "\n" in text or "\r" in text or "\t" in text:
+            bad.add(i)
+        elif any(ord(ch) < 32 or ord(ch) > 126 for ch in text):
+            bad.add(i)
+        elif text.startswith(" "):
+            if not any(ch.isalnum() for ch in text) or any(ch not in allowed_word_chars for ch in text):
+                bad.add(i)
+        elif stripped not in allowed_punct:
+            # Non-space-prefixed alphabetic tokens are usually GPT-2 continuation
+            # fragments in this capped demo; banning them improves sample hygiene.
+            bad.add(i)
+    return sorted(bad)
+
+
+def sentence_end_ids(compact_to_gpt2: torch.Tensor, tokenizer) -> list[int]:
+    ids = []
+    for i, gpt2_id in enumerate(compact_to_gpt2.long().cpu().tolist()):
+        stripped = tokenizer.decode([gpt2_id]).strip()
+        if stripped in {".", "!", "?"} or stripped.endswith((".", "!", "?")):
+            ids.append(i)
+    return ids
 
 
 def _load_wikitext_text(name: str, split: str) -> str:
@@ -76,10 +145,8 @@ def wikitext(
         if cache:
             torch.save({"train": train_gpt2, "val": val_gpt2}, cache_path)
 
-    if max_train_tokens is not None:
-        train_gpt2 = train_gpt2[:max_train_tokens]
-
-    # Build capped vocab on the training split.
+    # Build the capped vocab on the full training split.  ``max_train_tokens`` is
+    # a speed knob for the returned stream, not a different vocabulary policy.
     counts = torch.bincount(train_gpt2, minlength=int(tok.vocab_size))
     n_keep = max(min(int(vocab_cap) - 1, int((counts > 0).sum().item())), 1)
     _, top = torch.topk(counts, k=n_keep)
@@ -92,6 +159,8 @@ def wikitext(
 
     train_ids = gpt2_to_compact[train_gpt2]
     val_ids = gpt2_to_compact[val_gpt2]
+    if max_train_tokens is not None:
+        train_ids = train_ids[:max_train_tokens]
 
     return Corpus(train_ids=train_ids, val_ids=val_ids, vocab_size=n_keep + 1,
                   compact_to_gpt2=compact_to_gpt2, tokenizer=tok)

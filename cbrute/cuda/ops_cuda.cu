@@ -18,9 +18,11 @@
 #include "kernels/matmul_cutlass.cuh"
 
 #include <ATen/cuda/CUDAContext.h>
+#include <ATen/Dispatch.h>
 #include <c10/cuda/CUDAStream.h>
 #include <torch/torch.h>
 #include <cuda_runtime.h>
+#include <tuple>
 
 namespace cbrute { namespace cuda {
 
@@ -85,6 +87,35 @@ at::Tensor pack_bool(const at::Tensor& input) {
             reinterpret_cast<const uint8_t*>(inp.data_ptr<bool>()),
             as_u8(output), ld, row_bytes);
     }
+    return output;
+}
+
+at::Tensor pack_sign(const at::Tensor& input) {
+    TORCH_CHECK(input.dim() >= 1, "pack_sign: input must have >= 1 dim");
+    TORCH_CHECK(input.scalar_type() != at::kBool,
+                "pack_sign: input must be numeric, not torch.bool");
+
+    const auto inp = input.contiguous();
+    const int64_t ld = inp.size(-1);
+
+    auto out_shape = inp.sizes().vec();
+    if (ld == 0) {
+        out_shape.back() = 0;
+        return at::zeros(out_shape, inp.options().dtype(at::kLong));
+    }
+
+    const int64_t pd_words  = (ld + PACK_WIDTH - 1) / PACK_WIDTH;
+    const int64_t row_bytes = pd_words * (PACK_WIDTH / 8);
+    const int64_t batch     = inp.numel() / ld;
+    out_shape.back() = pd_words;
+
+    auto output = at::zeros(out_shape, inp.options().dtype(at::kLong));
+    const int chunks = (int)((ld + 31) / 32);
+    dim3 grid((unsigned)chunks, (unsigned)batch);
+    AT_DISPATCH_ALL_TYPES(inp.scalar_type(), "pack_sign", [&] {
+        kernels::k_pack_sign_warp<scalar_t><<<grid, 32, 0, cur_stream()>>>(
+            inp.data_ptr<scalar_t>(), as_u8(output), ld, row_bytes);
+    });
     return output;
 }
 
@@ -217,6 +248,43 @@ at::Tensor xnor_popcount_matmul(const at::Tensor& A, const at::Tensor& B, int64_
     kernels::k_xnor_popcount_matmul<<<grid, block, 0, cur_stream()>>>(
         as_u64(Ac), as_u64(Bc), C.data_ptr<int32_t>(), M, N, Kp, (int32_t)K);
     return C;
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor>
+bsr_scan(const at::Tensor& q, const at::Tensor& assoc,
+         const at::Tensor& decay_shifts, int64_t D) {
+    TORCH_CHECK(q.dim() == 3 && assoc.dim() == 3,
+                "bsr_scan: q and assoc must be packed tensors with shape (B, n, Kp)");
+    TORCH_CHECK(q.sizes() == assoc.sizes(), "bsr_scan: q/assoc shape mismatch");
+    TORCH_CHECK(q.scalar_type() == at::kLong && assoc.scalar_type() == at::kLong,
+                "bsr_scan: q and assoc must be int64 packed buffers");
+    TORCH_CHECK(decay_shifts.dim() == 1 && decay_shifts.scalar_type() == at::kInt,
+                "bsr_scan: decay_shifts must be a 1-D int32 tensor");
+    TORCH_CHECK(D >= 0, "bsr_scan: D must be non-negative");
+
+    const auto qc = q.contiguous();
+    const auto ac = assoc.contiguous();
+    const auto sc = decay_shifts.contiguous();
+    const int64_t B = qc.size(0), n = qc.size(1), Kp = qc.size(2);
+    TORCH_CHECK(Kp == (D + PACK_WIDTH - 1) / PACK_WIDTH,
+                "bsr_scan: packed width does not match D");
+    const int64_t groups = sc.numel();
+    TORCH_CHECK(groups > 0, "bsr_scan: decay_shifts must be non-empty");
+
+    auto read = at::zeros(qc.sizes(), qc.options());
+    auto state = at::zeros(qc.sizes(), qc.options());
+    auto gate = at::zeros(qc.sizes(), qc.options());
+    if (B == 0 || n == 0 || Kp == 0 || D == 0) {
+        return {read, state, gate};
+    }
+
+    const int chunks = (int)((D + 31) / 32);
+    dim3 grid((unsigned)chunks, (unsigned)B);
+    kernels::k_bsr_scan_chunked<<<grid, 32, 0, cur_stream()>>>(
+        as_u64(qc), as_u64(ac), sc.data_ptr<int32_t>(),
+        as_u8(read), as_u8(state), as_u8(gate),
+        n, Kp, D, (int)groups);
+    return {read, state, gate};
 }
 
 //  popcount — per-element int32, supports any integer dtype + bool.

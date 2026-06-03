@@ -1,30 +1,27 @@
-"""HÆMMR v2 — a binary-first, concept-native autoregressive language model.
+"""HÆMMR — a binary-first, concept-native autoregressive language model.
 
-This is the v2 architecture (the attached change set).  The headline is
-*separation of concerns* — separate memory mechanisms by job and separate
-representation subspaces by role:
+The architecture separates memory mechanisms by job and representation
+subspaces by role:
 
     token → E_lex(t)  ── input-bind ──▶  position-free concept c_i
         ┌───────────────────────────────────────────────────────────────┐ ×L
-        │  r = delta-BSR(c)              # compressed discourse (§B2)      │
-        │  e = EpisodicSlots(c, POS)     # exact in-window recall (§B1)    │
-        │  h = HopfieldBank(c)           # learned global priors (§B3)     │
+        │  r = delta-BSR(c)              # compressed discourse             │
+        │  e = EpisodicSlots(c, POS)     # exact in-window recall           │
+        │  h = HopfieldBank(c)           # learned global priors            │
         │  m = channel-mix(c)            # binary MLP                       │
         └───────────────────────────────────────────────────────────────┘
         ── out-bind ──▶ next-token concept ĉ  (position-free)
         ── lex-proj ──▶ ℓ̂ ── decode against BEF codebook ──▶ logits
-                              (+ semantic rerank from ĉ)            (§C1)
+                              (+ optional semantic rerank)
 
-Three structural fixes vs. v1: (A) **position never enters the decoded concept**
-— it lives only in the address lane (BSR/episodic keys), so decode is correct by
-construction (no ``next_unbind`` hack); (B1) a dedicated **episodic slot memory**
-gives exact marker/copy recall a lossy bundle cannot; (C1) the head emits a
-**concept** that is *projected* to the lexical frame and decoded against a
-**structured (BEF) codebook**, making "concept ≠ token" literal.
+Position never enters the decoded concept. It lives only in the address lane
+(BSR/episodic keys), so decoding does not need positional unbinding. Episodic
+slots provide exact in-window lookup, and the head emits a concept that is
+projected to a lexical frame before Hamming decode against the token codebook.
 
 Forward is bitwise (packed ``brute.bit1``); the only integers are signed matmul
-pre-activations and the BSR accumulator.  Training is BOLD bit-flips, with the
-borrowed BEP boundary gating and several error-floor mitigations (§D).
+pre-activations and the BSR accumulator. Training is BOLD bit-flips with
+boundary gating and discrete-noise regularisation options.
 """
 
 from __future__ import annotations
@@ -53,31 +50,32 @@ class HaemmrConfig:
     D: int = 1024                       # concept hypervector dimension
     n_layers: int = 2
     d_ff: int = 2048                    # channel-mix hidden width
-    # episodic slot memory (§B1) — the exact-recall fix
+    # episodic slot memory
     epi_read_k: int = 1                 # top-k read width (1 ⇒ exact single-slot)
     epi_slots: Optional[int] = None     # ring-buffer cap at inference; None ⇒ context length
-    # latent Hopfield priors (§B3)
+    # latent Hopfield priors
     n_slots: int = 256                  # learned static slots (M)
     top_k: int = 15                     # WTA width (odd → no ties)
-    # delta-BSR decay palette (§B2)
+    # delta-BSR decay palette
+    use_bsr: bool = True                # disable for packed-only hardware profiles
     decay_shifts: tuple = (1, 2, 3, 4, 0)   # power-of-two shifts; 0 = permanent
-    # representation / positions (§A)
+    # representation / positions
     use_position: bool = True           # positional addressing in the episodic lane
     pos_chunk: int = 256                # hierarchical position chunk size C
-    # decode (§C1)
+    # decode
     structured_codebook: bool = True    # BEF codebook (else random)
     bef_alpha: float = 1.0
     bef_sweeps: int = 30
     sem_weight: float = 0.5             # semantic-rerank logit weight (0 disables)
-    hopfield_cleanup: bool = False      # §C2 one-step concept cleanup before decode
+    hopfield_cleanup: bool = False      # one-step concept cleanup before decode
     cleanup_slots: int = 256
     cleanup_top_k: int = 7
-    # training mitigations (§D) and margin objective (§F)
+    # training mitigations and margin objective
     boundary_nu: Optional[float] = None  # BEP boundary gating |z|≤νD (e.g. 0.5); None=off
     label_smoothing: float = 0.0
     flip_dropout: float = 0.0           # activation bit-flip rate in the training forward
-    margin_theta_pos: float = 0.5       # §F matched-pair margin (fraction of D)
-    margin_theta_neg: float = 0.0       # §F distractor margin
+    margin_theta_pos: float = 0.5       # matched-pair margin (fraction of D)
+    margin_theta_neg: float = 0.0       # distractor margin
     margin_weight: float = 1.0
     # misc
     logit_temp: Optional[float] = None  # train-time logit scale; default sqrt(D)
@@ -138,10 +136,15 @@ class Block:
         D = cfg.D
         nm = f"blk{idx}"
         nu = cfg.boundary_nu
-        self.bsr = BSR(D, name=f"{nm}.bsr", decay_shifts=cfg.decay_shifts,
-                       generator=generator, device=device, boundary_nu=nu)
-        self.merge_bsr = ResidualMerge(D, name=f"{nm}.merge_bsr", p_open=cfg.gate_open,
-                                       generator=generator, device=device)
+        self.use_bsr = cfg.use_bsr
+        if self.use_bsr:
+            self.bsr = BSR(D, name=f"{nm}.bsr", decay_shifts=cfg.decay_shifts,
+                           generator=generator, device=device, boundary_nu=nu)
+            self.merge_bsr = ResidualMerge(D, name=f"{nm}.merge_bsr", p_open=cfg.gate_open,
+                                           generator=generator, device=device)
+        else:
+            self.bsr = None
+            self.merge_bsr = None
         self.epi = EpisodicSlotMemory(D, name=f"{nm}.epi", read_k=cfg.epi_read_k,
                                       n_slots=cfg.epi_slots, generator=generator,
                                       device=device, boundary_nu=nu)
@@ -158,16 +161,21 @@ class Block:
         self._shape = None
 
     def params(self) -> List[BoldParam]:
-        return (self.bsr.params() + self.merge_bsr.params()
-                + self.epi.params() + self.merge_epi.params()
+        ps = []
+        if self.use_bsr:
+            ps += self.bsr.params() + self.merge_bsr.params()
+        return (ps + self.epi.params() + self.merge_epi.params()
                 + self.hop.params() + self.merge_hop.params()
                 + self.mix.params() + self.merge_mix.params())
 
     def forward(self, c_bit: brute.Tensor, pos_bit: brute.Tensor) -> brute.Tensor:
         B, n, D = c_bit.shape
         self._shape = (B, n, D)
-        r = self.bsr.forward(c_bit)                            # discourse (B,n,D)
-        c1 = self.merge_bsr.forward(c_bit, r)
+        if self.use_bsr:
+            r = self.bsr.forward(c_bit)                        # discourse (B,n,D)
+            c1 = self.merge_bsr.forward(c_bit, r)
+        else:
+            c1 = c_bit
         e = self.epi.forward(c1, pos_bit)                     # exact recall (B,n,D)
         c2 = self.merge_epi.forward(c1, e)
         h = self.hop.forward(c2.reshape(B * n, D)).reshape(B, n, D)
@@ -187,9 +195,11 @@ class Block:
         S_c1_a, S_e = self.merge_epi.backward(S_c2)
         S_c1_b = self.epi.backward(S_e)
         S_c1 = S_c1_a + S_c1_b
-        S_c_a, S_r = self.merge_bsr.backward(S_c1)
-        S_c_b = self.bsr.backward(S_r)
-        return S_c_a + S_c_b
+        if self.use_bsr:
+            S_c_a, S_r = self.merge_bsr.backward(S_c1)
+            S_c_b = self.bsr.backward(S_r)
+            return S_c_a + S_c_b
+        return S_c1
 
 
 # ── the model ────────────────────────────────────────────────────────────────
@@ -211,12 +221,12 @@ class HaemmrLM:
         self.blocks = [Block(cfg, idx=i, generator=gen, device=self.device)
                        for i in range(cfg.n_layers)]
         self.out_bind = DiagBind(cfg.D, name="out", generator=gen, device=self.device)
-        # concept → lexical frame projection (§C1)
+        # concept -> lexical frame projection
         self.lex_proj = BooleanLinear(cfg.D, cfg.D, name="lex", generator=gen,
                                       device=self.device, boundary_nu=nu)
-        # semantic view of the concept for rerank (§C1)
+        # semantic view of the concept for rerank
         self.sem_bind = DiagBind(cfg.D, name="sem", generator=gen, device=self.device)
-        # optional concept cleanup bank (§C2)
+        # optional concept cleanup bank
         if cfg.hopfield_cleanup:
             self.cleanup_hop = HopfieldBank(cfg.D, cfg.cleanup_slots, cfg.cleanup_top_k,
                                             name="clean", generator=gen, device=self.device)
@@ -261,7 +271,7 @@ class HaemmrLM:
         self._pos_cache.clear()
         self._neutral_pos_cache.clear()
 
-    # ── positions (address lane only — never bound into the decoded concept) ───
+    # ── positions (address lane only; never bound into the decoded concept) ────
     def _positions(self, n: int):
         if self._pos_cache.get("n", -1) < n:
             codes = hierarchical_position_codes(self.pos_chunk_base, self.pos_offset_base,
@@ -279,14 +289,13 @@ class HaemmrLM:
         if self.cfg.use_position:
             return self._positions(n)
         if self._neutral_pos_cache.get("n", -1) < n:
-            ones = torch.ones(n, self.cfg.D, dtype=torch.bool, device=self.device)
             self._neutral_pos_cache = {
                 "n": n,
-                "bit": brute.as_tensor(ones, dtype=brute.bit1).to(self.device),
+                "bit": brute.ones(n, self.cfg.D, dtype=brute.bit1, device=self.device),
             }
         return self._neutral_pos_cache["bit"][:n]
 
-    # ── flip-dropout (train against the deployment bit-flip noise model, §D) ──
+    # ── flip-dropout (train against the deployment bit-flip noise model) ──────
     def _flip_noise(self, c_bit: brute.Tensor):
         rate = self.cfg.flip_dropout
         if not self.training or rate <= 0:
@@ -349,7 +358,7 @@ class HaemmrLM:
     # ── loss + BOLD backward ─────────────────────────────────────────────────
     def loss_and_backward(self, logits: torch.Tensor, targets: torch.Tensor,
                           matched: Optional[torch.Tensor] = None) -> dict:
-        """CE loss + BOLD backward.  ``matched`` (B,n) optionally supplies the §F
+        """CE loss + BOLD backward.  ``matched`` (B,n) optionally supplies
         episodic margin supervision (slot id each query should retrieve, -1 = none)."""
         cfg = self.cfg
         B, n = self._fwd_cache["B"], self._fwd_cache["n"]
@@ -369,7 +378,7 @@ class HaemmrLM:
         pred = scaled.argmax(dim=1)
         acc = float((pred[valid] == tgt[valid]).float().mean().item()) if n_valid else 0.0
 
-        # target distribution with optional label smoothing (§D)
+        # target distribution with optional label smoothing
         eps = cfg.label_smoothing
         onehot = torch.zeros_like(p)
         onehot.scatter_(1, safe_tgt.unsqueeze(1), 1.0)
@@ -397,7 +406,7 @@ class HaemmrLM:
 
         g_c = self.out_bind.backward(g_chat)                    # (B,n,D)
 
-        # §F margin objective on every block's episodic address lane (uses fwd cache)
+        # margin objective on every block's episodic address lane (uses fwd cache)
         margin_val = 0.0
         if matched is not None and cfg.margin_weight > 0:
             for blk in self.blocks:
@@ -446,8 +455,9 @@ class HaemmrLM:
     @torch.no_grad()
     def generate(self, ids: torch.Tensor, n_new: int, *, temperature: float = 1.0,
                  top_k: int = 0, ban_ids: Optional[List[int]] = None,
-                 repetition_window: int = 0, max_ctx: int = 256) -> torch.Tensor:
-        """Autoregressive min-Hamming / Boltzmann decoding (§C1).
+                 repetition_window: int = 0, max_ctx: int = 256,
+                 stop_ids: Optional[List[int]] = None, min_new: int = 0) -> torch.Tensor:
+        """Autoregressive min-Hamming / Boltzmann decoding.
 
         Recomputes the (linear-time) forward pass on the growing context each
         step; the streaming BSR/episodic state caches exist and are parity-tested
@@ -455,7 +465,8 @@ class HaemmrLM:
         """
         ids = ids.to(self.device)
         inv = 1.0 / float(self.cfg.logit_temp)
-        for _ in range(n_new):
+        stop = set(int(i) for i in (stop_ids or []))
+        for step in range(n_new):
             ctx = ids[:, -max_ctx:]
             sim = self.logits_last(ctx)                         # (B, V) similarities
             sim = sim * inv / max(temperature, 1e-4)
@@ -475,4 +486,6 @@ class HaemmrLM:
                 probs = torch.softmax(sim, dim=1)
                 nxt = torch.multinomial(probs, 1)
             ids = torch.cat([ids, nxt], dim=1)
+            if stop and step + 1 >= min_new and all(int(i) in stop for i in nxt[:, 0].tolist()):
+                break
         return ids

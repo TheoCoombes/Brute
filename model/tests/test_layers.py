@@ -132,14 +132,22 @@ class TestBSR:
         v = bsr._cache["v_pm1"]
         q = bsr._cache["q_pm1"]
         assoc = k * v
-        A = torch.zeros(2, 128)
+        A = torch.zeros(2, 128, dtype=torch.int32)
         S = torch.empty(2, 12, 128)
         gate = torch.empty(2, 12, 128)
+        shifts = bsr.decay_shift_by_dim
         for i in range(12):
             S[:, i, :] = torch.where(A >= 0, 1.0, -1.0)
             pred = k[:, i, :] * S[:, i, :]
             gate[:, i, :] = (pred != v[:, i, :]).float()
-            A = bsr.decay * A + gate[:, i, :] * assoc[:, i, :]
+            decayed = A.clone()
+            for s in bsr.decay_shift_values:
+                if s > 0:
+                    mask = shifts == s
+                    decayed[:, mask] = A[:, mask] - (A[:, mask] >> s)
+            update = torch.where(gate[:, i, :].bool(),
+                                 torch.where(assoc[:, i, :] > 0, 1, -1), 0).to(torch.int32)
+            A = decayed + update
         r_ref = q * S
         assert torch.equal(bsr._cache["gate"], gate)
         assert torch.equal(to_pm1(r), r_ref)

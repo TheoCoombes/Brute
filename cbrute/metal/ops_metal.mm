@@ -26,6 +26,7 @@
 #include <atomic>
 #include <shared_mutex>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -198,6 +199,46 @@ at::Tensor pack_bool(const at::Tensor& input) {
     return output;
 }
 
+at::Tensor pack_sign(const at::Tensor& input) {
+    TORCH_CHECK(input.is_mps(), "brute::mps::pack_sign expects an MPS tensor");
+    TORCH_CHECK(input.dim() >= 1, "pack_sign: input must have >= 1 dim");
+    TORCH_CHECK(input.scalar_type() != at::kBool,
+                "pack_sign: input must be numeric, not torch.bool");
+    auto inp = input.contiguous();
+    const int64_t ld = inp.size(-1);
+    auto out_shape = inp.sizes().vec();
+    if (ld == 0) {
+        out_shape.back() = 0;
+        return at::zeros(out_shape, inp.options().dtype(at::kLong));
+    }
+    const int64_t pd_words  = (ld + PACK_WIDTH - 1) / PACK_WIDTH;
+    const int64_t row_bytes = pd_words * (PACK_WIDTH / 8);
+    const int64_t batch     = inp.numel() / ld;
+    out_shape.back() = pd_words;
+    auto output = at::zeros(out_shape, inp.options().dtype(at::kLong));
+    const int chunks_per_row = (int)((ld + 31) / 32);
+    const int tgs_x          = (chunks_per_row + 7) / 8;
+    MTLSize grid = MTLSizeMake((NSUInteger)tgs_x * 256, (NSUInteger)batch, 1);
+    MTLSize tg   = MTLSizeMake(256, 1, 1);
+
+    id<MTLComputePipelineState> ps = nil;
+    switch (inp.scalar_type()) {
+        case at::kInt:
+            ps = BRUTE_CACHED_PS("pack_sign_i32_chunked");
+            break;
+        case at::kFloat:
+            ps = BRUTE_CACHED_PS("pack_sign_f32_chunked");
+            break;
+        default:
+            TORCH_CHECK(false, "pack_sign: MPS supports int32 and float32, got ",
+                        inp.scalar_type());
+    }
+    dispatch_kernel_ps(ps,
+        {{mtl_buf(inp), byte_offset(inp)}, {mtl_buf(output), byte_offset(output)}},
+        {(int32_t)ld, (int32_t)row_bytes}, grid, tg);
+    return output;
+}
+
 namespace {
 at::Tensor unpack_common(const std::string& kernel_name,
                          id<MTLComputePipelineState> ps,
@@ -270,6 +311,50 @@ at::Tensor xnor_popcount_matmul(const at::Tensor& A, const at::Tensor& B, int64_
             grid, tg);
     }
     return C;
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor>
+bsr_scan(const at::Tensor& q, const at::Tensor& assoc,
+         const at::Tensor& decay_shifts, int64_t D) {
+    TORCH_CHECK(q.is_mps() && assoc.is_mps() && decay_shifts.is_mps(),
+                "brute::mps::bsr_scan expects MPS tensors");
+    TORCH_CHECK(q.dim() == 3 && assoc.dim() == 3,
+                "bsr_scan: q and assoc must be packed tensors with shape (B, n, Kp)");
+    TORCH_CHECK(q.sizes() == assoc.sizes(), "bsr_scan: q/assoc shape mismatch");
+    TORCH_CHECK(q.scalar_type() == at::kLong && assoc.scalar_type() == at::kLong,
+                "bsr_scan: q and assoc must be int64 packed buffers");
+    TORCH_CHECK(decay_shifts.dim() == 1 && decay_shifts.scalar_type() == at::kInt,
+                "bsr_scan: decay_shifts must be a 1-D int32 tensor");
+    TORCH_CHECK(D >= 0, "bsr_scan: D must be non-negative");
+
+    auto qc = q.contiguous(), ac = assoc.contiguous(), sc = decay_shifts.contiguous();
+    const int64_t B = qc.size(0), n = qc.size(1), Kp = qc.size(2);
+    TORCH_CHECK(Kp == (D + PACK_WIDTH - 1) / PACK_WIDTH,
+                "bsr_scan: packed width does not match D");
+    const int64_t groups = sc.numel();
+    TORCH_CHECK(groups > 0, "bsr_scan: decay_shifts must be non-empty");
+
+    auto read = at::zeros(qc.sizes(), qc.options());
+    auto state = at::zeros(qc.sizes(), qc.options());
+    auto gate = at::zeros(qc.sizes(), qc.options());
+    if (B == 0 || n == 0 || Kp == 0 || D == 0) {
+        return {read, state, gate};
+    }
+
+    const int chunks_per_row = (int)((D + 31) / 32);
+    const int tgs_x          = (chunks_per_row + 7) / 8;
+    MTLSize grid = MTLSizeMake((NSUInteger)tgs_x * 256, (NSUInteger)B, 1);
+    MTLSize tg   = MTLSizeMake(256, 1, 1);
+    dispatch_kernel_ps(BRUTE_CACHED_PS("bsr_scan_chunked"),
+        {{mtl_buf(qc), byte_offset(qc)},
+         {mtl_buf(ac), byte_offset(ac)},
+         {mtl_buf(sc), byte_offset(sc)},
+         {mtl_buf(read), byte_offset(read)},
+         {mtl_buf(state), byte_offset(state)},
+         {mtl_buf(gate), byte_offset(gate)}},
+        {(int32_t)n, (int32_t)Kp, (int32_t)D, (int32_t)groups},
+        grid, tg);
+    return {read, state, gate};
 }
 
 //  Per-element popcount — handles any integer dtype.
