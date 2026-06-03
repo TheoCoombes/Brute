@@ -33,7 +33,7 @@ import torch
 import brute  # noqa: F401 — ensure the extension is importable
 
 from bold import BoldConfig, BoldOptimizer
-from data import OOV_ID, make_lm_batches, wikitext
+from data import OOV_ID, make_lm_batches, wikitext, tiny_shakespeare
 from model import HaemmrConfig, HaemmrLM, IGNORE_INDEX
 
 
@@ -102,7 +102,8 @@ def sample_demo(model, corpus, prompt, n_new, *, temperature, top_k, ban_oov,
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--dataset", default="wikitext-2", choices=["wikitext-2", "wikitext-103"])
+    p.add_argument("--dataset", default="wikitext-2",
+                   choices=["wikitext-2", "wikitext-103", "tiny-shakespeare"])
     p.add_argument("--data-root", default="./.data")
     p.add_argument("--vocab-cap", type=int, default=2048)
     p.add_argument("--max-train-tokens", type=int, default=None,
@@ -155,7 +156,9 @@ def main():
     p.add_argument("--eval-max-batches", type=int, default=40,
                    help="validation batches per eval; <=0 evaluates the full validation split.")
     p.add_argument("--sample-every", type=int, default=500)
-    p.add_argument("--prompt", default="The history of")
+    p.add_argument("--prompt", default=None,
+                   help="sampling prompt; defaults to 'The history of' for WikiText "
+                        "and 'ROMEO:\\n' for TinyShakespeare.")
     p.add_argument("--sample-len", type=int, default=40)
     p.add_argument("--sample-min-len", type=int, default=12)
     p.add_argument("--sentence-sample", action="store_true",
@@ -174,9 +177,14 @@ def main():
     torch.manual_seed(args.seed)
     print(f"device: {device}")
 
-    print(f"loading {args.dataset} (vocab cap {args.vocab_cap}) …")
-    corpus = wikitext(name=args.dataset, data_root=args.data_root,
-                      vocab_cap=args.vocab_cap, max_train_tokens=args.max_train_tokens)
+    print(f"loading {args.dataset} …")
+    if args.dataset == "tiny-shakespeare":
+        corpus = tiny_shakespeare(data_root=args.data_root,
+                                  max_train_tokens=args.max_train_tokens)
+    else:
+        print(f"  vocab cap {args.vocab_cap}")
+        corpus = wikitext(name=args.dataset, data_root=args.data_root,
+                          vocab_cap=args.vocab_cap, max_train_tokens=args.max_train_tokens)
     V = corpus.vocab_size
     Xtr, Ytr = make_lm_batches(corpus.train_ids, seq_len=args.seq_len, mask_oov=True,
                                seed=args.seed, shuffle=True)
@@ -283,7 +291,9 @@ def main():
                 csv_f.flush()
 
         if args.sample_every and step % args.sample_every == 0:
-            txt = sample_demo(model, corpus, args.prompt, args.sample_len,
+            prompt = args.prompt or (
+                "ROMEO:\n" if args.dataset == "tiny-shakespeare" else "The history of")
+            txt = sample_demo(model, corpus, prompt, args.sample_len,
                               temperature=args.temperature, top_k=args.sample_top_k,
                               ban_oov=True, rep_window=args.rep_window,
                               sentence=args.sentence_sample,

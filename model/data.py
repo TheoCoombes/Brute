@@ -1,10 +1,18 @@
-"""WikiText data loader with the GPT-2 BPE tokenizer and a capped vocabulary.
+"""WikiText and TinyShakespeare data loaders for HÆMMR training.
 
-HÆMMR decodes by a min-Hamming sweep over the whole codebook ``E`` (V × D bits),
-so for a small local demo we cap the (50k-token) GPT-2 vocabulary to the top
-``vocab_cap`` most-frequent tokens and fold the rest into a single OOV bucket at
-index 0.  This keeps the codebook — and the decode sweep — small and fast while
-still using the real GPT-2 tokenizer the user asked for.
+WikiText uses GPT-2 BPE with a capped vocabulary — suitable for word-level LM
+experiments at any scale but has a high OOV rate at small vocab caps.
+
+TinyShakespeare is character-level (~1 MB, 65 unique chars).  It is much cleaner
+for small-scale binary LM experiments: no BPE fragmentation artefacts, tiny
+vocab that fits perfectly in a small codebook, continuous prose without Wikipedia
+markup noise.  Download is cached on first run.
+
+HAEMMR decodes by a min-Hamming sweep over the whole codebook E (V x D bits),
+so for a small local demo we cap the 50k-token GPT-2 vocabulary to the top
+vocab_cap most-frequent tokens and fold the rest into a single OOV bucket at
+index 0.  This keeps the codebook small and fast while still using the real
+GPT-2 tokenizer.
 """
 
 from __future__ import annotations
@@ -192,3 +200,87 @@ def repeating_sequence(*, cycle: int = 8, n_tokens: int = 4096, seed: int = 0) -
     g = torch.Generator(device="cpu").manual_seed(int(seed))
     start = int(torch.randint(0, cycle, (1,), generator=g).item())
     return torch.tensor([(start + i) % cycle for i in range(n_tokens)], dtype=torch.long)
+
+
+# ── TinyShakespeare (character-level) ──────────────────────────────────────────
+
+_SHAKESPEARE_URL = (
+    "https://raw.githubusercontent.com/karpathy/char-rnn"
+    "/master/data/tinyshakespeare/input.txt"
+)
+
+
+class _CharTokenizer:
+    """Minimal character-level tokenizer that mirrors the GPT-2 tokenizer interface
+    used by ``Corpus.decode``, ``Corpus.encode``, ``sample_ban_ids``, and
+    ``sentence_end_ids``.
+
+    Character indices start at ``_offset`` (default 1) so that index 0 is reserved
+    for the ``OOV_ID`` slot consumed by ``make_lm_batches(mask_oov=True)``.  Since
+    all characters in the dataset are in-vocab, OOV_ID never appears and the mask
+    is a no-op — but the index convention must match.
+    """
+
+    def __init__(self, chars: list, offset: int = 1):
+        self._offset = offset
+        self._chars = chars           # chars[0] → compact id offset, etc.
+        self._c2i = {c: i + offset for i, c in enumerate(chars)}
+        self.vocab_size = len(chars) + offset
+        self.eos_token_id = self._c2i.get("\n", offset)
+
+    def encode(self, text: str) -> list:
+        return [self._c2i.get(c, OOV_ID) for c in text]
+
+    def decode(self, ids) -> str:
+        return "".join(
+            self._chars[int(i) - self._offset]
+            if self._offset <= int(i) < self._offset + len(self._chars)
+            else ("?" if int(i) != OOV_ID else "")
+            for i in ids
+        )
+
+
+def tiny_shakespeare(
+    *,
+    data_root: str = "./.data",
+    train_frac: float = 0.9,
+    max_train_tokens: Optional[int] = None,
+) -> Corpus:
+    """Character-level Tiny Shakespeare (~1 M chars, 65 unique characters).
+
+    Ideal for small-scale binary LM experiments: clean prose, tiny vocab (65 chars),
+    no BPE fragmentation, no OOV tokens.  The file is downloaded once and cached.
+
+    Returns a :class:`Corpus` compatible with :func:`make_lm_batches` and
+    :func:`train.py`'s training loop.  ``compact_to_gpt2`` is an identity map
+    (compact id == tokenizer id).
+    """
+    import urllib.request
+
+    os.makedirs(data_root, exist_ok=True)
+    cache_path = os.path.join(data_root, "tiny_shakespeare.txt")
+    if not os.path.exists(cache_path):
+        print(f"  downloading TinyShakespeare → {cache_path}")
+        urllib.request.urlretrieve(_SHAKESPEARE_URL, cache_path)
+
+    with open(cache_path, "r", encoding="utf-8") as fh:
+        text = fh.read()
+
+    chars = sorted(set(text))
+    tok = _CharTokenizer(chars, offset=1)   # index 0 reserved for OOV_ID
+    V = tok.vocab_size                       # len(chars) + 1
+
+    all_ids = torch.tensor(tok.encode(text), dtype=torch.long)
+    split = int(train_frac * len(all_ids))
+    train_ids = all_ids[:split]
+    val_ids   = all_ids[split:]
+
+    if max_train_tokens is not None:
+        train_ids = train_ids[:max_train_tokens]
+
+    compact_to_gpt2 = torch.arange(V, dtype=torch.long)  # identity map
+
+    return Corpus(
+        train_ids=train_ids, val_ids=val_ids,
+        vocab_size=V, compact_to_gpt2=compact_to_gpt2, tokenizer=tok,
+    )
