@@ -13,3 +13,4 @@ build/
 **/.runs/
 **/.data/
 **/runs/
+model/bench/results

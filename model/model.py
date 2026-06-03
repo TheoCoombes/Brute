@@ -79,6 +79,10 @@ class HaemmrConfig:
     margin_weight: float = 1.0
     # misc
     gate_open: float = 0.05
+    # component ablation flags (for sweep experiments)
+    use_bsr: bool = True
+    use_episodic: bool = True
+    use_hopfield: bool = True
     seed: int = 0
 
     def __post_init__(self):
@@ -127,6 +131,7 @@ class ChannelMix:
 class Block:
     def __init__(self, cfg: HaemmrConfig, *, idx: int, generator=None, device=None):
         D = cfg.D
+        self.cfg = cfg
         nm = f"blk{idx}"
         nu = cfg.boundary_nu
         self.bsr = BSR(D, name=f"{nm}.bsr", decay_shifts=cfg.decay_shifts,
@@ -158,11 +163,20 @@ class Block:
     def forward(self, c_bit: brute.Tensor, pos_bit: brute.Tensor) -> brute.Tensor:
         B, n, D = c_bit.shape
         self._shape = (B, n, D)
-        r = self.bsr.forward(c_bit)
+        if self.cfg.use_bsr:
+            r = self.bsr.forward(c_bit)
+        else:
+            r = c_bit
         c1 = self.merge_bsr.forward(c_bit, r)
-        e = self.epi.forward(c1, pos_bit)
+        if self.cfg.use_episodic:
+            e = self.epi.forward(c1, pos_bit)
+        else:
+            e = c1
         c2 = self.merge_epi.forward(c1, e)
-        h = self.hop.forward(c2.reshape(B * n, D)).reshape(B, n, D)
+        if self.cfg.use_hopfield:
+            h = self.hop.forward(c2.reshape(B * n, D)).reshape(B, n, D)
+        else:
+            h = c2
         c3 = self.merge_hop.forward(c2, h)
         m = self.mix.forward(c3.reshape(B * n, D)).reshape(B, n, D)
         c4 = self.merge_mix.forward(c3, m)
@@ -177,14 +191,20 @@ class Block:
         a_c3_t = self.mix.backward(a_m.reshape(B * n, D)).reshape(B, n, D)
         a_c3 = combine_desired(a_c3_s, a_c3_t, c3)
         a_c2_s, a_h = self.merge_hop.backward(a_c3)
-        self.hop.backward(a_h.reshape(B * n, D))           # no upstream signal
+        if self.cfg.use_hopfield:
+            self.hop.backward(a_h.reshape(B * n, D))       # no upstream signal
         a_c2 = a_c2_s
         a_c1_s, a_e = self.merge_epi.backward(a_c2)
-        a_c1_t = self.epi.backward(a_e)
-        a_c1 = combine_desired(a_c1_s, a_c1_t, c1)
+        if self.cfg.use_episodic:
+            a_c1_t = self.epi.backward(a_e)
+            a_c1 = combine_desired(a_c1_s, a_c1_t, c1)
+        else:
+            a_c1 = a_c1_s
         a_c_s, a_r = self.merge_bsr.backward(a_c1)
-        a_c_t = self.bsr.backward(a_r)
-        return combine_desired(a_c_s, a_c_t, c_bit)
+        if self.cfg.use_bsr:
+            a_c_t = self.bsr.backward(a_r)
+            return combine_desired(a_c_s, a_c_t, c_bit)
+        return a_c_s
 
 
 # ── the model ────────────────────────────────────────────────────────────────
@@ -383,7 +403,7 @@ class HaemmrLM:
         g_c = self.out_bind.backward(g_chat)
 
         margin_val = 0.0
-        if matched is not None and cfg.margin_weight > 0:
+        if matched is not None and cfg.margin_weight > 0 and cfg.use_episodic:
             for blk in self.blocks:
                 margin_val += blk.epi.margin_loss(
                     matched.to(self.device), theta_pos=cfg.margin_theta_pos,
