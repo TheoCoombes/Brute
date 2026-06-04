@@ -16,14 +16,24 @@ Useful flags::
     --D            concept hypervector dimension
     --layers       number of Boolean blocks
     --codebook-mode {offline,structured,random}
-                  offline GPT-2 SimHash by default; structured = inline BEF;
-                  random = unstructured codebook
+                  structured balanced hash by default; offline = GPT-2 SimHash
+                  ablation; random = alternate balanced hash seed
     --r            margin trigger fraction for lexical updates
     --bits         hidden-weight clamp width
+    --block-init-inertia
+                  initial |H| for stacked blocks (default: 8 for stable depth)
+    --block-update-clip
+                  elementwise ΔH clamp for stacked blocks (default: 1)
+    --readout-warmup-steps
+                  early codebook-only steps before hidden BEP updates
+    --margin-r-final / --margin-anneal-steps
+                  anneal the BEP margin after readout warmup
+    --max-trigger-rate
+                  cap actual hidden BEP rows per batch
     --gate-open    residual gate initial openness
     --no-position  disable hierarchical position codes in the episodic lane
     --sem-weight   semantic rerank weight added to lexical decode logits
-    --device       cpu | mps | cuda  (default: auto)
+    --device       cpu | mps | cuda  (default: cpu)
 """
 
 from __future__ import annotations
@@ -116,15 +126,31 @@ def main():
     p.add_argument("--p-r", type=float, default=0.0,
                    help="CP+R reinforcement probability (BEP §3.3).")
     p.add_argument("--bits", type=int, default=15, help="integer hidden-weight H bit-width.")
+    p.add_argument("--init-inertia", type=int, default=1,
+                   help="initial |H| for non-codebook head/readout parameters.")
+    p.add_argument("--update-clip", type=int, default=None,
+                   help="optional elementwise ΔH clamp for non-codebook head/readout parameters.")
+    p.add_argument("--block-init-inertia", type=int, default=8,
+                   help="initial |H| for stacked blocks; higher damps first-batch rewrites.")
+    p.add_argument("--block-update-clip", type=int, default=1,
+                   help="optional elementwise ΔH clamp for stacked blocks.")
+    p.add_argument("--readout-warmup-steps", type=int, default=25,
+                   help="codebook-only steps before hidden/block BEP updates.")
+    p.add_argument("--margin-r-final", type=float, default=0.0,
+                   help="final BEP margin fraction after annealing.")
+    p.add_argument("--margin-anneal-steps", type=int, default=100,
+                   help="steps after readout warmup over which r decays.")
+    p.add_argument("--max-trigger-rate", type=float, default=0.25,
+                   help="cap actual hidden BEP update rows as a fraction of valid rows.")
     p.add_argument("--log-csv", default=None, help="append the loss curve to this CSV file.")
     p.add_argument("--no-position", dest="use_position", action="store_false", default=True,
                    help="disable hierarchical position codes in the episodic address lane.")
     p.add_argument(
         "--codebook-mode",
         choices=CODEBOOK_MODES,
-        default="offline",
-        help="offline GPT-2 SimHash by default; structured uses inline BEF; "
-             "random uses an unstructured codebook.",
+        default="structured",
+        help="structured balanced hash by default; offline uses GPT-2 SimHash; "
+             "random uses an alternate balanced hash seed.",
     )
     p.add_argument("--bef-sweeps", type=int, default=30)
     p.add_argument("--sem-weight", type=float, default=0.5,
@@ -135,9 +161,9 @@ def main():
     p.add_argument("--gate-open", type=float, default=0.05,
                    help="residual-gate init openness (higher ⇒ context flows sooner).")
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--device", default=None, choices=[None, "cpu", "mps", "cuda"])
-    p.add_argument("--eval-every", type=int, default=200)
-    p.add_argument("--sample-every", type=int, default=500)
+    p.add_argument("--device", default="cpu", choices=["cpu", "mps", "cuda"])
+    p.add_argument("--eval-every", type=int, default=100)
+    p.add_argument("--sample-every", type=int, default=100)
     p.add_argument("--prompt", default="The history of")
     p.add_argument("--sample-len", type=int, default=40)
     p.add_argument("--temperature", type=float, default=0.8)
@@ -175,6 +201,14 @@ def main():
                        structured_codebook=structured_codebook,
                        bef_sweeps=args.bef_sweeps, sem_weight=args.sem_weight,
                        boundary_nu=args.boundary_nu,
+                       init_inertia=args.init_inertia,
+                       update_clip=args.update_clip,
+                       block_init_inertia=args.block_init_inertia,
+                       block_update_clip=args.block_update_clip,
+                       readout_warmup_steps=args.readout_warmup_steps,
+                       margin_r_final=args.margin_r_final,
+                       margin_anneal_steps=args.margin_anneal_steps,
+                       max_trigger_rate=args.max_trigger_rate,
                        flip_dropout=args.flip_dropout,
                        r=args.r, p_r=args.p_r, bits=args.bits,
                        )
@@ -189,6 +223,11 @@ def main():
                        BepConfig(r=args.r, p_r=args.p_r, bits=args.bits))
     n_bits = model.num_bit_parameters()
     print(f"model: D={cfg.D} layers={cfg.n_layers} d_ff={cfg.d_ff} slots={cfg.n_slots}"
+          f" block_H0={cfg.block_init_inertia or cfg.init_inertia}"
+          f" block_clip={cfg.block_update_clip}"
+          f" warmup={cfg.readout_warmup_steps}"
+          f" r={cfg.r}->{cfg.margin_r_final if cfg.margin_r_final is not None else cfg.r}"
+          f" cap={cfg.max_trigger_rate}"
           f"  |  {n_bits:,} bit-params ≈ {n_bits/8/1e6:.2f} MB")
     init = evaluate(model, Xva, Yva, args.batch_size)
     print(f"step 0    val loss {init['loss']:.3f}  ppl {init['ppl']:.1f}  acc {init['acc']:.4f}")
@@ -197,13 +236,14 @@ def main():
     if args.log_csv:
         csv_f = open(args.log_csv, "a")
         if csv_f.tell() == 0:
-            csv_f.write("step,train_ema,val_loss,val_ppl,val_acc,flip_frac\n")
+            csv_f.write("step,train_ema,val_loss,val_ppl,val_acc,flip_frac,"
+                        "trigger_rate,margin_trigger_rate,effective_r\n")
 
     bs = args.batch_size
     n_chunks = Xtr.shape[0]
     order = torch.randperm(n_chunks)
     ptr = 0
-    run_loss = run_acc = run_n = 0.0
+    run_loss = run_acc = run_n = run_trigger = run_margin_trigger = run_eff_r = 0.0
     ema = None
     t0 = time.time()
     for step in range(1, args.steps + 1):
@@ -223,20 +263,29 @@ def main():
         run_loss += step_loss
         run_acc += step_acc
         run_n += step_n
+        run_trigger += info["trigger_rate"]
+        run_margin_trigger += info.get("margin_trigger_rate", info["trigger_rate"])
+        run_eff_r += info.get("effective_r", args.r)
         ema = b_loss if ema is None else 0.98 * ema + 0.02 * b_loss
 
         if step % args.eval_every == 0 or step == args.steps:
             tr_loss = run_loss / max(run_n, 1)
             tr_acc = run_acc / max(run_n, 1)
-            run_loss = run_acc = run_n = 0.0
+            denom = max(args.eval_every if step % args.eval_every == 0 else step % args.eval_every, 1)
+            tr_trigger = run_trigger / denom
+            tr_margin_trigger = run_margin_trigger / denom
+            tr_eff_r = run_eff_r / denom
+            run_loss = run_acc = run_n = run_trigger = run_margin_trigger = run_eff_r = 0.0
             va = evaluate(model, Xva, Yva, bs)
             dt = time.time() - t0
             print(f"step {step:5d}  train loss {tr_loss:.3f} (ema {ema:.3f}) acc {tr_acc:.4f}  |  "
                   f"val loss {va['loss']:.3f} ppl {va['ppl']:.1f} acc {va['acc']:.4f}  |  "
-                  f"flip {st['flip_frac']*100:.3f}%  ({dt:.0f}s)")
+                  f"flip {st['flip_frac']*100:.3f}% trigger {tr_trigger:.3f}/{tr_margin_trigger:.3f}"
+                  f" r {tr_eff_r:.3f}  ({dt:.0f}s)")
             if csv_f:
                 csv_f.write(f"{step},{ema:.4f},{va['loss']:.4f},{va['ppl']:.2f},"
-                            f"{va['acc']:.4f},{st['flip_frac']:.5f}\n")
+                            f"{va['acc']:.4f},{st['flip_frac']:.5f},{tr_trigger:.5f},"
+                            f"{tr_margin_trigger:.5f},{tr_eff_r:.5f}\n")
                 csv_f.flush()
 
         if args.sample_every and step % args.sample_every == 0:

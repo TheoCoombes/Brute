@@ -160,6 +160,56 @@ def random_hypervectors(num: int, D: int, *, generator: torch.Generator | None =
     return hv.to(device) if device is not None else hv
 
 
+def balanced_hash_frame_bool(ids: torch.Tensor | int, D: int, *, seed: int = 0,
+                             device=None) -> torch.Tensor:
+    """Deterministic row-balanced code bits for token ids.
+
+    This is the scalable WikiText-sized codebook initializer: rows are generated
+    from ``(token_id, coordinate, seed)`` and contain exactly ``D//2`` +1 bits
+    (plus one deterministic tiebreak bit when ``D`` is odd).  Callers can
+    regenerate any input row on demand, so a frozen input codebook does not need
+    a second stored ``V × D`` tensor.
+    """
+    if isinstance(ids, int):
+        row_ids = torch.arange(ids, dtype=torch.int64, device=device)
+    else:
+        row_ids = ids.to(device=device, dtype=torch.int64).reshape(-1)
+    if D <= 0:
+        raise ValueError("D must be positive")
+    M = row_ids.numel()
+    if M == 0:
+        return torch.empty(0, D, dtype=torch.bool, device=row_ids.device)
+
+    p1 = 2_147_483_647
+    p2 = 2_147_483_629
+    dims = torch.arange(D, dtype=torch.int64, device=row_ids.device).reshape(1, D)
+    d1 = (dims + 1).remainder(p1)
+    d2 = (dims + 1).remainder(p2)
+    r1 = (row_ids.reshape(M, 1) + 1).remainder(p1)
+    r2 = (row_ids.reshape(M, 1) + 1).remainder(p2)
+    h1 = (r1 * ((d1 * 48_271 + 1) % p1)
+          + ((r1 * r1) % p1) * 69_621
+          + ((d1 * d1) % p1) * 1_103_515_245
+          + int(seed) * 1_013_904_223) % p1
+    h1 = (h1 * h1 + h1 * 12_345 + 45_123) % p1
+    h2 = (r2 * ((d2 * 69_621 + 1) % p2)
+          + ((r2 * r2) % p2) * 48_271
+          + ((d2 * d2) % p2) * 1_664_525
+          + int(seed) * 22_695_477) % p2
+    h2 = (h2 * h2 + h2 * 1_103_515_245 + 12_345) % p2
+    score = h1 * p2 + h2
+
+    order = score.argsort(dim=1)
+    bits = torch.zeros(M, D, dtype=torch.bool, device=row_ids.device)
+    n_pos = D // 2
+    if n_pos:
+        bits.scatter_(1, order[:, :n_pos], True)
+    if D % 2:
+        extra = ((row_ids * 1_103_515_245 + int(seed) * 12_345) % 2).bool()
+        bits[torch.arange(M, device=row_ids.device), order[:, n_pos]] = extra
+    return bits
+
+
 def hamming_similarity(q_bit: brute.Tensor, keys_bit: brute.Tensor) -> torch.Tensor:
     """Signed similarity ``<q, key> = D - 2·Hamming`` for every key (XNOR+popcount).
 

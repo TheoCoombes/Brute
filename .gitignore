@@ -14,3 +14,4 @@ build/
 **/.data/
 **/runs/
 model/bench/results
+*.pt

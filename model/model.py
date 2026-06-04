@@ -10,20 +10,22 @@ Architecture (unchanged from v2 — separation of concerns by job/role)::
         │  m = channel-mix(c)            # binary MLP                       │
         └───────────────────────────────────────────────────────────────┘
         ── out-bind ──▶ next-token concept ĉ  (position-free)
-        ── lex-proj ──▶ ℓ̂ ── decode against fixed prototype codebook ──▶ logits
+        ── lex-proj ──▶ ℓ̂ ── decode against trainable output codebook ──▶ logits
 
 Training is **BEP** (Boolean error propagation): the only large buffer per
 parameter is the integer hidden weight ``H`` (Int16); the visible weight is
 ``W = sign(H)``.  The backward pass threads **binary desired activations** ``a*``
-(bit1) — never a float signal — and the head is **margin-triggered against the
-fixed prototypes** (BEP Eqs. 1-2): an update fires for a position only when
-``logit[target] − max_other < r·D``, and the desired lexical activation is the
-target's prototype ``E[target]``.  No softmax/CE on the backward path.
+(bit1) — never a float signal — and the head is **contrastive margin-triggered**:
+an update fires for a position only when ``logit[target] − max_other < r·D``.
+The desired lexical activation votes only where the target and best wrong
+prototype differ, and the output codebook receives a symmetric integer
+perceptron update.  No softmax/CE on the backward path.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import List, Optional
 
 import torch
@@ -51,6 +53,7 @@ class HaemmrConfig:
     # episodic slot memory (§B1) — the exact-recall fix
     epi_read_k: int = 1
     epi_slots: Optional[int] = None
+    epi_sink_threshold: Optional[int] = None
     # latent Hopfield priors (§B3)
     n_slots: int = 256
     top_k: int = 15
@@ -69,14 +72,24 @@ class HaemmrConfig:
     cleanup_top_k: int = 7
     # BEP training (margin trigger + fixed prototypes, eligibility gate, reinforcement)
     r: float = 0.1                      # margin trigger: logit[tgt] − max_other < r·D
+    train_output_codebook: bool = True
+    margin_r_final: Optional[float] = None  # optional final r after annealing
+    margin_anneal_steps: int = 0            # steps after readout warmup
+    readout_warmup_steps: int = 0           # codebook-only early steps
+    max_trigger_rate: Optional[float] = None  # cap actual hidden BEP rows
     boundary_nu: Optional[float] = None  # eligibility gate |z| ≤ ν·in_dim (stage-2; off)
     p_r: float = 0.0                    # CP+R reinforcement probability (BEP §3.3)
     bits: int = 15                      # integer hidden-weight H bit-width
+    init_inertia: int = 1               # default non-codebook initial |H|
+    update_clip: Optional[int] = None   # default non-codebook elementwise ΔH clamp
+    block_init_inertia: Optional[int] = None  # override for stacked blocks
+    block_update_clip: Optional[int] = None   # override for stacked blocks
     flip_dropout: float = 0.0
     # §F episodic address-margin objective
     margin_theta_pos: float = 0.5
     margin_theta_neg: float = 0.0
     margin_weight: float = 1.0
+    self_supervised_induction: bool = True
     # misc
     gate_open: float = 0.05
     # component ablation flags (for sweep experiments)
@@ -92,6 +105,8 @@ class HaemmrConfig:
             raise ValueError("epi_read_k must be positive")
         if self.epi_slots is not None and self.epi_slots <= 0:
             raise ValueError("epi_slots must be positive when set")
+        if self.epi_sink_threshold is not None and self.epi_sink_threshold < 0:
+            raise ValueError("epi_sink_threshold must be non-negative when set")
         if self.pos_chunk <= 0:
             raise ValueError("pos_chunk must be positive")
         if self.sem_weight < 0:
@@ -100,18 +115,39 @@ class HaemmrConfig:
             raise ValueError("flip_dropout must be in [0, 1)")
         if self.boundary_nu is not None and self.boundary_nu < 0:
             raise ValueError("boundary_nu must be non-negative")
+        if self.init_inertia <= 0:
+            raise ValueError("init_inertia must be positive")
+        if self.block_init_inertia is not None and self.block_init_inertia <= 0:
+            raise ValueError("block_init_inertia must be positive when set")
+        if self.update_clip is not None and self.update_clip <= 0:
+            raise ValueError("update_clip must be positive when set")
+        if self.block_update_clip is not None and self.block_update_clip <= 0:
+            raise ValueError("block_update_clip must be positive when set")
+        if self.margin_r_final is not None and self.margin_r_final < 0:
+            raise ValueError("margin_r_final must be non-negative when set")
+        if self.margin_anneal_steps < 0:
+            raise ValueError("margin_anneal_steps must be non-negative")
+        if self.readout_warmup_steps < 0:
+            raise ValueError("readout_warmup_steps must be non-negative")
+        if self.max_trigger_rate is not None and not (0 < self.max_trigger_rate <= 1):
+            raise ValueError("max_trigger_rate must be in (0, 1] when set")
 
 
 # ── channel-mixing MLP (two Boolean linears) ───────────────────────────────────
 
 class ChannelMix:
     def __init__(self, D: int, d_ff: int, *, name: str, generator=None, device=None,
-                 boundary_nu=None):
+                 boundary_nu=None, init_inertia: int = 1,
+                 update_clip: Optional[int] = None):
         self.D, self.d_ff = D, d_ff
         self.lin1 = BooleanLinear(D, d_ff, name=f"{name}.lin1", generator=generator,
-                                  device=device, boundary_nu=boundary_nu)
+                                  device=device, boundary_nu=boundary_nu,
+                                  init_inertia=init_inertia,
+                                  update_clip=update_clip)
         self.lin2 = BooleanLinear(d_ff, D, name=f"{name}.lin2", generator=generator,
-                                  device=device, boundary_nu=boundary_nu)
+                                  device=device, boundary_nu=boundary_nu,
+                                  init_inertia=init_inertia,
+                                  update_clip=update_clip)
 
     def params(self) -> List[BepParam]:
         return self.lin1.params() + self.lin2.params()
@@ -134,23 +170,34 @@ class Block:
         self.cfg = cfg
         nm = f"blk{idx}"
         nu = cfg.boundary_nu
+        init_inertia = cfg.block_init_inertia or cfg.init_inertia
+        update_clip = cfg.block_update_clip if cfg.block_update_clip is not None else cfg.update_clip
         self.bsr = BSR(D, name=f"{nm}.bsr", decay_shifts=cfg.decay_shifts,
-                       generator=generator, device=device, boundary_nu=nu)
+                       generator=generator, device=device, boundary_nu=nu,
+                       init_inertia=init_inertia, update_clip=update_clip)
         self.merge_bsr = ResidualMerge(D, name=f"{nm}.merge_bsr", p_open=cfg.gate_open,
-                                       generator=generator, device=device)
+                                       generator=generator, device=device,
+                                       init_inertia=init_inertia, update_clip=update_clip)
         self.epi = EpisodicSlotMemory(D, name=f"{nm}.epi", read_k=cfg.epi_read_k,
                                       n_slots=cfg.epi_slots, generator=generator,
-                                      device=device, boundary_nu=nu)
+                                      device=device, boundary_nu=nu,
+                                      sink_threshold=cfg.epi_sink_threshold,
+                                      init_inertia=init_inertia, update_clip=update_clip)
         self.merge_epi = ResidualMerge(D, name=f"{nm}.merge_epi", p_open=cfg.gate_open,
-                                       value_path=True, generator=generator, device=device)
+                                       value_path=True, generator=generator, device=device,
+                                       init_inertia=init_inertia, update_clip=update_clip)
         self.hop = HopfieldBank(D, cfg.n_slots, cfg.top_k, name=f"{nm}.hop",
-                                generator=generator, device=device)
+                                generator=generator, device=device,
+                                init_inertia=init_inertia, update_clip=update_clip)
         self.merge_hop = ResidualMerge(D, name=f"{nm}.merge_hop", p_open=cfg.gate_open,
-                                       generator=generator, device=device)
+                                       generator=generator, device=device,
+                                       init_inertia=init_inertia, update_clip=update_clip)
         self.mix = ChannelMix(D, cfg.d_ff, name=f"{nm}.mix", generator=generator,
-                              device=device, boundary_nu=nu)
+                              device=device, boundary_nu=nu,
+                              init_inertia=init_inertia, update_clip=update_clip)
         self.merge_mix = ResidualMerge(D, name=f"{nm}.merge_mix", p_open=cfg.gate_open,
-                                       generator=generator, device=device)
+                                       generator=generator, device=device,
+                                       init_inertia=init_inertia, update_clip=update_clip)
         self._shape = None
         self._cache: dict = {}
 
@@ -225,25 +272,39 @@ class HaemmrLM:
                                       structured=cfg.structured_codebook,
                                       bef_alpha=cfg.bef_alpha, bef_sweeps=cfg.bef_sweeps,
                                       init_pm1=codebook_init,
-                                      generator=gen, device=self.device)
-        self.input_bind = DiagBind(cfg.D, name="in", generator=gen, device=self.device)
+                                      generator=gen, device=self.device,
+                                      seed=cfg.seed)
+        self.input_bind = DiagBind(cfg.D, name="in", generator=gen, device=self.device,
+                                   init_inertia=cfg.init_inertia,
+                                   update_clip=cfg.update_clip)
         self.blocks = [Block(cfg, idx=i, generator=gen, device=self.device)
                        for i in range(cfg.n_layers)]
-        self.out_bind = DiagBind(cfg.D, name="out", generator=gen, device=self.device)
+        self.out_bind = DiagBind(cfg.D, name="out", generator=gen, device=self.device,
+                                 init_inertia=cfg.init_inertia,
+                                 update_clip=cfg.update_clip)
         self.lex_proj = BooleanLinear(cfg.D, cfg.D, name="lex", generator=gen,
-                                      device=self.device, boundary_nu=nu)
-        self.sem_bind = DiagBind(cfg.D, name="sem", generator=gen, device=self.device)
+                                      device=self.device, boundary_nu=nu,
+                                      init_inertia=cfg.init_inertia,
+                                      update_clip=cfg.update_clip)
+        self.sem_bind = DiagBind(cfg.D, name="sem", generator=gen, device=self.device,
+                                 init_inertia=cfg.init_inertia,
+                                 update_clip=cfg.update_clip)
         if cfg.hopfield_cleanup:
             self.cleanup_hop = HopfieldBank(cfg.D, cfg.cleanup_slots, cfg.cleanup_top_k,
-                                            name="clean", generator=gen, device=self.device)
+                                            name="clean", generator=gen, device=self.device,
+                                            init_inertia=cfg.init_inertia,
+                                            update_clip=cfg.update_clip)
             self.cleanup_merge = ResidualMerge(cfg.D, name="clean.merge", p_open=cfg.gate_open,
-                                               generator=gen, device=self.device)
+                                               generator=gen, device=self.device,
+                                               init_inertia=cfg.init_inertia,
+                                               update_clip=cfg.update_clip)
 
         self.pos_chunk_base = (torch.randint(0, 2, (cfg.D,), generator=gen).float() * 2 - 1).to(self.device)
         self.pos_offset_base = (torch.randint(0, 2, (cfg.D,), generator=gen).float() * 2 - 1).to(self.device)
         self._pos_cache: dict = {}
         self._neutral_pos_cache: dict = {}
         self._fwd_cache: dict = {}
+        self._train_step = 0
 
     # ── parameters / checkpoint ──────────────────────────────────────────────
     def parameters(self) -> List[BepParam]:
@@ -267,12 +328,14 @@ class HaemmrLM:
             "cfg": self.cfg.__dict__,
             "pos_chunk_base": self.pos_chunk_base.detach().cpu().clone(),
             "pos_offset_base": self.pos_offset_base.detach().cpu().clone(),
+            "train_step": self._train_step,
             "params": {p.name: p.state_dict() for p in self.parameters()},
         }
 
     def load_state_dict(self, sd: dict) -> None:
         self.pos_chunk_base = sd["pos_chunk_base"].to(self.device)
         self.pos_offset_base = sd["pos_offset_base"].to(self.device)
+        self._train_step = int(sd.get("train_step", 0))
         byname = {p.name: p for p in self.parameters()}
         for name, psd in sd["params"].items():
             if name in byname:
@@ -346,10 +409,48 @@ class HaemmrLM:
         self._fwd_cache = {
             "B": B, "n": n, "ell_bit": ell_bit, "sem_bit": sem_bit,
             "chat_flat": chat_flat, "flip_masks": flip_masks, "cleanup": cleanup_cache,
+            "ids": ids,
         }
         return logits
 
-    # ── loss + BEP backward (margin trigger + fixed prototypes) ───────────────
+    def _synth_induction_matched(self, targets: torch.Tensor) -> torch.Tensor:
+        """Most recent previous position whose follower equals this target."""
+        B, n = self._fwd_cache["B"], self._fwd_cache["n"]
+        tgt = targets.to(self.device).reshape(B, n).long()
+        valid_t = tgt != IGNORE_INDEX
+        same_follower = tgt.unsqueeze(2) == tgt.unsqueeze(1)      # (B,t,m)
+        t = torch.arange(n, device=self.device).unsqueeze(1)
+        m = torch.arange(n, device=self.device).unsqueeze(0)
+        causal = m < t
+        valid = same_follower & valid_t.unsqueeze(2) & valid_t.unsqueeze(1) & causal.unsqueeze(0)
+        idx = torch.arange(n, device=self.device).view(1, 1, n).expand(B, n, n)
+        return torch.where(valid, idx, torch.full_like(idx, -1)).max(dim=2).values
+
+    def _effective_margin_r(self) -> float:
+        cfg = self.cfg
+        if cfg.margin_r_final is None or cfg.margin_anneal_steps <= 0:
+            return float(cfg.r)
+        post_warmup = max(0, self._train_step - cfg.readout_warmup_steps)
+        t = min(1.0, post_warmup / max(1, cfg.margin_anneal_steps))
+        return float(cfg.r + (cfg.margin_r_final - cfg.r) * t)
+
+    def _cap_hidden_trigger(self, trigger: torch.Tensor, deficit: torch.Tensor,
+                            valid: torch.Tensor) -> torch.Tensor:
+        cap_rate = self.cfg.max_trigger_rate
+        if cap_rate is None:
+            return trigger
+        n_valid = int(valid.sum().item())
+        n_trigger = int(trigger.sum().item())
+        cap = max(1, int(math.ceil(n_valid * float(cap_rate)))) if n_valid else 0
+        if n_trigger <= cap:
+            return trigger
+        priority = torch.where(trigger, deficit, torch.full_like(deficit, float("-inf")))
+        keep = torch.topk(priority, k=cap, dim=0).indices
+        capped = torch.zeros_like(trigger)
+        capped[keep] = True
+        return capped
+
+    # ── loss + BEP backward (contrastive margin trigger) ─────────────────────
     def loss_and_backward(self, logits: torch.Tensor, targets: torch.Tensor,
                           matched: Optional[torch.Tensor] = None) -> dict:
         cfg = self.cfg
@@ -369,28 +470,47 @@ class HaemmrLM:
         pred = scaled.argmax(dim=1)
         acc = float((pred[valid] == tgt[valid]).float().mean().item()) if n_valid else 0.0
 
-        # BEP margin trigger (Eqs. 1-2): fire where logit[tgt] − max_other < r·D
+        # BEP margin trigger: fire where logit[tgt] - max_other < r_eff*D.
+        effective_r = self._effective_margin_r()
         logit_tgt = logits.gather(1, safe_tgt.unsqueeze(1)).squeeze(1)
         other = logits.clone()
         other.scatter_(1, safe_tgt.unsqueeze(1), float("-inf"))
-        max_other = other.max(dim=1).values
-        trigger = valid & ((logit_tgt - max_other) < cfg.r * D)
-        trig_rate = float(trigger.float().mean().item()) if M else 0.0
+        max_other, wrong = other.max(dim=1)
+        margin_deficit = effective_r * D - (logit_tgt - max_other)
+        trigger = valid & (margin_deficit > 0)
+        readout_warmup = (
+            cfg.train_output_codebook
+            and cfg.readout_warmup_steps > 0
+            and self._train_step < cfg.readout_warmup_steps
+        )
+        if readout_warmup:
+            hidden_trigger = torch.zeros_like(trigger)
+        else:
+            hidden_trigger = self._cap_hidden_trigger(trigger, margin_deficit, valid)
+        trig_rate = float(hidden_trigger.float().mean().item()) if M else 0.0
+        margin_trig_rate = float(trigger.float().mean().item()) if M else 0.0
 
-        # desired lexical activation = target prototype where triggered, else current
+        # Desired activation is discriminative: agreement coords carry no opinion.
         proto = self.codebook.prototype(safe_tgt)          # (M, D) bit1
-        sel = to_bit1(trigger.unsqueeze(1).expand(M, D))
+        wrong_proto = self.codebook.prototype(wrong)
+        agree = brute.fast.eq(proto, wrong_proto)
+        sel = to_bit1(hidden_trigger.unsqueeze(1).expand(M, D))
         ell_bit = self._fwd_cache["ell_bit"]
-        ell_des = mux(sel, proto, ell_bit)
+        ell_margin_des = mux(agree, ell_bit, proto)
+        ell_des = mux(sel, ell_margin_des, ell_bit)
         chat_flat = self._fwd_cache["chat_flat"]
+        if cfg.train_output_codebook:
+            decode_update = trigger & (pred != tgt)
+            self.codebook.backward_decode(ell_bit, safe_tgt, wrong, decode_update)
         # only triggered positions inject a backward signal (BEP); the rest carry
         # no opinion (desired = current activation, no weight update).
-        bep.set_active(trigger)
+        bep.set_active(hidden_trigger)
         g_chat = self.lex_proj.backward(ell_des)
 
         sem_bit = self._fwd_cache["sem_bit"]
         if sem_bit is not None:
-            sem_des = mux(sel, proto, sem_bit)
+            sem_margin_des = mux(agree, sem_bit, proto)
+            sem_des = mux(sel, sem_margin_des, sem_bit)
             g_chat_sem = self.sem_bind.backward(sem_des)
             g_chat = combine_desired(g_chat, g_chat_sem, chat_flat)
         g_chat = g_chat.reshape(B, n, D)
@@ -403,11 +523,16 @@ class HaemmrLM:
         g_c = self.out_bind.backward(g_chat)
 
         margin_val = 0.0
+        if (matched is None and cfg.self_supervised_induction
+                and cfg.margin_weight > 0 and cfg.use_episodic):
+            matched = self._synth_induction_matched(targets)
         if matched is not None and cfg.margin_weight > 0 and cfg.use_episodic:
+            active_rows = hidden_trigger.reshape(B, n)
             for blk in self.blocks:
                 margin_val += blk.epi.margin_loss(
                     matched.to(self.device), theta_pos=cfg.margin_theta_pos,
-                    theta_neg=cfg.margin_theta_neg, weight=cfg.margin_weight)
+                    theta_neg=cfg.margin_theta_neg, weight=cfg.margin_weight,
+                    active_rows=active_rows)
 
         flip_masks = self._fwd_cache["flip_masks"]
         for blk, fbit in zip(reversed(self.blocks), reversed(flip_masks)):
@@ -417,9 +542,13 @@ class HaemmrLM:
         g_emb = self.input_bind.backward(g_c)
         self.codebook.backward_embed(g_emb)
         bep.set_active(None)
+        self._train_step += 1
 
         return {"loss": loss, "acc": acc, "n_valid": n_valid, "margin": margin_val,
                 "trigger_rate": trig_rate,
+                "margin_trigger_rate": margin_trig_rate,
+                "effective_r": effective_r,
+                "readout_warmup": readout_warmup,
                 "ppl": float(torch.exp(torch.tensor(loss)).item()) if n_valid else float("inf")}
 
     @torch.no_grad()

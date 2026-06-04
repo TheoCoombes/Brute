@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import ssl
 from typing import Optional
 
 import torch
@@ -42,6 +43,16 @@ def _cache_key(gpt2_ids: torch.Tensor, D: int, seed: int, source: str) -> str:
 
 def _load_gpt2_embeddings(source: str) -> torch.Tensor:
     """Return the (vocab, hidden) pretrained input-embedding matrix for ``source``."""
+    verify_paths = ssl.get_default_verify_paths()
+    cafile = verify_paths.cafile
+    if cafile and os.path.exists(cafile):
+        # Hugging Face uses requests/urllib3, which respects REQUESTS_CA_BUNDLE.
+        # On this machine the Homebrew/OpenSSL bundle is the one that validates
+        # the Hub certificate chain.
+        os.environ.setdefault("REQUESTS_CA_BUNDLE", cafile)
+        os.environ.setdefault("CURL_CA_BUNDLE", cafile)
+        os.environ.setdefault("SSL_CERT_FILE", cafile)
+
     from transformers import AutoModel
 
     model = AutoModel.from_pretrained(source)

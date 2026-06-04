@@ -53,8 +53,11 @@ The backward pass is BEP:
 * each parameter stores an integer hidden weight buffer `H` (`int16`);
 * the visible weight is `sign(H)`;
 * the logging loss is a normal NLL/perplexity calculation only;
-* the update path fires only where the decode margin triggers
-  (`logit[target] - max_other < r * D`);
+* the raw decode margin is tracked as
+  (`logit[target] - max_other < r_eff * D`);
+* output-codebook/readout updates can run on all raw violations, while hidden
+  BEP updates can be warmed up, annealed, and capped to avoid whole-batch
+  rewrites after early readout adaptation;
 * triggered positions emit binary desired activations, not float gradients;
 * episodic address projections can also receive local matched-slot supervision.
 
@@ -68,11 +71,13 @@ Useful flags on the current CLI:
 * `--bef-sweeps`
 * `--sem-weight`
 * `--r`, `--p-r`, `--bits`, `--flip-dropout`
+* `--readout-warmup-steps`, `--margin-r-final`, `--margin-anneal-steps`
+* `--max-trigger-rate`
 * `--gate-open`, `--boundary-nu`
 
-`--codebook-mode offline` is the default for WikiText training and probing.
-It builds a GPT-2 SimHash codebook from pretrained embeddings and caches it
-under `model/.data/codebook`.
+`--codebook-mode structured` is the default for WikiText training and probing.
+`offline` builds a GPT-2 SimHash codebook from pretrained embeddings and caches
+it under `model/.data/codebook`.
 
 `--codebook-mode structured` keeps the inline BEF initializer.
 `--codebook-mode random` disables the structured initializer and uses a random

@@ -126,10 +126,11 @@ class BepParam:
     """
 
     __slots__ = ("name", "H", "_bit", "_dirty", "_prev_sign", "shape", "device",
-                 "bits", "p_r", "lr")
+                 "bits", "p_r", "lr", "update_clip")
 
     def __init__(self, H: torch.Tensor, name: str = "", *, bits: int = 15,
-                 p_r: float = 0.0, lr: int = 1):
+                 p_r: float = 0.0, lr: int = 1,
+                 update_clip: Optional[int] = None):
         self.name = name
         self.H = H.to(torch.int16)
         self.shape = tuple(H.shape)
@@ -137,6 +138,7 @@ class BepParam:
         self.bits = bits                 # H clipped to [-(2^{bits-1}), 2^{bits-1}-1]
         self.p_r = p_r                   # CP+R reinforcement probability (BEP §3.3)
         self.lr = lr                     # integer update scale (BEP "learning rate")
+        self.update_clip = update_clip   # optional per-step elementwise ΔH clamp
         self._bit: Optional[brute.Tensor] = None
         self._dirty = True
         self._prev_sign: Optional[torch.Tensor] = None
@@ -164,6 +166,9 @@ class BepParam:
         """``H += delta`` (the masked, binary outer-product update from backward)."""
         if delta_int.shape != self.H.shape:
             delta_int = delta_int.reshape(self.H.shape)
+        if self.update_clip is not None:
+            clip = int(self.update_clip)
+            delta_int = delta_int.clamp(-clip, clip)
         self.H += delta_int.to(torch.int16)
         self._dirty = True
 
@@ -249,6 +254,7 @@ class BepConfig:
     bits: int = 15          # integer H bit-width (clip range)
     gamma: int = 1          # winner-takes-update group size (stage-2; 1 = off)
     lr: int = 1             # integer update scale
+    update_clip: Optional[int] = None  # optional elementwise ΔH clamp
 
 
 class BepOptimizer:
@@ -261,6 +267,8 @@ class BepOptimizer:
             p.p_r = self.config.p_r
             p.bits = self.config.bits
             p.lr = self.config.lr
+            if self.config.update_clip is not None:
+                p.update_clip = int(self.config.update_clip)
         self._step = 0
 
     def zero_signals(self) -> None:        # kept for API compatibility (no-op)
@@ -292,14 +300,17 @@ class BepOptimizer:
 # ── helpers ─────────────────────────────────────────────────────────────────────
 
 def random_bit_param(shape, name: str, *, generator: Optional[torch.Generator] = None,
-                     device=None, p_true: float = 0.5, bits: int = 15) -> BepParam:
+                     device=None, p_true: float = 0.5, bits: int = 15,
+                     init_inertia: int = 1,
+                     update_clip: Optional[int] = None) -> BepParam:
     """A :class:`BepParam` with ``H`` initialised to small balanced ±1 ints.
 
     ``sign(H)`` is therefore a balanced random ±1 weight, and a single agreeing
     backward step can already flip a bit (small ``|H|`` ⇒ fast early plasticity).
     """
     signs = (torch.rand(shape, generator=generator) < p_true)        # CPU generator
-    H = signs.to(torch.int16).mul_(2).sub_(1)                        # ±1
+    inertia = max(1, int(init_inertia))
+    H = signs.to(torch.int16).mul_(2).sub_(1).mul_(inertia)          # ±inertia
     if device is not None:
         H = H.to(device)
-    return BepParam(H, name=name, bits=bits)
+    return BepParam(H, name=name, bits=bits, update_clip=update_clip)

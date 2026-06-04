@@ -21,7 +21,7 @@ from brute.tensor import Tensor as _BT
 
 import bep
 from bep import BepParam, random_bit_param, combine_desired, mux, pm1_int, signed_batch_sum
-from vsa import bind, sign_to_bit1, to_bit1
+from vsa import balanced_hash_frame_bool, bind, sign_to_bit1, to_bit1
 
 
 # Per-step integer push that opens a value-path :class:`ResidualMerge` gate at
@@ -30,6 +30,11 @@ from vsa import bind, sign_to_bit1, to_bit1
 # tasks without saturating the gate on tasks that are solvable from local
 # context — there the ordinary agreement signal still closes the gate.
 _VALUE_BOOST: float = 1.0
+
+# The output codebook is trainable now.  Starting its existing H buffer at ±16
+# keeps step-0 signs identical while preventing a few early mistakes from moving
+# prototypes faster than the hidden path can learn.
+_CODEBOOK_INIT_INERTIA = 16
 
 
 # ── packed broadcast binding (c ⊗ mask) ───────────────────────────────────────
@@ -54,10 +59,14 @@ class BooleanLinear:
 
     def __init__(self, in_dim: int, out_dim: int, *, name: str,
                  generator: Optional[torch.Generator] = None, device=None,
-                 boundary_nu: Optional[float] = None):
+                 boundary_nu: Optional[float] = None,
+                 init_inertia: int = 1,
+                 update_clip: Optional[int] = None):
         self.in_dim, self.out_dim = in_dim, out_dim
         self.W = random_bit_param((out_dim, in_dim), f"{name}.W",
-                                  generator=generator, device=device)
+                                  generator=generator, device=device,
+                                  init_inertia=init_inertia,
+                                  update_clip=update_clip)
         self.boundary_nu = boundary_nu
         self._cache: dict = {}
 
@@ -80,9 +89,12 @@ class DiagBind:
     """``out = c ⊗ m`` with a learned 1-bit mask ``m`` (D,) — a diagonal transform."""
 
     def __init__(self, D: int, *, name: str, generator: Optional[torch.Generator] = None,
-                 device=None):
+                 device=None, init_inertia: int = 1,
+                 update_clip: Optional[int] = None):
         self.D = D
-        self.m = random_bit_param((D,), f"{name}.m", generator=generator, device=device)
+        self.m = random_bit_param((D,), f"{name}.m", generator=generator, device=device,
+                                  init_inertia=init_inertia,
+                                  update_clip=update_clip)
         self._cache: dict = {}
 
     def params(self) -> List[BepParam]:
@@ -111,10 +123,14 @@ class ResidualMerge:
 
     def __init__(self, D: int, *, name: str, p_open: float = 0.05,
                  value_path: bool = False,
-                 generator: Optional[torch.Generator] = None, device=None):
+                 generator: Optional[torch.Generator] = None, device=None,
+                 init_inertia: int = 1,
+                 update_clip: Optional[int] = None):
         self.D = D
         self.g = random_bit_param((D,), f"{name}.g", generator=generator,
-                                  device=device, p_true=p_open)
+                                  device=device, p_true=p_open,
+                                  init_inertia=init_inertia,
+                                  update_clip=update_clip)
         # ``value_path`` merges carry retrieved content that must reach the head at
         # supervised (triggered) positions — see :meth:`backward`'s open bootstrap.
         self.value_path = value_path
@@ -182,41 +198,52 @@ class ResidualMerge:
         return a_skip, a_trans
 
 
-# ── Token codebook (shared input embedding + fixed prototype decoder) ──────────
+# ── Token codebook (frozen input rows + trainable output decoder) ──────────────
 
 class TokenCodebook:
-    """One binary codebook ``E`` (V, D): row lookup *and* min-Hamming decode.
+    """Binary token codes with a frozen input geometry and trainable output ``E``.
 
-    Under BEP the codebook is the **fixed prototype classifier** — it is not
-    trained by the flip rule (the visible weight ``sign(H)`` never crosses zero,
-    since no ``ΔH`` is ever accumulated into it).  Both the input embedding and
-    the output decode read these fixed prototypes.
+    The output codebook is the existing :class:`BepParam` named ``E`` so the
+    locked decode matmul is unchanged.  For default balanced-hash initialisation,
+    input rows are regenerated from token ids and ``seed`` instead of stored in
+    a second ``V x D`` tensor; this unties input/output without adding another
+    per-weight accumulator.  Arbitrary offline initialisers cannot be regenerated
+    under that memory constraint, so they remain tied opt-in ablations.
     """
 
     def __init__(self, vocab_size: int, D: int, *, name: str = "E",
                  structured: bool = False, bef_alpha: float = 1.0, bef_sweeps: int = 30,
                  init_pm1: Optional[torch.Tensor] = None,
-                 generator: Optional[torch.Generator] = None, device=None):
+                 generator: Optional[torch.Generator] = None, device=None,
+                 seed: int = 0):
         self.V, self.D = vocab_size, D
+        self._input_seed: Optional[int] = None
+        self._embed_cache: dict = {}
         if init_pm1 is not None:
             # Precomputed prototypes (e.g. an offline GPT-2 SimHash codebook).
             if tuple(init_pm1.shape) != (vocab_size, D):
                 raise ValueError(
                     f"init_pm1 shape {tuple(init_pm1.shape)} != ({vocab_size}, {D})")
             frame = init_pm1
-        elif structured:
-            from vsa import binary_equiangular_frame
-            frame = binary_equiangular_frame(vocab_size, D, alpha=bef_alpha,
-                                             n_sweeps=bef_sweeps, generator=generator)
-        else:
-            self.E = random_bit_param((vocab_size, D), name, generator=generator, device=device)
-            self._embed_cache = {}
+            bit = brute.as_tensor(frame > 0, dtype=brute.bit1)
+            if device is not None:
+                bit = bit.to(device)
+            self.E = BepParam(pm1_int(bit) * _CODEBOOK_INIT_INERTIA, name=name)
             return
-        bit = brute.as_tensor(frame > 0, dtype=brute.bit1)
-        if device is not None:
-            bit = bit.to(device)
-        self.E = BepParam(pm1_int(bit), name=name)
-        self._embed_cache: dict = {}
+        elif structured:
+            self._input_seed = int(seed)
+        else:
+            self._input_seed = int(seed) ^ 0x5EED_5EED
+
+        dev = device
+        H = torch.empty(vocab_size, D, dtype=torch.int16, device=dev)
+        chunk = max(1, min(vocab_size, max(1, 4_194_304 // max(D, 1))))
+        for start in range(0, vocab_size, chunk):
+            end = min(start + chunk, vocab_size)
+            ids = torch.arange(start, end, dtype=torch.long, device=dev)
+            rows = balanced_hash_frame_bool(ids, D, seed=self._input_seed, device=dev)
+            H[start:end] = rows.to(torch.int16).mul_(2).sub_(1).mul_(_CODEBOOK_INIT_INERTIA)
+        self.E = BepParam(H, name=name)
 
     def params(self) -> List[BepParam]:
         return [self.E]
@@ -225,7 +252,13 @@ class TokenCodebook:
     def embed(self, ids: torch.Tensor) -> brute.Tensor:
         B, n = ids.shape
         flat = ids.reshape(-1).long()
-        rows = self.E.bit[flat]                            # (B*n, D) bit1
+        if self._input_seed is None:
+            rows = self.E.bit[flat]                        # offline ablation: tied
+        else:
+            uniq, inv = torch.unique(flat, sorted=False, return_inverse=True)
+            row_bits = balanced_hash_frame_bool(uniq, self.D, seed=self._input_seed,
+                                                device=flat.device)
+            rows = brute.as_tensor(row_bits[inv], dtype=brute.bit1)
         self._embed_cache = {"ids": flat, "shape": (B, n)}
         return rows.reshape(B, n, self.D) if rows.dim() == 2 else rows
 
@@ -239,8 +272,30 @@ class TokenCodebook:
         return brute.fast.matmul(chat_bit, self.E.bit)     # (M, V) int32
 
     def prototype(self, ids: torch.Tensor) -> brute.Tensor:
-        """Fixed prototype rows ``E[ids]`` (the desired decode target)."""
+        """Current output prototype rows ``E[ids]``."""
         return self.E.bit[ids.reshape(-1).long()]
+
+    def backward_decode(self, ell_bit: brute.Tensor, target_ids: torch.Tensor,
+                        wrong_ids: torch.Tensor, active_mask: torch.Tensor) -> None:
+        """Sparse multiclass-perceptron update for the trainable output codebook.
+
+        Triggered rows vote ``E[target] += ell`` and ``E[wrong] -= ell`` directly
+        into the existing int16 ``H`` buffer with row ``index_add_``.  No dense
+        ``V x D`` delta tensor and no additional per-weight state are allocated.
+        """
+        active = active_mask.to(device=self.E.device, dtype=torch.bool).reshape(-1)
+        tgt = target_ids.to(device=self.E.device, dtype=torch.long).reshape(-1)
+        wrong = wrong_ids.to(device=self.E.device, dtype=torch.long).reshape(-1)
+        active = active & (tgt >= 0) & (tgt < self.V) & (wrong >= 0) & (wrong < self.V) & (tgt != wrong)
+        if int(active.sum().item()) == 0:
+            return None
+        rows = pm1_int(ell_bit, dtype=torch.int16)[active]
+        if self.E.lr != 1:
+            rows = (rows.to(torch.int32) * int(self.E.lr)).to(torch.int16)
+        self.E.H.index_add_(0, tgt[active], rows)
+        self.E.H.index_add_(0, wrong[active], -rows)
+        self.E._dirty = True
+        return None
 
 
 # ── Latent Hopfield Bank (binary associative memory / latent attention) ────────
@@ -249,10 +304,16 @@ class HopfieldBank:
     """M learned slots — key ``P`` (M,D), payload ``U`` (M,D).  Top-k WTA read."""
 
     def __init__(self, D: int, n_slots: int, top_k: int, *, name: str = "hop",
-                 generator: Optional[torch.Generator] = None, device=None):
+                 generator: Optional[torch.Generator] = None, device=None,
+                 init_inertia: int = 1,
+                 update_clip: Optional[int] = None):
         self.D, self.M, self.k = D, n_slots, top_k
-        self.P = random_bit_param((n_slots, D), f"{name}.P", generator=generator, device=device)
-        self.U = random_bit_param((n_slots, D), f"{name}.U", generator=generator, device=device)
+        self.P = random_bit_param((n_slots, D), f"{name}.P", generator=generator, device=device,
+                                  init_inertia=init_inertia,
+                                  update_clip=update_clip)
+        self.U = random_bit_param((n_slots, D), f"{name}.U", generator=generator, device=device,
+                                  init_inertia=init_inertia,
+                                  update_clip=update_clip)
         self._cache: dict = {}
 
     def params(self) -> List[BepParam]:
@@ -311,13 +372,23 @@ class EpisodicSlotMemory:
     def __init__(self, D: int, *, name: str = "epi", read_k: int = 1,
                  n_slots: Optional[int] = None, attn_inv_temp: Optional[float] = None,
                  generator: Optional[torch.Generator] = None, device=None,
-                 boundary_nu: Optional[float] = None):
+                 boundary_nu: Optional[float] = None,
+                 sink_threshold: Optional[int] = None,
+                 init_inertia: int = 1,
+                 update_clip: Optional[int] = None):
         self.D = D
         self.k = read_k
         self.N = n_slots
-        self.Kc = BooleanLinear(D, D, name=f"{name}.Kc", generator=generator, device=device, boundary_nu=boundary_nu)
-        self.Qc = BooleanLinear(D, D, name=f"{name}.Qc", generator=generator, device=device, boundary_nu=boundary_nu)
-        self.Qp = BooleanLinear(D, D, name=f"{name}.Qp", generator=generator, device=device, boundary_nu=boundary_nu)
+        self.sink_threshold = 0 if sink_threshold is None else int(sink_threshold)
+        self.Kc = BooleanLinear(D, D, name=f"{name}.Kc", generator=generator, device=device,
+                                boundary_nu=boundary_nu, init_inertia=init_inertia,
+                                update_clip=update_clip)
+        self.Qc = BooleanLinear(D, D, name=f"{name}.Qc", generator=generator, device=device,
+                                boundary_nu=boundary_nu, init_inertia=init_inertia,
+                                update_clip=update_clip)
+        self.Qp = BooleanLinear(D, D, name=f"{name}.Qp", generator=generator, device=device,
+                                boundary_nu=boundary_nu, init_inertia=init_inertia,
+                                update_clip=update_clip)
         self._cache: dict = {}
         self._s_kc = self._s_pos = self._s_pay = None
         self._s_ptr = 0
@@ -347,11 +418,13 @@ class EpisodicSlotMemory:
             causal = causal & ((t - m) <= self.N)
         cmask = (~causal).unsqueeze(0)                     # (1,n,n)
 
-        score = torch.empty(B, n, n, dtype=torch.int32, device=c_bit.device)
-        for b in range(B):
-            content = brute.fast.matmul(qc_bit[b], kc_bit[b])      # (n,n)
-            position = brute.fast.matmul(qp_bit[b], pos_bit)       # (n,n)
-            score[b] = content + position
+        qc_int = pm1_int(qc_bit, dtype=torch.int32)
+        kc_int = pm1_int(kc_bit, dtype=torch.int32)
+        qp_int = pm1_int(qp_bit, dtype=torch.int32)
+        pos_int = pm1_int(pos_bit, dtype=torch.int32)
+        content = torch.bmm(qc_int, kc_int.transpose(1, 2))         # (B,n,n)
+        position = torch.matmul(qp_int, pos_int.transpose(0, 1))    # (B,n,n)
+        score = content + position
         score = score.masked_fill(cmask, self._NEG)
 
         kk = min(self.k, n, self.N or n)
@@ -359,17 +432,14 @@ class EpisodicSlotMemory:
             topv, topi = score.max(dim=2, keepdim=True)
         else:
             topv, topi = torch.topk(score, k=kk, dim=2)
-        valid_top = topv > (self._NEG // 2)
+        valid_top = (topv > (self._NEG // 2)) & (topv >= self.sink_threshold)
         no_slot = ~valid_top.any(dim=2)                    # (B,n)
 
-        read = torch.zeros(B, n, D, dtype=torch.int32, device=c_bit.device)
-        for b in range(B):
-            c_int = pm1_int(c_bit[b], dtype=torch.int32)             # (n,D)
-            sel = c_int[topi[b].reshape(-1)].reshape(n, kk, D)       # (n,kk,D)
-            sel = sel * valid_top[b].unsqueeze(-1)
-            r = sel.sum(dim=1)                                       # (n,D)
-            r = torch.where(no_slot[b].unsqueeze(-1), c_int, r)
-            read[b] = r
+        c_int = pm1_int(c_bit, dtype=torch.int32)                    # (B,n,D)
+        batch_idx = torch.arange(B, device=c_bit.device).view(B, 1, 1).expand(B, n, kk)
+        sel = c_int[batch_idx, topi]                                 # (B,n,kk,D)
+        read = (sel * valid_top.unsqueeze(-1)).sum(dim=2)             # (B,n,D)
+        read = torch.where(no_slot.unsqueeze(-1), c_int, read)
         read_bit = sign_to_bit1(read)
 
         self._cache = {
@@ -397,13 +467,13 @@ class EpisodicSlotMemory:
         if am is not None and am.shape[0] == B * n:
             r_int = r_int * am.reshape(B, n, 1).to(r_int.dtype)
 
-        acc = torch.zeros(B, n, D, dtype=torch.int32, device=a_star_read.device)
-        for b in range(B):
-            for j in range(kk):
-                idx = topi[b, :, j]                         # (n,)
-                src = r_int[b] * valid_top[b, :, j].unsqueeze(-1)
-                acc[b].index_add_(0, idx, src)
-            acc[b] += no_slot[b].unsqueeze(-1) * r_int[b]   # no-slot rows: identity
+        flat_acc = torch.zeros(B * n, D, dtype=torch.int32, device=a_star_read.device)
+        batch_base = (torch.arange(B, device=a_star_read.device) * n).view(B, 1, 1)
+        flat_idx = (batch_base + topi).reshape(-1)
+        src = (r_int.unsqueeze(2) * valid_top.unsqueeze(-1)).reshape(-1, D)
+        flat_acc.index_add_(0, flat_idx, src)
+        acc = flat_acc.reshape(B, n, D)
+        acc += no_slot.unsqueeze(-1) * r_int                 # no-slot rows: identity
         cur = c_bit.bool()
         out = torch.where(acc > 0, torch.ones_like(cur),
                           torch.where(acc < 0, torch.zeros_like(cur), cur))
@@ -411,7 +481,8 @@ class EpisodicSlotMemory:
 
     # ── §F local Hamming-margin objective (binary desired activations) ─────────
     def margin_loss(self, matched: torch.Tensor, *, theta_pos: float = 0.5,
-                    theta_neg: float = 0.0, weight: float = 1.0) -> float:
+                    theta_neg: float = 0.0, weight: float = 1.0,
+                    active_rows: Optional[torch.Tensor] = None) -> float:
         """Push the matched query/key pair above ``θ⁺`` (and the best distractor
         below ``θ⁻``) by emitting binary desired activations for the address
         projections and accumulating their integer ``ΔH`` (HÆMMR v2 §F).
@@ -424,6 +495,8 @@ class EpisodicSlotMemory:
         in_range = (matched >= 0) & (matched < n)
         safe_idx = matched.clamp(0, max(n - 1, 0))
         valid = in_range & torch.gather(causal, 2, safe_idx.unsqueeze(-1)).squeeze(-1)
+        if active_rows is not None:
+            valid = valid & active_rows.to(device=valid.device, dtype=torch.bool).reshape(B, n)
         if int(valid.sum()) == 0:
             return 0.0
         pos_score = torch.gather(score, 2, safe_idx.unsqueeze(-1)).squeeze(-1)
@@ -495,8 +568,10 @@ class EpisodicSlotMemory:
             position = torch.einsum("bd,bsd->bs", qp.int(), self._s_pos[:, :cnt].int())
             score = content + position
             sel = score.argmax(dim=1)
-            read = torch.gather(self._s_pay[:, :cnt], 1,
-                                sel.view(B, 1, 1).expand(B, 1, D)).squeeze(1)
+            best = score.gather(1, sel.view(B, 1)).squeeze(1)
+            picked = torch.gather(self._s_pay[:, :cnt], 1,
+                                  sel.view(B, 1, 1).expand(B, 1, D)).squeeze(1)
+            read = torch.where((best >= self.sink_threshold).view(B, 1), picked, c_int)
         kc = pm1_int(self.Kc.forward(c_bit)[0])
         pos_int = pm1_int(pos_bit) if getattr(pos_bit, "_is_bit1", False) else pos_bit.to(torch.int16)
         p = self._s_ptr
@@ -558,11 +633,19 @@ class BSR:
     def __init__(self, D: int, *, name: str = "bsr",
                  decay_shifts=(1, 2, 3, 4, 0),
                  generator: Optional[torch.Generator] = None, device=None,
-                 boundary_nu: Optional[float] = None):
+                 boundary_nu: Optional[float] = None,
+                 init_inertia: int = 1,
+                 update_clip: Optional[int] = None):
         self.D = D
-        self.K = BooleanLinear(D, D, name=f"{name}.K", generator=generator, device=device, boundary_nu=boundary_nu)
-        self.V = BooleanLinear(D, D, name=f"{name}.V", generator=generator, device=device, boundary_nu=boundary_nu)
-        self.Q = BooleanLinear(D, D, name=f"{name}.Q", generator=generator, device=device, boundary_nu=boundary_nu)
+        self.K = BooleanLinear(D, D, name=f"{name}.K", generator=generator, device=device,
+                               boundary_nu=boundary_nu, init_inertia=init_inertia,
+                               update_clip=update_clip)
+        self.V = BooleanLinear(D, D, name=f"{name}.V", generator=generator, device=device,
+                               boundary_nu=boundary_nu, init_inertia=init_inertia,
+                               update_clip=update_clip)
+        self.Q = BooleanLinear(D, D, name=f"{name}.Q", generator=generator, device=device,
+                               boundary_nu=boundary_nu, init_inertia=init_inertia,
+                               update_clip=update_clip)
         self.shifts = pow2_decay_shifts(D, decay_shifts, device=device)        # (D,)
         self._cache: dict = {}
         self._stream_A: Optional[torch.Tensor] = None
