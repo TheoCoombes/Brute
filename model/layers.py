@@ -203,37 +203,17 @@ class ResidualMerge:
 class TokenCodebook:
     """Binary token codes with a frozen input geometry and trainable output ``E``.
 
-    The output codebook is the existing :class:`BepParam` named ``E`` so the
-    locked decode matmul is unchanged.  For default balanced-hash initialisation,
-    input rows are regenerated from token ids and ``seed`` instead of stored in
-    a second ``V x D`` tensor; this unties input/output without adding another
-    per-weight accumulator.  Arbitrary offline initialisers cannot be regenerated
-    under that memory constraint, so they remain tied opt-in ablations.
+    Input rows are regenerated from token ids and ``seed`` (never stored as a
+    second V×D tensor), keeping input/output untied without extra per-weight state.
     """
 
     def __init__(self, vocab_size: int, D: int, *, name: str = "E",
                  structured: bool = False, bef_alpha: float = 1.0, bef_sweeps: int = 30,
-                 init_pm1: Optional[torch.Tensor] = None,
                  generator: Optional[torch.Generator] = None, device=None,
                  seed: int = 0):
         self.V, self.D = vocab_size, D
-        self._input_seed: Optional[int] = None
+        self._input_seed = int(seed) if structured else int(seed) ^ 0x5EED_5EED
         self._embed_cache: dict = {}
-        if init_pm1 is not None:
-            # Precomputed prototypes (e.g. an offline GPT-2 SimHash codebook).
-            if tuple(init_pm1.shape) != (vocab_size, D):
-                raise ValueError(
-                    f"init_pm1 shape {tuple(init_pm1.shape)} != ({vocab_size}, {D})")
-            frame = init_pm1
-            bit = brute.as_tensor(frame > 0, dtype=brute.bit1)
-            if device is not None:
-                bit = bit.to(device)
-            self.E = BepParam(pm1_int(bit) * _CODEBOOK_INIT_INERTIA, name=name)
-            return
-        elif structured:
-            self._input_seed = int(seed)
-        else:
-            self._input_seed = int(seed) ^ 0x5EED_5EED
 
         dev = device
         H = torch.empty(vocab_size, D, dtype=torch.int16, device=dev)
@@ -252,13 +232,10 @@ class TokenCodebook:
     def embed(self, ids: torch.Tensor) -> brute.Tensor:
         B, n = ids.shape
         flat = ids.reshape(-1).long()
-        if self._input_seed is None:
-            rows = self.E.bit[flat]                        # offline ablation: tied
-        else:
-            uniq, inv = torch.unique(flat, sorted=False, return_inverse=True)
-            row_bits = balanced_hash_frame_bool(uniq, self.D, seed=self._input_seed,
-                                                device=flat.device)
-            rows = brute.as_tensor(row_bits[inv], dtype=brute.bit1)
+        uniq, inv = torch.unique(flat, sorted=False, return_inverse=True)
+        row_bits = balanced_hash_frame_bool(uniq, self.D, seed=self._input_seed,
+                                            device=flat.device)
+        rows = brute.as_tensor(row_bits[inv], dtype=brute.bit1)
         self._embed_cache = {"ids": flat, "shape": (B, n)}
         return rows.reshape(B, n, self.D) if rows.dim() == 2 else rows
 

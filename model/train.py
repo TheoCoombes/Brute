@@ -15,9 +15,8 @@ Useful flags::
 
     --D            concept hypervector dimension
     --layers       number of Boolean blocks
-    --codebook-mode {offline,structured,random}
-                  structured balanced hash by default; offline = GPT-2 SimHash
-                  ablation; random = alternate balanced hash seed
+    --codebook-mode {structured,random}
+                  structured balanced hash by default; random = alternate balanced hash seed
     --r            margin trigger fraction for lexical updates
     --bits         hidden-weight clamp width
     --block-init-inertia
@@ -54,7 +53,7 @@ from data import make_lm_batches, wikitext
 from model import HaemmrConfig, HaemmrLM, IGNORE_INDEX
 
 
-CODEBOOK_MODES = ("offline", "structured", "random")
+CODEBOOK_MODES = ("structured", "random")
 
 
 def auto_device(choice):
@@ -149,8 +148,7 @@ def main():
         "--codebook-mode",
         choices=CODEBOOK_MODES,
         default="structured",
-        help="structured balanced hash by default; offline uses GPT-2 SimHash; "
-             "random uses an alternate balanced hash seed.",
+        help="structured balanced hash by default; random uses an alternate balanced hash seed.",
     )
     p.add_argument("--bef-sweeps", type=int, default=30)
     p.add_argument("--sem-weight", type=float, default=0.5,
@@ -178,7 +176,6 @@ def main():
 
     codebook_mode = args.codebook_mode
     structured_codebook = codebook_mode != "random"
-    offline_codebook = codebook_mode == "offline"
 
     print(f"loading {args.dataset} with full GPT-2 tokenizer (codebook={codebook_mode}) …")
     corpus = wikitext(name=args.dataset, data_root=args.data_root,
@@ -212,13 +209,7 @@ def main():
                        flip_dropout=args.flip_dropout,
                        r=args.r, p_r=args.p_r, bits=args.bits,
                        )
-    codebook_init = None
-    if offline_codebook:
-        from codebook import from_corpus
-        print(f"building offline GPT-2 SimHash codebook (D={args.D}) …")
-        codebook_init = from_corpus(corpus, args.D, seed=args.seed,
-                                    cache_dir=str(Path(args.data_root) / "codebook"))
-    model = HaemmrLM(cfg, device=device, codebook_init=codebook_init)
+    model = HaemmrLM(cfg, device=device)
     opt = BepOptimizer(model.parameters(),
                        BepConfig(r=args.r, p_r=args.p_r, bits=args.bits))
     n_bits = model.num_bit_parameters()
@@ -295,7 +286,7 @@ def main():
             print(f"  sample[{args.prompt!r}]: {txt}")
 
     torch.save({"model": model.state_dict(), "opt": opt.state_dict(),
-                "vocab_size": V, "compact_to_gpt2": corpus.compact_to_gpt2},
+                "vocab_size": V},
                args.ckpt)
     print(f"saved checkpoint → {args.ckpt}")
     if csv_f:

@@ -18,7 +18,6 @@ class Corpus:
     train_ids: torch.Tensor          # 1-D int64 GPT-2 token ids
     val_ids: torch.Tensor            # 1-D int64 GPT-2 token ids
     vocab_size: int                  # full tokenizer size
-    compact_to_gpt2: torch.Tensor    # (vocab_size,) int64
     tokenizer: object
 
     def decode(self, ids: torch.Tensor) -> str:
@@ -69,10 +68,9 @@ def wikitext(
         train_gpt2 = train_gpt2[:max_train_tokens]
 
     vocab_size = int(tok.vocab_size)
-    compact_to_gpt2 = torch.arange(vocab_size, dtype=torch.long)
 
     return Corpus(train_ids=train_gpt2, val_ids=val_gpt2, vocab_size=vocab_size,
-                  compact_to_gpt2=compact_to_gpt2, tokenizer=tok)
+                  tokenizer=tok)
 
 
 def make_lm_batches(ids: torch.Tensor, *, seq_len: int,

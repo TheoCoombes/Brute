@@ -257,8 +257,7 @@ class Block:
 # ── the model ────────────────────────────────────────────────────────────────
 
 class HaemmrLM:
-    def __init__(self, cfg: HaemmrConfig, *, device=None,
-                 codebook_init: Optional[torch.Tensor] = None):
+    def __init__(self, cfg: HaemmrConfig, *, device=None):
         self.cfg = cfg
         self.training = True
         self.device = torch.device(device) if device is not None else torch.device("cpu")
@@ -266,12 +265,9 @@ class HaemmrLM:
         gen = torch.Generator(device="cpu").manual_seed(int(cfg.seed))
         nu = cfg.boundary_nu
 
-        # ``codebook_init`` (V, D) ±1 floats overrides BEF/random init — e.g. an
-        # offline GPT-2 SimHash codebook (see codebook.py).
         self.codebook = TokenCodebook(cfg.vocab_size, cfg.D, name="E",
                                       structured=cfg.structured_codebook,
                                       bef_alpha=cfg.bef_alpha, bef_sweeps=cfg.bef_sweeps,
-                                      init_pm1=codebook_init,
                                       generator=gen, device=self.device,
                                       seed=cfg.seed)
         self.input_bind = DiagBind(cfg.D, name="in", generator=gen, device=self.device,
