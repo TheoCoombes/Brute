@@ -1,25 +1,31 @@
-"""HÆMMR — a binary-first, concept-native autoregressive language model (BEP).
+"""A native **binary decoder transformer** — token↔token attention, BEP-trained.
 
-Architecture (unchanged from v2 — separation of concerns by job/role)::
+This is a 1:1 binary-native equivalent of a standard decoder transformer, built
+entirely on packed ``brute.bit1`` (uint64) tensors::
 
-    token → E_lex(t)  ── input-bind ──▶  position-free concept c_i
-        ┌───────────────────────────────────────────────────────────────┐ ×L
-        │  r = delta-BSR(c)              # compressed discourse (§B2)      │
-        │  e = EpisodicSlots(c, POS)     # exact in-window recall (§B1)    │
-        │  h = HopfieldBank(c)           # learned global priors (§B3)     │
-        │  m = channel-mix(c)            # binary MLP                       │
-        └───────────────────────────────────────────────────────────────┘
-        ── out-bind ──▶ next-token concept ĉ  (position-free)
-        ── lex-proj ──▶ ℓ̂ ── decode against trainable output codebook ──▶ logits
+    token → E(t)  ── input-bind ──▶  position-free concept  x_i ∈ 𝔹^D
+        ┌──────────────────────────────────────────────────────────────┐ ×L
+        │  a = BinaryMultiHeadAttention(x)     # token↔token (ALiBi, causal) │
+        │  x = maj3(x, a, c_A)                 # majority residual          │
+        │  f = BinaryGLU(x)                    # exact XNOR-gated FFN        │
+        │  x = maj3(x, f, c_F)                 # majority residual          │
+        └──────────────────────────────────────────────────────────────┘
+        ── out-bind ──▶ ĉ ── lex-proj ──▶ ℓ̂ ── tied-codebook Hamming ──▶ logits
+
+Sequence mixing is one native :class:`~attention.BinaryMultiHeadAttention` (no
+recurrence, no associative bank, no slot memory): queries, keys and values are
+1-bit projections per head, scores are XNOR-popcount signed dot products on an
+integer register, position is a relative integer ALiBi bias, and the value
+combine is a packed gather (hardmax) or an int8 vote bundle (soft).
 
 Training is **BEP** (Boolean error propagation): the only large buffer per
 parameter is the integer hidden weight ``H`` (Int16); the visible weight is
 ``W = sign(H)``.  The backward pass threads **binary desired activations** ``a*``
-(bit1) — never a float signal — and the head is **contrastive margin-triggered**:
-an update fires for a position only when ``logit[target] − max_other < r·D``.
-The desired lexical activation votes only where the target and best wrong
-prototype differ, and the output codebook receives a symmetric integer
-perceptron update.  No softmax/CE on the backward path.
+(bit1) — never a float signal — and the head is **contrastive margin-triggered**
+(an update fires for a position only when ``logit[target] − max_other < r·D``).
+The attention score lane (``W_Q, W_K``) is trained by a per-head Hamming-margin
+objective supervised by the self-supervised induction signal.  No softmax/CE on
+the backward path.
 """
 
 from __future__ import annotations
@@ -34,81 +40,77 @@ import brute
 
 import bep
 from bep import BepParam, combine_desired, mux
-from layers import (
-    BSR, BooleanLinear, DiagBind, EpisodicSlotMemory, HopfieldBank,
-    ResidualMerge, TokenCodebook,
-)
-from vsa import hierarchical_position_codes, to_bit1
+from attention import BinaryMultiHeadAttention
+from layers import BinaryGLU, BooleanLinear, DiagBind, MajorityResidual, TokenCodebook
 
 
 IGNORE_INDEX = -1
 
 
 @dataclass
-class HaemmrConfig:
+class TransformerConfig:
     vocab_size: int = 50257              # GPT-2 tokenizer size; training overrides from data
-    D: int = 1024                       # concept hypervector dimension
+    D: int = 512                        # concept hypervector / model dimension
     n_layers: int = 2
-    d_ff: int = 2048                    # channel-mix hidden width
-    # episodic slot memory (§B1) — the exact-recall fix
-    epi_read_k: int = 1
-    epi_slots: Optional[int] = None
-    epi_sink_threshold: Optional[int] = None
-    # latent Hopfield priors (§B3)
-    n_slots: int = 256
-    top_k: int = 15
-    # delta-BSR decay palette (§B2)
-    decay_shifts: tuple = (1, 2, 3, 4, 0)
-    # representation / positions (§A)
-    use_position: bool = True
-    pos_chunk: int = 256
-    # decode (§C1)
+    n_heads: int = 4                    # D // n_heads must be a multiple of 64
+    d_ff: int = 1024                    # GLU hidden width
+    # attention
+    attn_mode: str = "soft"             # 'soft' (int8 vote bundle) | 'hardmax' (gather)
+    attn_band: int = 1                  # soft attention integer margin band (≥1)
+    alibi: bool = True                  # relative integer ALiBi score bias
+    causal: bool = True                 # causal mask (j ≤ i)
+    causal_strict: bool = False         # exclude self (j < i): recency selects i-1
+    value_proj: bool = True             # True: learned W_V/W_O; False: raw-concept copy
+    alibi_slopes_override: Optional[tuple] = None  # explicit per-head integer slopes
+    # readout / codebook
     structured_codebook: bool = True
     bef_alpha: float = 1.0
     bef_sweeps: int = 30
-    sem_weight: float = 0.5
-    hopfield_cleanup: bool = False
-    cleanup_slots: int = 256
-    cleanup_top_k: int = 7
-    # BEP training (margin trigger + fixed prototypes, eligibility gate, reinforcement)
+    sem_weight: float = 0.5             # semantic rerank lane weight (0 disables)
+    # BEP training (margin trigger + fixed prototypes, reinforcement)
     r: float = 0.1                      # margin trigger: logit[tgt] − max_other < r·D
     train_output_codebook: bool = True
-    margin_r_final: Optional[float] = None  # optional final r after annealing
-    margin_anneal_steps: int = 0            # steps after readout warmup
-    readout_warmup_steps: int = 0           # codebook-only early steps
-    max_trigger_rate: Optional[float] = None  # cap actual hidden BEP rows
-    boundary_nu: Optional[float] = None  # eligibility gate |z| ≤ ν·in_dim (stage-2; off)
-    p_r: float = 0.0                    # CP+R reinforcement probability (BEP §3.3)
-    bits: int = 15                      # integer hidden-weight H bit-width
-    init_inertia: int = 1               # default non-codebook initial |H|
-    update_clip: Optional[int] = None   # default non-codebook elementwise ΔH clamp
-    block_init_inertia: Optional[int] = None  # override for stacked blocks
-    block_update_clip: Optional[int] = None   # override for stacked blocks
+    margin_r_final: Optional[float] = None
+    margin_anneal_steps: int = 0
+    readout_warmup_steps: int = 0
+    max_trigger_rate: Optional[float] = None
+    boundary_nu: Optional[float] = None
+    p_r: float = 0.0
+    bits: int = 15
+    init_inertia: int = 1
+    update_clip: Optional[int] = None
+    block_init_inertia: Optional[int] = None
+    block_update_clip: Optional[int] = None
     flip_dropout: float = 0.0
-    # §F episodic address-margin objective
+    # attention score-lane margin objective
     margin_theta_pos: float = 0.5
     margin_theta_neg: float = 0.0
     margin_weight: float = 1.0
     self_supervised_induction: bool = True
-    # misc
-    gate_open: float = 0.05
-    # component ablation flags (for sweep experiments)
-    use_bsr: bool = True
-    use_episodic: bool = True
-    use_hopfield: bool = True
+    # binary residual: 'mux' (branch replaces skip — copy/retrieval) | 'majority'
+    # (maj3(skip, branch, c) — BOLD-faithful, aggregation)
+    residual_mode: str = "mux"
+    gate_open: float = 0.05             # residual gate initial openness (→ identity init)
+    residual_c_p_true: float = 0.5
     seed: int = 0
 
     def __post_init__(self):
         if self.D <= 0:
             raise ValueError("D must be positive")
-        if self.epi_read_k <= 0:
-            raise ValueError("epi_read_k must be positive")
-        if self.epi_slots is not None and self.epi_slots <= 0:
-            raise ValueError("epi_slots must be positive when set")
-        if self.epi_sink_threshold is not None and self.epi_sink_threshold < 0:
-            raise ValueError("epi_sink_threshold must be non-negative when set")
-        if self.pos_chunk <= 0:
-            raise ValueError("pos_chunk must be positive")
+        if self.n_heads <= 0 or self.D % self.n_heads != 0:
+            raise ValueError("n_heads must divide D")
+        if (self.D // self.n_heads) % 64 != 0:
+            raise ValueError("D // n_heads must be a multiple of 64 (packed head dim)")
+        if self.attn_mode not in ("soft", "hardmax"):
+            raise ValueError("attn_mode must be 'soft' or 'hardmax'")
+        if self.residual_mode not in ("mux", "majority"):
+            raise ValueError("residual_mode must be 'mux' or 'majority'")
+        if self.attn_band < 1:
+            raise ValueError("attn_band must be >= 1")
+        if not 0.0 <= self.gate_open <= 1.0:
+            raise ValueError("gate_open must be in [0, 1]")
+        if self.d_ff <= 0:
+            raise ValueError("d_ff must be positive")
         if self.sem_weight < 0:
             raise ValueError("sem_weight must be non-negative")
         if not 0.0 <= self.flip_dropout < 1.0:
@@ -133,131 +135,67 @@ class HaemmrConfig:
             raise ValueError("max_trigger_rate must be in (0, 1] when set")
 
 
-# ── channel-mixing MLP (two Boolean linears) ───────────────────────────────────
-
-class ChannelMix:
-    def __init__(self, D: int, d_ff: int, *, name: str, generator=None, device=None,
-                 boundary_nu=None, init_inertia: int = 1,
-                 update_clip: Optional[int] = None):
-        self.D, self.d_ff = D, d_ff
-        self.lin1 = BooleanLinear(D, d_ff, name=f"{name}.lin1", generator=generator,
-                                  device=device, boundary_nu=boundary_nu,
-                                  init_inertia=init_inertia,
-                                  update_clip=update_clip)
-        self.lin2 = BooleanLinear(d_ff, D, name=f"{name}.lin2", generator=generator,
-                                  device=device, boundary_nu=boundary_nu,
-                                  init_inertia=init_inertia,
-                                  update_clip=update_clip)
-
-    def params(self) -> List[BepParam]:
-        return self.lin1.params() + self.lin2.params()
-
-    def forward(self, x_bit: brute.Tensor) -> brute.Tensor:
-        h_bit, _ = self.lin1.forward(x_bit)
-        m_bit, _ = self.lin2.forward(h_bit)
-        return m_bit
-
-    def backward(self, a_star: brute.Tensor) -> brute.Tensor:
-        a_h = self.lin2.backward(a_star)
-        return self.lin1.backward(a_h)
-
-
-# ── one Boolean block ──────────────────────────────────────────────────────────
+# ── one binary transformer block: MHA → maj-residual → GLU → maj-residual ───────
 
 class Block:
-    def __init__(self, cfg: HaemmrConfig, *, idx: int, generator=None, device=None):
+    def __init__(self, cfg: TransformerConfig, *, idx: int, generator=None, device=None):
         D = cfg.D
         self.cfg = cfg
         nm = f"blk{idx}"
         nu = cfg.boundary_nu
         init_inertia = cfg.block_init_inertia or cfg.init_inertia
         update_clip = cfg.block_update_clip if cfg.block_update_clip is not None else cfg.update_clip
-        self.bsr = BSR(D, name=f"{nm}.bsr", decay_shifts=cfg.decay_shifts,
-                       generator=generator, device=device, boundary_nu=nu,
-                       init_inertia=init_inertia, update_clip=update_clip)
-        self.merge_bsr = ResidualMerge(D, name=f"{nm}.merge_bsr", p_open=cfg.gate_open,
-                                       generator=generator, device=device,
-                                       init_inertia=init_inertia, update_clip=update_clip)
-        self.epi = EpisodicSlotMemory(D, name=f"{nm}.epi", read_k=cfg.epi_read_k,
-                                      n_slots=cfg.epi_slots, generator=generator,
-                                      device=device, boundary_nu=nu,
-                                      sink_threshold=cfg.epi_sink_threshold,
+        self.mha = BinaryMultiHeadAttention(
+            D, cfg.n_heads, name=f"{nm}.mha", attn_mode=cfg.attn_mode, alibi=cfg.alibi,
+            causal=cfg.causal, causal_strict=cfg.causal_strict, attn_band=cfg.attn_band,
+            value_proj=cfg.value_proj, alibi_slopes_override=cfg.alibi_slopes_override,
+            generator=generator, device=device,
+            boundary_nu=nu, init_inertia=init_inertia, update_clip=update_clip)
+        self.res_a = MajorityResidual(D, name=f"{nm}.res_a", mode=cfg.residual_mode,
+                                      p_open=cfg.gate_open, c_p_true=cfg.residual_c_p_true,
+                                      value_path=True, generator=generator, device=device,
                                       init_inertia=init_inertia, update_clip=update_clip)
-        self.merge_epi = ResidualMerge(D, name=f"{nm}.merge_epi", p_open=cfg.gate_open,
-                                       value_path=True, generator=generator, device=device,
-                                       init_inertia=init_inertia, update_clip=update_clip)
-        self.hop = HopfieldBank(D, cfg.n_slots, cfg.top_k, name=f"{nm}.hop",
-                                generator=generator, device=device,
-                                init_inertia=init_inertia, update_clip=update_clip)
-        self.merge_hop = ResidualMerge(D, name=f"{nm}.merge_hop", p_open=cfg.gate_open,
-                                       generator=generator, device=device,
-                                       init_inertia=init_inertia, update_clip=update_clip)
-        self.mix = ChannelMix(D, cfg.d_ff, name=f"{nm}.mix", generator=generator,
-                              device=device, boundary_nu=nu,
-                              init_inertia=init_inertia, update_clip=update_clip)
-        self.merge_mix = ResidualMerge(D, name=f"{nm}.merge_mix", p_open=cfg.gate_open,
-                                       generator=generator, device=device,
-                                       init_inertia=init_inertia, update_clip=update_clip)
-        self._shape = None
+        self.glu = BinaryGLU(D, cfg.d_ff, name=f"{nm}.glu", generator=generator, device=device,
+                             boundary_nu=nu, init_inertia=init_inertia, update_clip=update_clip)
+        self.res_f = MajorityResidual(D, name=f"{nm}.res_f", mode=cfg.residual_mode,
+                                      p_open=cfg.gate_open, c_p_true=cfg.residual_c_p_true,
+                                      value_path=False, generator=generator, device=device,
+                                      init_inertia=init_inertia, update_clip=update_clip)
         self._cache: dict = {}
 
     def params(self) -> List[BepParam]:
-        return (self.bsr.params() + self.merge_bsr.params()
-                + self.epi.params() + self.merge_epi.params()
-                + self.hop.params() + self.merge_hop.params()
-                + self.mix.params() + self.merge_mix.params())
+        return (self.mha.params() + self.res_a.params()
+                + self.glu.params() + self.res_f.params())
 
-    def forward(self, c_bit: brute.Tensor, pos_bit: brute.Tensor) -> brute.Tensor:
-        B, n, D = c_bit.shape
-        self._shape = (B, n, D)
-        if self.cfg.use_bsr:
-            r = self.bsr.forward(c_bit)
-        else:
-            r = c_bit
-        c1 = self.merge_bsr.forward(c_bit, r)
-        if self.cfg.use_episodic:
-            e = self.epi.forward(c1, pos_bit)
-        else:
-            e = c1
-        c2 = self.merge_epi.forward(c1, e)
-        if self.cfg.use_hopfield:
-            h = self.hop.forward(c2.reshape(B * n, D)).reshape(B, n, D)
-        else:
-            h = c2
-        c3 = self.merge_hop.forward(c2, h)
-        m = self.mix.forward(c3.reshape(B * n, D)).reshape(B, n, D)
-        c4 = self.merge_mix.forward(c3, m)
-        self._cache = {"c_bit": c_bit, "c1": c1, "c2": c2, "c3": c3}
-        return c4
+    def forward(self, x_bit: brute.Tensor) -> brute.Tensor:
+        B, n, D = x_bit.shape
+        a = self.mha.forward(x_bit)                       # attention sublayer
+        x2 = self.res_a.forward(x_bit, a)                 # majority residual
+        f = self.glu.forward(x2.reshape(B * n, D)).reshape(B, n, D)   # FFN sublayer
+        x4 = self.res_f.forward(x2, f)                    # majority residual
+        self._cache = {"shape": (B, n, D), "x_bit": x_bit, "x2": x2}
+        return x4
 
-    def backward(self, a_c4: brute.Tensor) -> brute.Tensor:
-        B, n, D = self._shape
-        c_bit, c1, c2, c3 = (self._cache["c_bit"], self._cache["c1"],
-                             self._cache["c2"], self._cache["c3"])
-        a_c3_s, a_m = self.merge_mix.backward(a_c4)
-        a_c3_t = self.mix.backward(a_m.reshape(B * n, D)).reshape(B, n, D)
-        a_c3 = combine_desired(a_c3_s, a_c3_t, c3)
-        a_c2_s, a_h = self.merge_hop.backward(a_c3)
-        if self.cfg.use_hopfield:
-            self.hop.backward(a_h.reshape(B * n, D))       # no upstream signal
-        a_c2 = a_c2_s
-        a_c1_s, a_e = self.merge_epi.backward(a_c2)
-        if self.cfg.use_episodic:
-            a_c1_t = self.epi.backward(a_e)
-            a_c1 = combine_desired(a_c1_s, a_c1_t, c1)
-        else:
-            a_c1 = a_c1_s
-        a_c_s, a_r = self.merge_bsr.backward(a_c1)
-        if self.cfg.use_bsr:
-            a_c_t = self.bsr.backward(a_r)
-            return combine_desired(a_c_s, a_c_t, c_bit)
-        return a_c_s
+    def backward(self, x4_star: brute.Tensor) -> brute.Tensor:
+        B, n, D = self._cache["shape"]
+        x_bit, x2 = self._cache["x_bit"], self._cache["x2"]
+        x2_skip, f_star = self.res_f.backward(x4_star)
+        x2_trans = self.glu.backward(f_star.reshape(B * n, D)).reshape(B, n, D)
+        x2_star = combine_desired(x2_skip, x2_trans, x2)
+        x_skip, a_star = self.res_a.backward(x2_star)
+        x_trans = self.mha.backward(a_star)
+        return combine_desired(x_skip, x_trans, x_bit)
+
+    def margin_loss(self, matched: torch.Tensor, *, theta_pos: float, theta_neg: float,
+                    active_rows: Optional[torch.Tensor]) -> float:
+        return self.mha.margin_loss(matched, theta_pos=theta_pos, theta_neg=theta_neg,
+                                    active_rows=active_rows)
 
 
 # ── the model ────────────────────────────────────────────────────────────────
 
-class HaemmrLM:
-    def __init__(self, cfg: HaemmrConfig, *, device=None):
+class BinaryTransformerLM:
+    def __init__(self, cfg: TransformerConfig, *, device=None):
         self.cfg = cfg
         self.training = True
         self.device = torch.device(device) if device is not None else torch.device("cpu")
@@ -268,37 +206,18 @@ class HaemmrLM:
         self.codebook = TokenCodebook(cfg.vocab_size, cfg.D, name="E",
                                       structured=cfg.structured_codebook,
                                       bef_alpha=cfg.bef_alpha, bef_sweeps=cfg.bef_sweeps,
-                                      generator=gen, device=self.device,
-                                      seed=cfg.seed)
+                                      generator=gen, device=self.device, seed=cfg.seed)
         self.input_bind = DiagBind(cfg.D, name="in", generator=gen, device=self.device,
-                                   init_inertia=cfg.init_inertia,
-                                   update_clip=cfg.update_clip)
+                                   init_inertia=cfg.init_inertia, update_clip=cfg.update_clip)
         self.blocks = [Block(cfg, idx=i, generator=gen, device=self.device)
                        for i in range(cfg.n_layers)]
         self.out_bind = DiagBind(cfg.D, name="out", generator=gen, device=self.device,
-                                 init_inertia=cfg.init_inertia,
-                                 update_clip=cfg.update_clip)
+                                 init_inertia=cfg.init_inertia, update_clip=cfg.update_clip)
         self.lex_proj = BooleanLinear(cfg.D, cfg.D, name="lex", generator=gen,
                                       device=self.device, boundary_nu=nu,
-                                      init_inertia=cfg.init_inertia,
-                                      update_clip=cfg.update_clip)
+                                      init_inertia=cfg.init_inertia, update_clip=cfg.update_clip)
         self.sem_bind = DiagBind(cfg.D, name="sem", generator=gen, device=self.device,
-                                 init_inertia=cfg.init_inertia,
-                                 update_clip=cfg.update_clip)
-        if cfg.hopfield_cleanup:
-            self.cleanup_hop = HopfieldBank(cfg.D, cfg.cleanup_slots, cfg.cleanup_top_k,
-                                            name="clean", generator=gen, device=self.device,
-                                            init_inertia=cfg.init_inertia,
-                                            update_clip=cfg.update_clip)
-            self.cleanup_merge = ResidualMerge(cfg.D, name="clean.merge", p_open=cfg.gate_open,
-                                               generator=gen, device=self.device,
-                                               init_inertia=cfg.init_inertia,
-                                               update_clip=cfg.update_clip)
-
-        self.pos_chunk_base = (torch.randint(0, 2, (cfg.D,), generator=gen).float() * 2 - 1).to(self.device)
-        self.pos_offset_base = (torch.randint(0, 2, (cfg.D,), generator=gen).float() * 2 - 1).to(self.device)
-        self._pos_cache: dict = {}
-        self._neutral_pos_cache: dict = {}
+                                 init_inertia=cfg.init_inertia, update_clip=cfg.update_clip)
         self._fwd_cache: dict = {}
         self._train_step = 0
 
@@ -308,8 +227,6 @@ class HaemmrLM:
         for b in self.blocks:
             ps += b.params()
         ps += self.out_bind.params() + self.lex_proj.params() + self.sem_bind.params()
-        if self.cfg.hopfield_cleanup:
-            ps += self.cleanup_hop.params() + self.cleanup_merge.params()
         return ps
 
     def num_bit_parameters(self) -> int:
@@ -322,43 +239,18 @@ class HaemmrLM:
     def state_dict(self) -> dict:
         return {
             "cfg": self.cfg.__dict__,
-            "pos_chunk_base": self.pos_chunk_base.detach().cpu().clone(),
-            "pos_offset_base": self.pos_offset_base.detach().cpu().clone(),
             "train_step": self._train_step,
             "params": {p.name: p.state_dict() for p in self.parameters()},
         }
 
     def load_state_dict(self, sd: dict) -> None:
-        self.pos_chunk_base = sd["pos_chunk_base"].to(self.device)
-        self.pos_offset_base = sd["pos_offset_base"].to(self.device)
         self._train_step = int(sd.get("train_step", 0))
         byname = {p.name: p for p in self.parameters()}
         for name, psd in sd["params"].items():
             if name in byname:
                 byname[name].load_state_dict(psd)
-        self._pos_cache.clear()
-        self._neutral_pos_cache.clear()
 
-    # ── positions (address lane only — never bound into the decoded concept) ───
-    def _positions(self, n: int):
-        if self._pos_cache.get("n", -1) < n:
-            codes = hierarchical_position_codes(self.pos_chunk_base, self.pos_offset_base,
-                                                n, chunk=self.cfg.pos_chunk)
-            self._pos_cache = {"n": n, "bit": codes}
-        return self._pos_cache["bit"][:n]
-
-    def _position_lane(self, n: int):
-        if self.cfg.use_position:
-            return self._positions(n)
-        if self._neutral_pos_cache.get("n", -1) < n:
-            ones = torch.ones(n, self.cfg.D, dtype=torch.bool, device=self.device)
-            self._neutral_pos_cache = {
-                "n": n,
-                "bit": brute.as_tensor(ones, dtype=brute.bit1).to(self.device),
-            }
-        return self._neutral_pos_cache["bit"][:n]
-
-    # ── flip-dropout (train against the deployment bit-flip noise model, §D) ──
+    # ── flip-dropout (train against the deployment bit-flip noise model) ──────
     def _flip_noise(self, c_bit: brute.Tensor):
         rate = self.cfg.flip_dropout
         if not self.training or rate <= 0:
@@ -373,7 +265,6 @@ class HaemmrLM:
         ids = ids.to(self.device)
         B, n = ids.shape
         D = self.cfg.D
-        pos_bit = self._position_lane(n)
 
         emb = self.codebook.embed(ids)
         c = self.input_bind.forward(emb)
@@ -381,14 +272,8 @@ class HaemmrLM:
         for blk in self.blocks:
             c, fbit = self._flip_noise(c)
             flip_masks.append(fbit)
-            c = blk.forward(c, pos_bit)
+            c = blk.forward(c)
         chat = self.out_bind.forward(c)
-
-        cleanup_cache = None
-        if self.cfg.hopfield_cleanup:
-            hc = self.cleanup_hop.forward(chat.reshape(B * n, D)).reshape(B, n, D)
-            chat = self.cleanup_merge.forward(chat, hc)
-            cleanup_cache = True
 
         chat_flat = chat.reshape(B * n, D)
         ell_bit, _ = self.lex_proj.forward(chat_flat)
@@ -404,13 +289,18 @@ class HaemmrLM:
 
         self._fwd_cache = {
             "B": B, "n": n, "ell_bit": ell_bit, "sem_bit": sem_bit,
-            "chat_flat": chat_flat, "flip_masks": flip_masks, "cleanup": cleanup_cache,
-            "ids": ids,
+            "chat_flat": chat_flat, "flip_masks": flip_masks, "ids": ids,
         }
         return logits
 
     def _synth_induction_matched(self, targets: torch.Tensor) -> torch.Tensor:
-        """Most recent previous position whose follower equals this target."""
+        """Most recent previous position whose follower equals this target.
+
+        The self-supervised induction signal: for query ``i`` with target token
+        ``t``, find the latest ``m < i`` whose own target equals ``t`` — i.e. the
+        position attention should copy from.  Returns ``(B, n)`` long (``-1`` =
+        none).
+        """
         B, n = self._fwd_cache["B"], self._fwd_cache["n"]
         tgt = targets.to(self.device).reshape(B, n).long()
         valid_t = tgt != IGNORE_INDEX
@@ -490,7 +380,8 @@ class HaemmrLM:
         proto = self.codebook.prototype(safe_tgt)          # (M, D) bit1
         wrong_proto = self.codebook.prototype(wrong)
         agree = brute.fast.eq(proto, wrong_proto)
-        sel = to_bit1(hidden_trigger.unsqueeze(1).expand(M, D))
+        sel = brute.as_tensor(hidden_trigger.unsqueeze(1).expand(M, D).contiguous(),
+                              dtype=brute.bit1)
         ell_bit = self._fwd_cache["ell_bit"]
         ell_margin_des = mux(agree, ell_bit, proto)
         ell_des = mux(sel, ell_margin_des, ell_bit)
@@ -511,24 +402,17 @@ class HaemmrLM:
             g_chat = combine_desired(g_chat, g_chat_sem, chat_flat)
         g_chat = g_chat.reshape(B, n, D)
 
-        if self._fwd_cache["cleanup"]:
-            g_chat_skip, g_hc = self.cleanup_merge.backward(g_chat)
-            self.cleanup_hop.backward(g_hc.reshape(B * n, D))
-            g_chat = g_chat_skip
-
         g_c = self.out_bind.backward(g_chat)
 
         margin_val = 0.0
-        if (matched is None and cfg.self_supervised_induction
-                and cfg.margin_weight > 0 and cfg.use_episodic):
+        if (matched is None and cfg.self_supervised_induction and cfg.margin_weight > 0):
             matched = self._synth_induction_matched(targets)
-        if matched is not None and cfg.margin_weight > 0 and cfg.use_episodic:
+        if matched is not None and cfg.margin_weight > 0:
             active_rows = hidden_trigger.reshape(B, n)
             for blk in self.blocks:
-                margin_val += blk.epi.margin_loss(
+                margin_val += blk.margin_loss(
                     matched.to(self.device), theta_pos=cfg.margin_theta_pos,
-                    theta_neg=cfg.margin_theta_neg, weight=cfg.margin_weight,
-                    active_rows=active_rows)
+                    theta_neg=cfg.margin_theta_neg, active_rows=active_rows)
 
         flip_masks = self._fwd_cache["flip_masks"]
         for blk, fbit in zip(reversed(self.blocks), reversed(flip_masks)):

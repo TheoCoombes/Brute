@@ -13,6 +13,10 @@ at::Tensor  unpack_bool (const at::Tensor& packed, at::IntArrayRef logical_shape
 //  Matmul (CUTLASS B1 XOR-popc on sm_80+, hand kernel otherwise)
 at::Tensor  xnor_popcount_matmul(const at::Tensor& A, const at::Tensor& B, int64_t K);
 
+//  Signed vote bundle: out = sign(Σ_n W·pm1(V)).  W int8 (B,M,N), V packed
+//  (B,N,Dp) → packed (B,M,Dp).  D = logical last dim of V.
+at::Tensor  signed_bundle(const at::Tensor& W, const at::Tensor& V, int64_t D);
+
 //  Popcount / hamming
 at::Tensor  popcount         (const at::Tensor& x);
 at::Tensor  packed_popcount  (const at::Tensor& x);

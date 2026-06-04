@@ -50,6 +50,9 @@ TORCH_LIBRARY(brute, m) {
     // matmul
     m.def("xnor_popcount_matmul(Tensor A, Tensor B, int K) -> Tensor");
 
+    // signed vote bundle: int8-weight × bit1 → bit1 (register-bound reduce)
+    m.def("signed_bundle(Tensor W, Tensor V, int D) -> Tensor");
+
     // popcount / hamming
     m.def("popcount(Tensor x) -> Tensor");
     m.def("packed_popcount(Tensor x) -> Tensor");
@@ -74,6 +77,7 @@ TORCH_LIBRARY_IMPL(brute, CPU, m) {
     m.impl("unpack_bits",          cbrute::cpu::unpack_bits);
     m.impl("unpack_bool",          cbrute::cpu::unpack_bool);
     m.impl("xnor_popcount_matmul", cbrute::cpu::xnor_popcount_matmul);
+    m.impl("signed_bundle",        cbrute::cpu::signed_bundle);
     m.impl("popcount",             cbrute::cpu::popcount);
     m.impl("packed_popcount",      cbrute::cpu::packed_popcount);
     m.impl("hamming_distance",     cbrute::cpu::hamming_distance);
@@ -88,6 +92,7 @@ TORCH_LIBRARY_IMPL(brute, MPS, m) {
     m.impl("unpack_bits",          cbrute::mps::unpack_bits);
     m.impl("unpack_bool",          cbrute::mps::unpack_bool);
     m.impl("xnor_popcount_matmul", cbrute::mps::xnor_popcount_matmul);
+    m.impl("signed_bundle",        cbrute::mps::signed_bundle);
     m.impl("popcount",             cbrute::mps::popcount);
     m.impl("packed_popcount",      cbrute::mps::packed_popcount);
     m.impl("hamming_distance",     cbrute::mps::hamming_distance);
@@ -103,6 +108,7 @@ TORCH_LIBRARY_IMPL(brute, CUDA, m) {
     m.impl("unpack_bits",          cbrute::cuda::unpack_bits);
     m.impl("unpack_bool",          cbrute::cuda::unpack_bool);
     m.impl("xnor_popcount_matmul", cbrute::cuda::xnor_popcount_matmul);
+    m.impl("signed_bundle",        cbrute::cuda::signed_bundle);
     m.impl("popcount",             cbrute::cuda::popcount);
     m.impl("packed_popcount",      cbrute::cuda::packed_popcount);
     m.impl("hamming_distance",     cbrute::cuda::hamming_distance);

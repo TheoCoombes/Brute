@@ -67,6 +67,7 @@ if(HAVE_MPS)
     cbrute/metal/kernels/popcount.metal
     cbrute/metal/kernels/reductions.metal
     cbrute/metal/kernels/matmul.metal
+    cbrute/metal/kernels/signed_bundle.metal
   )
   set(BRUTE_METAL_AIRS "")
   foreach(src IN LISTS BRUTE_METAL_SRCS)

@@ -16,6 +16,7 @@
 #include "kernels/popcount.cuh"
 #include "kernels/matmul_fallback.cuh"
 #include "kernels/matmul_cutlass.cuh"
+#include "kernels/signed_bundle.cuh"
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAStream.h>
@@ -217,6 +218,26 @@ at::Tensor xnor_popcount_matmul(const at::Tensor& A, const at::Tensor& B, int64_
     kernels::k_xnor_popcount_matmul<<<grid, block, 0, cur_stream()>>>(
         as_u64(Ac), as_u64(Bc), C.data_ptr<int32_t>(), M, N, Kp, (int32_t)K);
     return C;
+}
+
+//  signed_bundle — int8-weight × bit1 → bit1; one thread per output word.
+at::Tensor signed_bundle(const at::Tensor& W, const at::Tensor& V, int64_t D) {
+    TORCH_CHECK(W.dim() == 3 && V.dim() == 3,
+                "signed_bundle: W (B,M,N), V packed (B,N,Dp)");
+    TORCH_CHECK(W.scalar_type() == at::kChar, "signed_bundle: W must be int8");
+    const int64_t B = W.size(0), M = W.size(1), N = W.size(2), Dp = V.size(2);
+    TORCH_CHECK(V.size(0) == B && V.size(1) == N,
+                "signed_bundle: W (B,M,N) / V (B,N,Dp) batch or N mismatch");
+    auto Wc = W.contiguous(), Vc = V.contiguous();
+    auto out = at::zeros({B, M, Dp}, V.options().dtype(at::kLong));
+    const int64_t total = B * M * Dp;
+    if (total == 0) return out;
+    const int block = 256;
+    const unsigned grid = (unsigned)((total + block - 1) / block);
+    kernels::k_signed_bundle<<<grid, block, 0, cur_stream()>>>(
+        Wc.data_ptr<int8_t>(), as_u64(Vc), reinterpret_cast<uint64_t*>(out.data_ptr()),
+        (int)B, (int)M, (int)N, (int)Dp, (int)D);
+    return out;
 }
 
 //  popcount — per-element int32, supports any integer dtype + bool.

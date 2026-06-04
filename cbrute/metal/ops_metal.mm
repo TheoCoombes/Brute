@@ -272,6 +272,30 @@ at::Tensor xnor_popcount_matmul(const at::Tensor& A, const at::Tensor& B, int64_
     return C;
 }
 
+//  signed_bundle — int8-weight × bit1 → bit1; one thread per output word.
+at::Tensor signed_bundle(const at::Tensor& W, const at::Tensor& V, int64_t D) {
+    TORCH_CHECK(W.is_mps() && V.is_mps(), "signed_bundle: expects MPS tensors");
+    TORCH_CHECK(W.dim() == 3 && V.dim() == 3,
+                "signed_bundle: W (B,M,N), V packed (B,N,Dp)");
+    TORCH_CHECK(W.scalar_type() == at::kChar, "signed_bundle: W must be int8");
+    const int64_t B = W.size(0), M = W.size(1), N = W.size(2), Dp = V.size(2);
+    TORCH_CHECK(V.size(0) == B && V.size(1) == N,
+                "signed_bundle: W (B,M,N) / V (B,N,Dp) batch or N mismatch");
+    auto Wc = W.contiguous(), Vc = V.contiguous();
+    auto out = at::zeros({B, M, Dp}, V.options().dtype(at::kLong));
+    const int64_t total = B * M * Dp;
+    if (total == 0) return out;
+    MTLSize grid = MTLSizeMake((NSUInteger)total, 1, 1);
+    MTLSize tg   = MTLSizeMake(256, 1, 1);
+    dispatch_kernel_ps(BRUTE_CACHED_PS("signed_bundle_kernel"),
+        {{mtl_buf(Wc), byte_offset(Wc)},
+         {mtl_buf(Vc), byte_offset(Vc)},
+         {mtl_buf(out), byte_offset(out)}},
+        {(int32_t)B, (int32_t)M, (int32_t)N, (int32_t)Dp, (int32_t)D},
+        grid, tg);
+    return out;
+}
+
 //  Per-element popcount — handles any integer dtype.
 at::Tensor popcount(const at::Tensor& packed) {
     auto p = packed.contiguous();

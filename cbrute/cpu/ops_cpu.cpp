@@ -155,6 +155,63 @@ at::Tensor xnor_popcount_matmul(const at::Tensor& A, const at::Tensor& B, int64_
     return C;
 }
 
+//  signed_bundle — int8-weight × bit1 → bit1 reduction.
+//    out[b,m,d] = sign( Σ_n W[b,m,n] · pm1(V[b,n,d]) ),  pm1(bit) = bit ? +1 : -1.
+//  The signed vote accumulator is a *transient* per-(b,m) int32 register (D
+//  entries); V is read straight from its packed words (no unpack), the output is
+//  packed in place.  sign(0) = +1 (>= 0), matching ``sign_to_bit1``; and because
+//  clamping preserves sign, this is bit-identical to the int8-clamped reference.
+at::Tensor signed_bundle(const at::Tensor& W, const at::Tensor& V, int64_t D) {
+    TORCH_CHECK(W.dim() == 3 && V.dim() == 3,
+                "signed_bundle: W must be (B,M,N) and V packed (B,N,Dp)");
+    TORCH_CHECK(W.scalar_type() == at::kChar, "signed_bundle: W must be int8");
+    const int64_t B = W.size(0), M = W.size(1), N = W.size(2), Dp = V.size(2);
+    TORCH_CHECK(V.size(0) == B && V.size(1) == N,
+                "signed_bundle: W (B,M,N) / V (B,N,Dp) batch or N mismatch");
+    const auto Wc = W.contiguous();
+    const auto Vc = V.contiguous();
+    auto out = at::zeros({B, M, Dp}, V.options().dtype(at::kLong));
+    if (B * M == 0 || Dp == 0) return out;
+
+    const int8_t*   w = Wc.data_ptr<int8_t>();
+    const uint64_t* v = reinterpret_cast<const uint64_t*>(Vc.data_ptr());
+    uint64_t*       o = reinterpret_cast<uint64_t*>(out.data_ptr());
+    const int64_t Dl = D;
+
+    at::parallel_for(0, B * M, ROW_GRAIN, [&](int64_t s, int64_t e) {
+        std::vector<int32_t> acc((size_t)(Dp * PACK_WIDTH));   // one alloc per task
+        for (int64_t bm = s; bm < e; ++bm) {
+            const int64_t b = bm / M, m = bm % M;
+            std::fill(acc.begin(), acc.end(), 0);
+            const int8_t*   wrow = w + (b * M + m) * N;
+            const uint64_t* vbat = v + b * N * Dp;
+            for (int64_t nn = 0; nn < N; ++nn) {
+                const int32_t wv = (int32_t)wrow[nn];
+                if (wv == 0) continue;
+                const uint64_t* vrow = vbat + nn * Dp;
+                for (int64_t dp = 0; dp < Dp; ++dp) {
+                    const uint64_t word = vrow[dp];
+                    int32_t* ap = acc.data() + dp * PACK_WIDTH;
+                    for (int bit = 0; bit < PACK_WIDTH; ++bit)
+                        ap[bit] += ((word >> bit) & 1ULL) ? wv : -wv;
+                }
+            }
+            uint64_t* orow = o + (b * M + m) * Dp;
+            for (int64_t dp = 0; dp < Dp; ++dp) {
+                const int32_t* ap = acc.data() + dp * PACK_WIDTH;
+                const int64_t base = dp * PACK_WIDTH;
+                uint64_t outw = 0;
+                for (int bit = 0; bit < PACK_WIDTH; ++bit) {
+                    if (base + bit >= Dl) break;            // pad bits stay 0
+                    if (ap[bit] >= 0) outw |= (uint64_t(1) << bit);
+                }
+                orow[dp] = outw;
+            }
+        }
+    });
+    return out;
+}
+
 //  popcount — per-element, int32 output. Supports any integer dtype + bool.
 at::Tensor popcount(const at::Tensor& x) {
     const auto p = x.contiguous();

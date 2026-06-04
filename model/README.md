@@ -1,156 +1,155 @@
-# HÆMMR Model
+# `model/` — a native binary decoder transformer (BEP-trained, fully packed)
 
-This directory contains the current packed-bit reference implementation of HÆMMR.
-The model is not a standard float transformer. The hot path stays on `brute.bit1`
-tensors, the recurrent state is explicit, and training uses BEP/BOLD-style
-integer hidden weights (`bep.py`) instead of float gradients.
+A **1:1 binary-native equivalent of a standard decoder transformer**: token↔token
+attention, a GLU feed-forward, residual connections and tied-codebook logits —
+built entirely on packed 1-bit `brute.bit1` (uint64) tensors and trained with
+**BEP** (Boolean error propagation: integer hidden weights, 1-bit visible
+weights, binary desired-activation backward). No float weights, no float
+optimiser state, and the sequence-mixing hot path never unpacks.
 
-## Core Data Flow
+This replaces the earlier HÆMMR mixers (a linear-recurrence `BSR`, a
+`HopfieldBank`, an addressed `EpisodicSlotMemory`) with one native
+`BinaryMultiHeadAttention` — the open problem BEP's own paper lists as future work
+("extending BEP to transformer-style models … multi-head mechanisms").
 
-```text
-token ids
-  -> TokenCodebook.embed()
-  -> input DiagBind
-  -> [ BSR
-       EpisodicSlotMemory
-       HopfieldBank
-       ChannelMix ] x L
-  -> out DiagBind
-  -> lex_proj
-  -> optional semantic DiagBind + semantic decode
-  -> fixed codebook decode
-  -> logits
+```
+token → E(t) ── input-bind ──▶ position-free concept  x_i ∈ 𝔹^D
+   ┌────────────────────────────────────────────────────────────────┐ × n_layers
+   │  a = BinaryMultiHeadAttention(x)    # token↔token (ALiBi, causal)  │
+   │  x = residual(x, a)                 # gated mux / majority         │
+   │  f = BinaryGLU(x)                   # exact XNOR-gated FFN          │
+   │  x = residual(x, f)                                                │
+   └────────────────────────────────────────────────────────────────┘
+   ── out-bind ──▶ ĉ ── lex-proj ──▶ ℓ̂ ── ⟨ℓ̂, E(t)⟩ Hamming logits ──▶ softmax
 ```
 
-Positions are only used in the episodic address lane. The decoded concept stream
-stays position-free. If `use_position=False`, the episodic lane receives a
-neutral all-ones code instead of hierarchical position codes.
+## The attention mechanism (`attention.py`)
 
-## Main Components
+The persistent stream `x_i ∈ 𝔹^D` is **position-free**; position enters only as an
+integer bias on the score *register*. Per head (`d_h = D / n_heads`, a multiple of
+64 so heads stay packed):
 
-| Component | File | Role |
-|---|---|---|
-| `TokenCodebook` | [`layers.py`](./layers.py) | Fixed token prototypes plus min-Hamming decode. Supports inline BEF or offline GPT-2 SimHash initialisation. |
-| `DiagBind` | [`layers.py`](./layers.py) | Learned diagonal bitwise binding masks for input, output, and semantic decode lanes. |
-| `BooleanLinear` | [`layers.py`](./layers.py) | Packed XNOR/popcount linear projection with BEP backward wiring. |
-| `ResidualMerge` | [`layers.py`](./layers.py) | Binary gated skip/transform merge. |
-| `BSR` | [`layers.py`](./layers.py) | Delta-corrected recurrent bundle with a small multi-timescale decay palette. |
-| `EpisodicSlotMemory` | [`layers.py`](./layers.py) | Exact in-window causal recall using content + position scoring and optional local margin supervision. |
-| `HopfieldBank` | [`layers.py`](./layers.py) | Static learned key/value prior bank with top-k winner-take-all readout. |
-| `ChannelMix` | [`model.py`](./model.py) | Two-stage binary MLP used as the per-block channel mixer. |
-| `HaemmrLM` | [`model.py`](./model.py) | Full stack assembly, loss/backward path, generation, and checkpointing. |
-| `BepParam` / `BepOptimizer` | [`bep.py`](./bep.py) | Integer hidden weights, visible `sign(H)` weights, and bit-flip stepping. |
+| step | operation | type |
+|------|-----------|------|
+| project | `q,k,v = sign(W_{Q,K,V}^h · x)` (`BooleanLinear`, per head) | `bit1` |
+| score | `ℓ_ij = ⟨q_i, k_j⟩ = d_h − 2·H(q_i,k_j)` (`brute.fast.matmul`) | int32 **register** |
+| position | `ℓ_ij += −b_h·(i−j)` (ALiBi, integer slope per head) | int32 register |
+| causal | `ℓ_ij = −∞` for `j>i` (or `j≥i` if `causal_strict`) | mask |
+| combine (hardmax) | `o_i = v_{argmax_j ℓ_ij}` (packed `index_select` gather) | `bit1` |
+| combine (soft) | `o_i = sign(Σ_{j≤i} n(ℓ_ij)·v_j)`, `n(ℓ)=relu(ℓ−ℓ_max+band)` | int8 weights/acc |
+| output | `a = sign(W_O · concat_h o)` (`BooleanLinear`) | `bit1` |
 
-The model also has an optional cleanup Hopfield pass in `HaemmrConfig`
-(`hopfield_cleanup=True`) for experiments, but the standard CLI leaves it off.
+Heads are split/merged by slicing and concatenating the underlying uint64
+**packed buffers** directly (never `cat`/`stack` on the logical bits), so the
+whole forward stays packed.
 
-## Training
+### Exact ↔ approximate map
 
-`train.py` is the main training entry point.
+* **Exact (algebraic identities, no approximation):** XNOR = bipolar multiply;
+  `⟨u,v⟩ = D − 2·Hamming`; the score register; ALiBi (relative, integer); the
+  causal mask; **hardmax** value transport (a packed gather — bit-exact copy of
+  the argmax source); the XNOR-GLU gate; the coordinate majority residual; the
+  tied-codebook Hamming logits.
+* **Bounded approximation (soft attention only):** the soft value combine is a
+  *signed integer vote bundle* `sign(Σ_j w_ij·pm1(v_j))`. It satisfies a
+  **dominance theorem** — if one source's weight exceeds the sum of all others
+  (`w_ij* > Σ_{j≠j*} w_ij`), the bundle equals that source's value coordinate-wise
+  — so when the top key's margin clears the band it reduces to hardmax. The int8
+  accumulator saturates at ±127, but **clamping preserves sign**, so the output
+  sign is exact regardless of magnitude.
 
-The backward pass is BEP:
+## BEP training (`bep.py`, reused verbatim)
 
-* each parameter stores an integer hidden weight buffer `H` (`int16`);
-* the visible weight is `sign(H)`;
-* the logging loss is a normal NLL/perplexity calculation only;
-* the raw decode margin is tracked as
-  (`logit[target] - max_other < r_eff * D`);
-* output-codebook/readout updates can run on all raw violations, while hidden
-  BEP updates can be warmed up, annealed, and capped to avoid whole-batch
-  rewrites after early readout adaptation;
-* triggered positions emit binary desired activations, not float gradients;
-* episodic address projections can also receive local matched-slot supervision.
+Each parameter is an int16 hidden weight `H`; the visible weight is `W = sign(H)`
+(≈1 bit/weight). The backward pass threads **binary desired activations** `a*`
+(bit1) — never a float signal:
 
-Useful flags on the current CLI:
+* `linear_backward`: `ΔH = a*_out ⊗ a_in` (binary outer product → integer
+  accumulate); upstream `a*_in = sign(Wᵀ a*_out)`. Both are bit1 XNOR-popcount
+  matmuls.
+* The head is **contrastive margin-triggered**: an update fires for a position
+  only when `logit[target] − max_other < r·D`. No softmax/CE on the backward
+  path (real softmax/CE are logging only).
+* Attention's score lane (`W_Q, W_K`) is trained by a per-head **Hamming-margin**
+  objective (`BinaryMultiHeadAttention.margin_loss`) supervised by the
+  self-supervised induction signal; the value lane is trained by routing the
+  desired output back through the same combine (`backward`).
 
-* `--D`, `--layers`, `--d-ff`
-* `--slots`, `--top-k`
-* `--epi-slots`, `--epi-read-k`
-* `--no-position`
-* `--codebook-mode offline|structured|random`
-* `--bef-sweeps`
-* `--sem-weight`
-* `--r`, `--p-r`, `--bits`, `--flip-dropout`
-* `--readout-warmup-steps`, `--margin-r-final`, `--margin-anneal-steps`
-* `--max-trigger-rate`
-* `--gate-open`, `--boundary-nu`
+## Hot-path-packed invariant
 
-`--codebook-mode structured` is the default for WikiText training and probing.
-`offline` builds a GPT-2 SimHash codebook from pretrained embeddings and caches
-it under `model/.data/codebook`.
+Every *persistent* tensor is packed `brute.bit1` (uint64) end-to-end. The only
+integers are **transient registers**: the int32 score `ℓ`, the int8 attention
+weights `n(ℓ)`, and the int8 value-vote accumulator. The forward pass performs
+**zero** unpacks of any kind (verified in `tests/test_efficiency_contracts.py`);
+a full training step materialises **no** dense ±1 float (`unpack_bits`) — the only
+bit→byte unpacks (`unpack_bool`) are BEP weight-gradient / codebook updates at
+parameter granularity, never per token-pair.
 
-`--codebook-mode structured` keeps the inline BEF initializer.
-`--codebook-mode random` disables the structured initializer and uses a random
-codebook instead.
+## The one custom kernel — `brute.signed_bundle` (Stage B)
 
-The synthetic probe (`probe_synthetic.py`) uses `structured` by default and
-supports `random` for ablations.
+The soft combine is an **int8-weight × bit1 → bit1** reduction. `brute` ships
+bit1×bit1→int (XNOR-popcount) but not int×bit1, so this is the single
+register-bound primitive that needs a kernel. `brute.signed_bundle(W:int8 (B,M,N),
+V:bit1 (B,N,Dp), D) → bit1 (B,M,Dp)` reads `V` straight from its packed words
+(never materialised) and accumulates the signed vote in a transient register. It
+is implemented on **CPU** (`cbrute/cpu`), **MPS** (`cbrute/metal`) and **CUDA**
+(`cbrute/cuda`, compile-checked only on this Mac — no NVIDIA GPU here), and is
+reused for both the attention forward and its transposed backward. Until the
+extension is rebuilt the code transparently falls back to a bit-identical Stage-A
+reference; `tests/test_signed_bundle_kernel.py` asserts kernel == reference on
+CPU + MPS.
 
-Example:
+## What learns, and the training characteristics (research notes)
+
+This is binary, discrete-update training; a few properties differ from a float
+transformer and are worth knowing (all reflected in the config defaults and the
+test recipes in `tests/_helpers.py::retrieval_config`):
+
+* **Residual cold-start.** A summed binary residual is *not* identity at init —
+  an untrained branch injects ~25% bit noise and destroys the signal before the
+  readout can learn. The residual is therefore admitted through a per-coordinate
+  gate initialised mostly **closed** (≈ identity at init), opening where the
+  branch predicts the target.
+* **`residual_mode`.** `mux` (open ⇒ branch *replaces* skip) is required for exact
+  value replacement (copy / retrieval); `majority` (open ⇒ `maj3(skip,branch,c)`)
+  is the BOLD-faithful binary residual but can only *add*, not overwrite.
+* **`value_proj`.** `True` (faithful `W_V/W_O`) is the default. `False` is
+  raw-concept-copy attention: the retrieved value is the clean source codeword
+  (no projection), which the readout decodes directly — the cleanest, most stable
+  transport for copy / retrieval tasks.
+* **ALiBi must scale to `d_h`.** Scores are the unnormalised `±d_h` dot, so slopes
+  span `1` (content head) to `> 2·d_h` (recency head, attends the nearest key).
+* **Gentle updates.** The readout/codebook co-adaptation runs away under
+  aggressive hyper-parameters; small `r`, `max_trigger_rate`, `update_clip` and a
+  `readout_warmup_steps` keep it convergent.
+
+**Verified end-to-end:** local next-token identity → ~1.0; previous-token copy (a
+genuine non-local attention task) → ~1.0, *matching a float transformer baseline*
+on the same task (`tests/test_transformer_baseline.py`). The attention mechanism
+itself is verified bit-exact in `tests/test_attention.py`.
+
+## Hyper-parameters (`TransformerConfig`)
+
+| group | knobs | notes |
+|-------|-------|-------|
+| shape | `D, n_layers, n_heads, d_ff` | `D // n_heads` must be a multiple of 64 |
+| attention | `attn_mode {soft,hardmax}`, `attn_band`, `alibi`, `causal`, `causal_strict`, `value_proj`, `alibi_slopes_override` | soft `band` ≥ 1 = temperature |
+| residual | `residual_mode {mux,majority}`, `gate_open` | `gate_open` low ⇒ identity init |
+| codebook | `structured_codebook`, `bef_*`, `sem_weight` | tied Hamming readout |
+| BEP | `r`, `margin_r_final`, `margin_anneal_steps`, `readout_warmup_steps`, `max_trigger_rate`, `p_r`, `bits`, `init_inertia`, `update_clip`, `block_init_inertia`, `block_update_clip` | margin trigger + integer step |
+| margin lane | `margin_theta_pos/neg`, `margin_weight`, `self_supervised_induction` | trains `W_Q/W_K` |
+
+## Running
 
 ```bash
-./.venv/bin/python model/train.py \
-  --steps 1500 \
-  --D 1024 \
-  --layers 2 \
-  --seq-len 64 \
-  --r 0.1 \
-  --bits 15
+.venv/bin/python model/train.py --steps 1500 --D 512 --layers 2 --n-heads 4 --seq-len 64
+.venv/bin/python model/benchmark_matrix.py --quick     # geometry / mechanism / efficiency matrix
+.venv/bin/python -m pytest model/tests -q              # full suite (CPU + MPS)
+.venv/bin/python -m pytest model/tests -q --run-slow   # + end-to-end learnability probes
 ```
 
-## Data And Codebooks
+(Run `train.py` / `benchmark_matrix.py` as scripts, not `python -m model.*` — the
+directory name `model` would otherwise shadow the `model.py` module.)
 
-[`data.py`](./data.py) loads WikiText with the full GPT-2 tokenizer and returns
-raw GPT-2 ids plus the `compact_to_gpt2` mapping used for decode and
-checkpoint compatibility.
-
-[`codebook.py`](./codebook.py) can build an offline GPT-2 SimHash codebook from
-pretrained token embeddings. That is the default codebook mode for WikiText
-training and is cached under `model/.data/codebook` so the expensive download
-only happens on the first build.
-
-## Entry Points
-
-* [`train.py`](./train.py): main WikiText training CLI.
-* [`sample.py`](./sample.py): sample from a checkpoint.
-* [`probe_synthetic.py`](./probe_synthetic.py): small synthetic induction/copy/retrieval probes.
-* [`probe_wikitext.py`](./probe_wikitext.py): compare content-only and positioned WikiText probes.
-* [`benchmark_matrix.py`](./benchmark_matrix.py): geometry, component, synthetic, and efficiency matrix.
-* [`bench/run_all.py`](./bench/run_all.py): run benchmark groups and refresh `benchmark-report.md`.
-
-## Reports
-
-`benchmark-report.md` is the current auto-generated report. It is written from
-`model/bench/results/` by `bench/run_all.py`.
-
-`benchmark_report.md` is the historical v1 matrix report retained for context.
-It is no longer the active report target.
-
-## Testing
-
-Run the package tests with:
-
-```bash
-./.venv/bin/python -m pytest model/tests -q
-```
-
-The tests cover:
-
-* VSA binding, unbinding, bundling, positions, and BEF initialisation
-* packed Boolean layers and BEP backward wiring
-* BSR recurrence and streaming parity
-* episodic slot causality, windowing, and margin supervision
-* full-model forward/backward, sampling, and checkpoint round-tripping
-* source-level efficiency contracts that guard against old packed-path regressions
-
-## Where To Start When Changing The Model
-
-If you are changing the core architecture, start with:
-
-1. [`vsa.py`](./vsa.py)
-2. [`bep.py`](./bep.py)
-3. [`layers.py`](./layers.py)
-4. [`model.py`](./model.py)
-
-That is the shortest path to understanding how the packed representation,
-memory blocks, and update rule fit together.
+See `AGENTS.md` for the development workflow, bit1 conventions, the no-unpack
+contract, and the rebuild command for the Stage-B kernel.

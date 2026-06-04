@@ -1,233 +1,165 @@
-"""Benchmark matrix for HÆMMR research comparisons.
+"""Research comparison matrix for the native binary transformer.
 
-The matrix is intentionally small and reproducible: it measures binary/VSA
-geometry, component behavior, synthetic attention tasks against a tiny
-Transformer baseline, forward-path bitwise efficiency, and optionally ingests a
-WikiText training CSV produced by ``train.py``.
+A small, reproducible matrix that reports, side by side, the things that make
+this model interesting as a research artefact:
+
+  1. **geometry**   — the exact bit1/VSA identities the model is built on
+                       (XNOR = bipolar multiply; ``⟨u,v⟩ = D − 2·Hamming``).
+  2. **mechanism**  — attention exactness: integer scores equal ``d_h − 2H``, and
+                       hardmax transports the argmax value bit-for-bit.
+  3. **learning**   — previous-token copy (a genuinely non-local attention task):
+                       the binary transformer vs a float transformer baseline.
+  4. **efficiency** — the binary model's forward does zero unpacks, and its
+                       train-time parameter footprint vs an fp32 + Adam transformer.
+
+Run as a script (not ``-m model.benchmark_matrix`` — the ``model`` directory would
+shadow the ``model.py`` module)::
+
+    .venv/bin/python model/benchmark_matrix.py              # full matrix
+    .venv/bin/python model/benchmark_matrix.py --quick      # skip the learning probe
+    .venv/bin/python model/benchmark_matrix.py --json out.json
 """
 
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import sys
 import time
 from pathlib import Path
-from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent / "tests"))
 
 import torch
 
 import brute
-from layers import BSR, HopfieldBank, TokenCodebook
-from model import HaemmrConfig, HaemmrLM
-from probe_synthetic import run_haemmr, run_transformer
-from profile_bitwise import count_hot_ops
-from vsa import bind, hamming_similarity, position_codes, random_hypervectors, sign_to_bit1, to_pm1
+from attention import BinaryMultiHeadAttention
+from model import TransformerConfig, BinaryTransformerLM
+from vsa import bind, hamming_similarity, random_hypervectors
+from _helpers import (TransformerBaseline, prev_token_batch, retrieval_config,
+                      train_prev_token, train_baseline)
 
 
-def _metric(section, name, value, unit="", notes=""):
+def _row(section, name, value, unit="", notes=""):
     return {"section": section, "name": name, "value": value, "unit": unit, "notes": notes}
 
 
-def run_geometry(args):
+# ── 1. geometry ──────────────────────────────────────────────────────────────
+
+def run_geometry(g):
+    rows, D = [], 1024
+    a = random_hypervectors(64, D, generator=g)
+    b = random_hypervectors(64, D, generator=g)
+    xnor_ok = bool((bind(a, b).unpack_pm1() == a.unpack_pm1() * b.unpack_pm1()).all())
+    rows.append(_row("geometry", "XNOR == bipolar multiply", xnor_ok, "", "exact"))
+    sim = hamming_similarity(a[:1], b)                       # (1, 64) int
+    pm = (a[:1].unpack_pm1() @ b.unpack_pm1().t())
+    rows.append(_row("geometry", "<u,v> == D - 2*Hamming",
+                     bool((sim.float() == pm).all()), "", "exact"))
+    return rows
+
+
+# ── 2. mechanism exactness ────────────────────────────────────────────────────
+
+def run_mechanism(g):
     rows = []
-    g = torch.Generator().manual_seed(args.seed + 10)
-    D = 1024
-
-    x = random_hypervectors(128, D, generator=g)
-    r = random_hypervectors(128, D, generator=g)
-    recovered = bind(bind(x, r), r)
-    bind_acc = float((to_pm1(recovered) == to_pm1(x)).float().mean())
-    rows.append(_metric("geometry", "bind_unbind_bit_accuracy", bind_acc, "fraction"))
-
-    fillers = random_hypervectors(64 * 5, D, generator=g).reshape(64, 5, D)
-    roles = random_hypervectors(64 * 5, D, generator=g).reshape(64, 5, D)
-    correct = 0
-    for i in range(64):
-        records = to_pm1(bind(fillers[i].reshape(5, D), roles[i].reshape(5, D)))
-        bundle = sign_to_bit1(records.sum(dim=0, keepdim=True))
-        target = int(torch.randint(0, 5, (1,), generator=g).item())
-        query = bind(bundle, roles[i, target:target + 1])
-        pred = int(hamming_similarity(query, fillers[i]).argmax().item())
-        correct += int(pred == target)
-    rows.append(_metric("geometry", "bundle_5_record_retrieval_accuracy", correct / 64, "fraction"))
-
-    base = (torch.randint(0, 2, (D,), generator=g) * 2 - 1).float()
-    pos = position_codes(base, 16)
-    dressed = bind(x[:16], pos)
-    undressed = bind(dressed, pos)
-    pos_acc = float((to_pm1(undressed) == to_pm1(x[:16])).float().mean())
-    rows.append(_metric("geometry", "position_bind_unbind_bit_accuracy", pos_acc, "fraction"))
-
-    cb = TokenCodebook(256, D, name="bench.E", generator=g)
-    token_rows = cb.E.bit[:128]
-    pos128 = position_codes(base, 128)
-    positioned = bind(token_rows, pos128)
-    raw_decode = cb.decode(positioned).argmax(dim=1)
-    unbound_decode = cb.decode(bind(positioned, pos128)).argmax(dim=1)
-    target = torch.arange(128)
-    rows.append(_metric("geometry", "positioned_raw_decode_accuracy",
-                        float((raw_decode == target).float().mean()), "fraction",
-                        notes="Should be low: positioned concepts are not raw codebook rows."))
-    rows.append(_metric("geometry", "positioned_unbound_decode_accuracy",
-                        float((unbound_decode == target).float().mean()), "fraction"))
-
-    for dim in (512, 4096):
-        hv = random_hypervectors(128, dim, generator=g)
-        sim = hamming_similarity(hv[:1], hv[1:]).float().abs()
-        rows.append(_metric("geometry", f"mean_abs_random_similarity_D{dim}",
-                            float((sim / dim).mean()), "normalized_dot"))
+    D, H, B, n = 128, 2, 2, 8
+    x = random_hypervectors(B * n, D, generator=g).reshape(B, n, D)
+    mha = BinaryMultiHeadAttention(D, H, name="m", attn_mode="hardmax",
+                                   causal_strict=True, generator=g)
+    a = mha.forward(x)
+    qh, kh = mha._cache["q_head_bits"][0], mha._cache["k_head_bits"][0]
+    score = brute.fast.matmul(qh[0], kh[0])
+    dot = (qh[0].unpack_pm1() @ kh[0].unpack_pm1().t())
+    rows.append(_row("mechanism", "score == d_h - 2H",
+                     bool((score.float() == dot).all()), "", "exact"))
+    rows.append(_row("mechanism", "forward stays packed bit1", a.dtype == brute.bit1, "", ""))
     return rows
 
 
-def run_components(args):
+# ── 3. learning: binary vs float baseline on previous-token copy ──────────────
+
+def run_learning(g, steps=600):
     rows = []
-    g = torch.Generator().manual_seed(args.seed + 20)
-    D = 128
-
-    bsr = BSR(D, name="bench.bsr", generator=g)
-    c = random_hypervectors(2 * 64, D, generator=g).reshape(2, 64, D)
-    batched = bsr.forward(c)
-    bsr.reset_stream(2)
-    streamed_pm1 = torch.stack([to_pm1(bsr.step(c[:, i])) for i in range(64)], dim=1)
-    mismatch = float((streamed_pm1 != to_pm1(batched)).float().mean())
-    rows.append(_metric("component_bsr", "streaming_vs_batched_mismatch", mismatch, "fraction"))
-
-    hv = random_hypervectors(4, D, generator=g)
-    seq_a = torch.stack([to_pm1(hv[0])] * 63 + [to_pm1(hv[3])])
-    seq_b = torch.stack([to_pm1(hv[1])] * 63 + [to_pm1(hv[3])])
-    late = to_pm1(bsr.forward(brute.as_tensor(torch.stack([seq_a, seq_b]) > 0, dtype=brute.bit1)))[:, -1]
-    late_diff = float((late[0] != late[1]).float().mean())
-    rows.append(_metric("component_bsr", "persistent_prefix_late_read_difference", late_diff, "fraction"))
-
-    hop = HopfieldBank(D, n_slots=16, top_k=1, name="bench.hop", generator=g)
-    keys = random_hypervectors(16, D, generator=g)
-    payloads = random_hypervectors(16, D, generator=g)
-    hop.P.bit = keys
-    hop.U.bit = payloads
-    out = hop.forward(keys)
-    hop_acc = float((to_pm1(out) == to_pm1(payloads)).float().mean())
-    rows.append(_metric("component_hopfield", "controlled_top1_payload_bit_accuracy", hop_acc, "fraction"))
-
-    cfg = HaemmrConfig(vocab_size=128, D=256, n_layers=1, d_ff=512, n_slots=64,
-                       top_k=5, use_position=True, seed=args.seed)
-    model = HaemmrLM(cfg, device="cpu")
-    rows.append(_metric("component_model", "bit_parameters", model.num_bit_parameters(), "bits"))
-    rows.append(_metric("component_model", "approx_parameter_storage", model.num_bit_parameters() / 8 / 1e6, "MB"))
+    cfg = retrieval_config(V=16, D=128, n_heads=1, attn_mode="hardmax")
+    binary = BinaryTransformerLM(cfg)
+    t0 = time.time(); b_acc = train_prev_token(binary, steps=steps); b_t = time.time() - t0
+    base = TransformerBaseline(16, d_model=64, n_heads=2, n_layers=1,
+                               causal_strict=True, alibi_recency=True)
+    t0 = time.time(); f_acc = train_baseline(base, prev_token_batch, steps=max(steps // 2, 200))
+    f_t = time.time() - t0
+    rows.append(_row("learning", "binary prev-token acc", round(b_acc, 3), "",
+                     f"{b_t:.0f}s, chance 0.0625"))
+    rows.append(_row("learning", "float baseline prev-token acc", round(f_acc, 3), "", f"{f_t:.0f}s"))
+    rows.append(_row("learning", "binary matches baseline (>0.9)",
+                     bool(b_acc > 0.9 and f_acc > 0.9), "", ""))
     return rows
 
 
-def run_synthetic(args):
+# ── 4. efficiency ──────────────────────────────────────────────────────────────
+
+def run_efficiency(g):
     rows = []
-    synth_args = SimpleNamespace(
-        seed=args.seed, D=args.synthetic_D, layers=1, d_ff=2 * args.synthetic_D,
-        slots=32, top_k=3, epi_slots=None, epi_read_k=1, decay_shifts=(1, 2, 3, 4, 0),
-        device="cpu", gate_open=0.05, r=0.1, bits=15, flip_dropout=0.0,
-        codebook_mode="structured", bef_sweeps=30, sem_weight=0.5,
-        use_position=True, use_bsr=True, use_episodic=True, use_hopfield=True,
-        margin_supervision=True, steps=args.haemmr_steps,
-        batch_size=64, baseline_steps=args.transformer_steps, baseline_dim=64,
-        baseline_layers=2, baseline_lr=3e-3,
-    )
-    for task in ("induction", "marker", "copy"):
-        for length in (16, 64):
-            h = run_haemmr(task, length, synth_args)
-            rows.append({
-                "section": "synthetic_attention",
-                "task": task,
-                "length": length,
-                "model": "haemmr",
-                **h,
-            })
-            t = run_transformer(task, length, synth_args)
-            rows.append({
-                "section": "synthetic_attention",
-                "task": task,
-                "length": length,
-                "model": "tiny_transformer",
-                **t,
-            })
+    cfg = TransformerConfig(vocab_size=256, D=256, n_layers=2, n_heads=4, d_ff=512,
+                            attn_mode="hardmax", seed=0)
+    m = BinaryTransformerLM(cfg)
+    ids = torch.randint(0, 256, (4, 16))
+    names = ("unpack_bits", "unpack_bool")
+    orig = {k: getattr(torch.ops.brute, k) for k in names}
+    counts = {k: 0 for k in names}
+    for k in names:
+        def mk(name, o):
+            return lambda *a, **kw: (counts.__setitem__(name, counts[name] + 1) or o(*a, **kw))
+        setattr(torch.ops.brute, k, mk(k, orig[k]))
+    try:
+        m.forward(ids)
+    finally:
+        for k, v in orig.items():
+            setattr(torch.ops.brute, k, v)
+    rows.append(_row("efficiency", "forward unpacks (hardmax)", sum(counts.values()), "",
+                     "fully packed"))
+    n = m.num_bit_parameters()
+    rows.append(_row("efficiency", "param footprint", round(m.param_bytes() / 1e6, 3), "MB",
+                     f"{n:,} bit-params, int16 H"))
+    rows.append(_row("efficiency", "vs fp32+Adam footprint", round((n * 12) / 1e6, 3), "MB",
+                     "weight+m+v; ~6x larger"))
     return rows
-
-
-def run_efficiency(args):
-    cfg = HaemmrConfig(vocab_size=512, D=256, n_layers=1, d_ff=512, n_slots=64,
-                       top_k=5, use_position=True, seed=args.seed)
-    model = HaemmrLM(cfg, device="cpu")
-    ids = torch.randint(0, 512, (4, 32))
-    model.forward(ids)
-    with count_hot_ops() as counts:
-        t0 = time.perf_counter()
-        for _ in range(args.profile_iters):
-            model.forward(ids)
-        elapsed = time.perf_counter() - t0
-    tokens = 4 * 32 * args.profile_iters
-    rows = [
-        _metric("efficiency", "forward_tokens_per_second", tokens / max(elapsed, 1e-9), "tokens/s"),
-        _metric("efficiency", "fast_matmul_calls", counts["fast_matmul"], "calls"),
-        _metric("efficiency", "unpack_pm1_calls", counts["unpack_pm1"], "calls"),
-        _metric("efficiency", "to_bit1_pack_calls", counts["to_bit1_pack"], "calls"),
-    ]
-    return rows
-
-
-def run_wikitext(csv_path: str | None):
-    if not csv_path:
-        return []
-    path = Path(csv_path)
-    if not path.exists():
-        return [_metric("wikitext", "csv_missing", str(path))]
-    with path.open() as f:
-        rows = list(csv.DictReader(f))
-    out = []
-    for r in rows:
-        step = int(r["step"])
-        out.extend([
-            _metric("wikitext", f"step_{step}_val_loss", float(r["val_loss"])),
-            _metric("wikitext", f"step_{step}_val_ppl", float(r["val_ppl"])),
-            _metric("wikitext", f"step_{step}_val_acc", float(r["val_acc"]), "fraction"),
-        ])
-    if rows:
-        best = min(rows, key=lambda r: float(r["val_loss"]))
-        out.append(_metric("wikitext", "best_val_loss", float(best["val_loss"])))
-        out.append(_metric("wikitext", "best_val_ppl", float(best["val_ppl"])))
-        out.append(_metric("wikitext", "best_step", int(best["step"])))
-    return out
 
 
 def main():
-    p = argparse.ArgumentParser()
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--synthetic-D", type=int, default=128)
-    p.add_argument("--haemmr-steps", type=int, default=80)
-    p.add_argument("--transformer-steps", type=int, default=300)
-    p.add_argument("--profile-iters", type=int, default=5)
-    p.add_argument("--wikitext-csv", default=None)
-    p.add_argument("--json-out", default="/private/tmp/haemmr_benchmark_matrix.json")
+    p.add_argument("--steps", type=int, default=600, help="prev-token probe steps")
+    p.add_argument("--quick", action="store_true", help="skip the learning probe")
+    p.add_argument("--json", default=None, help="write the matrix as JSON")
     args = p.parse_args()
+    torch.manual_seed(args.seed)
+    g = torch.Generator(device="cpu").manual_seed(args.seed + 1)
 
-    t0 = time.time()
-    results = {
-        "meta": {
-            "seed": args.seed,
-            "haemmr_steps": args.haemmr_steps,
-            "transformer_steps": args.transformer_steps,
-            "synthetic_D": args.synthetic_D,
-        },
-        "rows": (
-            run_geometry(args)
-            + run_components(args)
-            + run_synthetic(args)
-            + run_efficiency(args)
-            + run_wikitext(args.wikitext_csv)
-        ),
-    }
-    results["meta"]["elapsed_s"] = time.time() - t0
-    Path(args.json_out).write_text(json.dumps(results, indent=2))
-    print(json.dumps(results, indent=2))
+    rows = []
+    rows += run_geometry(g)
+    rows += run_mechanism(g)
+    rows += run_efficiency(g)
+    if not args.quick:
+        rows += run_learning(g, steps=args.steps)
+
+    width = max(len(r["name"]) for r in rows)
+    section = None
+    for r in rows:
+        if r["section"] != section:
+            section = r["section"]
+            print(f"\n-- {section} --")
+        val = r["value"]
+        val = ("OK" if val else "FAIL") if isinstance(val, bool) else val
+        line = f"  {r['name']:<{width}}  {val} {r['unit']}".rstrip()
+        if r["notes"]:
+            line += f"   ({r['notes']})"
+        print(line)
+    if args.json:
+        Path(args.json).write_text(json.dumps(rows, indent=2))
+        print(f"\nwrote {args.json}")
 
 
 if __name__ == "__main__":

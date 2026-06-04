@@ -50,7 +50,7 @@ import brute  # noqa: F401 — ensure the extension is importable
 
 from bep import BepConfig, BepOptimizer
 from data import make_lm_batches, wikitext
-from model import HaemmrConfig, HaemmrLM, IGNORE_INDEX
+from model import TransformerConfig, BinaryTransformerLM, IGNORE_INDEX
 
 
 CODEBOOK_MODES = ("structured", "random")
@@ -108,15 +108,20 @@ def main():
     p.add_argument("--data-root", default="./.data")
     p.add_argument("--max-train-tokens", type=int, default=None,
                    help="Truncate the training stream (faster local demo).")
-    p.add_argument("--D", type=int, default=1024, help="Concept hypervector dim.")
+    p.add_argument("--D", type=int, default=512, help="Concept / model dimension.")
     p.add_argument("--layers", type=int, default=2)
-    p.add_argument("--d-ff", type=int, default=2048)
-    p.add_argument("--slots", type=int, default=256, help="Hopfield bank slots M.")
-    p.add_argument("--top-k", type=int, default=15, help="Hopfield WTA width (odd).")
-    p.add_argument("--epi-slots", type=int, default=None,
-                   help="episodic exact-recall window; default = full sequence during training.")
-    p.add_argument("--epi-read-k", type=int, default=1,
-                   help="episodic top-k read width (1 = exact single-slot).")
+    p.add_argument("--n-heads", type=int, default=4, help="attention heads (D//heads %% 64 == 0).")
+    p.add_argument("--d-ff", type=int, default=1024, help="binary GLU hidden width.")
+    p.add_argument("--attn-mode", choices=["soft", "hardmax"], default="soft",
+                   help="soft = int8 vote bundle; hardmax = packed argmax gather.")
+    p.add_argument("--attn-band", type=int, default=1, help="soft attention integer margin band.")
+    p.add_argument("--residual-mode", choices=["mux", "majority"], default="mux",
+                   help="mux = branch replaces skip (copy); majority = maj3 (BOLD-faithful).")
+    p.add_argument("--no-value-proj", dest="value_proj", action="store_false", default=True,
+                   help="raw-concept-copy attention (no W_V/W_O) — cleaner retrieval transport.")
+    p.add_argument("--causal-strict", action="store_true", default=False,
+                   help="exclude self (j<i): ALiBi recency then selects the previous token.")
+    p.add_argument("--no-alibi", dest="alibi", action="store_false", default=True)
     p.add_argument("--seq-len", type=int, default=64)
     p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--steps", type=int, default=1500, help="number of optimiser (flip) steps.")
@@ -142,8 +147,8 @@ def main():
     p.add_argument("--max-trigger-rate", type=float, default=0.25,
                    help="cap actual hidden BEP update rows as a fraction of valid rows.")
     p.add_argument("--log-csv", default=None, help="append the loss curve to this CSV file.")
-    p.add_argument("--no-position", dest="use_position", action="store_false", default=True,
-                   help="disable hierarchical position codes in the episodic address lane.")
+    p.add_argument("--gate-open", type=float, default=0.05,
+                   help="residual admittance-gate init openness (→ identity init).")
     p.add_argument(
         "--codebook-mode",
         choices=CODEBOOK_MODES,
@@ -156,8 +161,6 @@ def main():
     p.add_argument("--boundary-nu", type=float, default=None,
                    help="BEP-style boundary eligibility gate; unset disables it.")
     p.add_argument("--flip-dropout", type=float, default=0.0)
-    p.add_argument("--gate-open", type=float, default=0.05,
-                   help="residual-gate init openness (higher ⇒ context flows sooner).")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="cpu", choices=["cpu", "mps", "cuda"])
     p.add_argument("--eval-every", type=int, default=100)
@@ -191,31 +194,33 @@ def main():
           f"  vocab={V}  chunks: train={Xtr.shape[0]:,} val={Xva.shape[0]:,}")
     print(f"  baselines (val):  uniform={1.0/V:.4f}  unigram={unigram_baseline(Yva.cpu(), V):.4f}")
 
-    cfg = HaemmrConfig(vocab_size=V, D=args.D, n_layers=args.layers, d_ff=args.d_ff,
-                       n_slots=args.slots, top_k=args.top_k, seed=args.seed,
-                       epi_slots=args.epi_slots, epi_read_k=args.epi_read_k,
-                       use_position=args.use_position, gate_open=args.gate_open,
-                       structured_codebook=structured_codebook,
-                       bef_sweeps=args.bef_sweeps, sem_weight=args.sem_weight,
-                       boundary_nu=args.boundary_nu,
-                       init_inertia=args.init_inertia,
-                       update_clip=args.update_clip,
-                       block_init_inertia=args.block_init_inertia,
-                       block_update_clip=args.block_update_clip,
-                       readout_warmup_steps=args.readout_warmup_steps,
-                       margin_r_final=args.margin_r_final,
-                       margin_anneal_steps=args.margin_anneal_steps,
-                       max_trigger_rate=args.max_trigger_rate,
-                       flip_dropout=args.flip_dropout,
-                       r=args.r, p_r=args.p_r, bits=args.bits,
-                       )
-    model = HaemmrLM(cfg, device=device)
+    cfg = TransformerConfig(vocab_size=V, D=args.D, n_layers=args.layers,
+                            n_heads=args.n_heads, d_ff=args.d_ff, seed=args.seed,
+                            attn_mode=args.attn_mode, attn_band=args.attn_band,
+                            residual_mode=args.residual_mode, value_proj=args.value_proj,
+                            causal_strict=args.causal_strict, alibi=args.alibi,
+                            gate_open=args.gate_open,
+                            structured_codebook=structured_codebook,
+                            bef_sweeps=args.bef_sweeps, sem_weight=args.sem_weight,
+                            boundary_nu=args.boundary_nu,
+                            init_inertia=args.init_inertia,
+                            update_clip=args.update_clip,
+                            block_init_inertia=args.block_init_inertia,
+                            block_update_clip=args.block_update_clip,
+                            readout_warmup_steps=args.readout_warmup_steps,
+                            margin_r_final=args.margin_r_final,
+                            margin_anneal_steps=args.margin_anneal_steps,
+                            max_trigger_rate=args.max_trigger_rate,
+                            flip_dropout=args.flip_dropout,
+                            r=args.r, p_r=args.p_r, bits=args.bits,
+                            )
+    model = BinaryTransformerLM(cfg, device=device)
     opt = BepOptimizer(model.parameters(),
                        BepConfig(r=args.r, p_r=args.p_r, bits=args.bits))
     n_bits = model.num_bit_parameters()
-    print(f"model: D={cfg.D} layers={cfg.n_layers} d_ff={cfg.d_ff} slots={cfg.n_slots}"
+    print(f"model: D={cfg.D} layers={cfg.n_layers} heads={cfg.n_heads} d_ff={cfg.d_ff}"
+          f" attn={cfg.attn_mode} resid={cfg.residual_mode} value_proj={cfg.value_proj}"
           f" block_H0={cfg.block_init_inertia or cfg.init_inertia}"
-          f" block_clip={cfg.block_update_clip}"
           f" warmup={cfg.readout_warmup_steps}"
           f" r={cfg.r}->{cfg.margin_r_final if cfg.margin_r_final is not None else cfg.r}"
           f" cap={cfg.max_trigger_rate}"

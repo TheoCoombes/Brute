@@ -111,6 +111,25 @@ def matmul(a: Tensor, b_t: Tensor) -> torch.Tensor:
         a._packed_buf, b_t._packed_buf, K)
 
 
+# ── Signed vote bundle (int-weight × bit1 → bit1) ───────────────────────────────
+
+def signed_bundle(W: torch.Tensor, V: Tensor) -> Tensor:
+    """``out[...,m,:] = sign( Σ_n W[...,m,n]·pm1(V[...,n,:]) )`` — register-bound.
+
+    ``W`` is an integer weight tensor ``(B, M, N)`` (cast to int8); ``V`` is a
+    bit1 tensor ``(B, N, D)``.  Returns a bit1 tensor ``(B, M, D)``.  ``V`` is
+    read straight from its packed buffer — never materialised — and the signed
+    vote accumulator lives only in registers.  This is the one int×bit1→bit1
+    reduction ``brute`` does not get from the XNOR-popcount matmul; it powers the
+    soft binary-attention value combine (and its transposed backward).
+    """
+    B, M, N = int(W.shape[0]), int(W.shape[1]), int(W.shape[2])
+    D = int(V.shape[-1])
+    W8 = W.to(torch.int8).contiguous()
+    out_packed = torch.ops.brute.signed_bundle(W8, V._packed_buf_contig(), D)
+    return Tensor._make_bit1_from_packed(out_packed, [B, M, D])
+
+
 # ── Packed-buffer arithmetic for the truly performance-paranoid ─────────
 
 def xor_packed(a_buf: torch.Tensor, b_buf: torch.Tensor) -> torch.Tensor:
