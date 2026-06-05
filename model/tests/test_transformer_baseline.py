@@ -208,7 +208,7 @@ class TestStructuralIOComparison:
         ids = torch.randint(0, 16, (B, n))
         m.forward(ids)
         pos = torch.arange(n).unsqueeze(0)   # (1, n) broadcast over B
-        for h, idx in enumerate(m.blocks[0].mha._cache["idx_heads"]):
+        for h, idx in enumerate(m.h[0].attn._cache["idx_heads"]):
             if idx is not None:
                 assert bool((idx <= pos).all()), (
                     f"Binary model head {h} attended to a future key: idx={idx}"

@@ -3,14 +3,14 @@
 This is a 1:1 binary-native equivalent of a standard decoder transformer, built
 entirely on packed ``brute.bit1`` (uint64) tensors::
 
-    token → E(t)  ── input-bind ──▶  position-free concept  x_i ∈ 𝔹^D
+    input_ids ── wte ──▶  position-free hidden_states  x_i ∈ 𝔹^D
         ┌──────────────────────────────────────────────────────────────┐ ×L
-        │  a = BinaryMultiHeadAttention(x)     # token↔token (ALiBi, causal) │
-        │  x = maj3(x, a, c_A)                 # majority residual          │
-        │  f = BinaryGLU(x)                    # exact XNOR-gated FFN        │
-        │  x = maj3(x, f, c_F)                 # majority residual          │
+        │  a = attn(x)                         # token↔token (ALiBi, causal) │
+        │  x = binary residual(x, a)                                           │
+        │  f = mlp(x)                          # exact XNOR-gated GLU         │
+        │  x = binary residual(x, f)                                           │
         └──────────────────────────────────────────────────────────────┘
-        ── out-bind ──▶ ĉ ── lex-proj ──▶ ℓ̂ ── tied-codebook Hamming ──▶ logits
+        ── lm_head ──▶ tied-codebook Hamming logits
 
 Sequence mixing is one native :class:`~attention.BinaryMultiHeadAttention` (no
 recurrence, no associative bank, no slot memory): queries, keys and values are
@@ -19,7 +19,7 @@ integer register, position is a relative integer ALiBi bias, and the value
 combine is a packed gather (hardmax) or an int8 vote bundle (soft).
 
 Training is **BEP** (Boolean error propagation): the only large buffer per
-parameter is the integer hidden weight ``H`` (Int16); the visible weight is
+parameter is the integer hidden weight ``H`` (Int8); the visible weight is
 ``W = sign(H)``.  The backward pass threads **binary desired activations** ``a*``
 (bit1) — never a float signal — and the head is **contrastive margin-triggered**
 (an update fires for a position only when ``logit[target] − max_other < r·D``).
@@ -41,7 +41,7 @@ import brute
 import bep
 from bep import BepParam, combine_desired, mux
 from attention import BinaryMultiHeadAttention
-from layers import BinaryGLU, BooleanLinear, DiagBind, MajorityResidual, TokenCodebook
+from layers import BinaryGLU, MajorityResidual, TokenCodebook
 
 
 IGNORE_INDEX = -1
@@ -62,27 +62,16 @@ class TransformerConfig:
     causal_strict: bool = False         # exclude self (j < i): recency selects i-1
     value_proj: bool = True             # True: learned W_V/W_O; False: raw-concept copy
     alibi_slopes_override: Optional[tuple] = None  # explicit per-head integer slopes
-    # readout / codebook
-    structured_codebook: bool = True
-    bef_alpha: float = 1.0
-    bef_sweeps: int = 30
-    sem_weight: float = 0.5             # semantic rerank lane weight (0 disables)
-    # BEP training (margin trigger + fixed prototypes, reinforcement)
+    # BEP training (margin trigger + lm_head warmup)
     r: float = 0.1                      # margin trigger: logit[tgt] − max_other < r·D
-    train_output_codebook: bool = True
-    freeze_codebook_after_warmup: bool = False  # if True: codebook frozen after warmup_steps
     margin_r_final: Optional[float] = None
     margin_anneal_steps: int = 0
-    readout_warmup_steps: int = 0
+    lm_head_warmup_steps: int = 0
     max_trigger_rate: Optional[float] = None
-    boundary_nu: Optional[float] = None
-    p_r: float = 0.0
-    bits: int = 15
     init_inertia: int = 1
     update_clip: Optional[int] = None
     block_init_inertia: Optional[int] = None
     block_update_clip: Optional[int] = None
-    flip_dropout: float = 0.0
     # attention score-lane margin objective
     margin_theta_pos: float = 0.5
     margin_theta_neg: float = 0.0
@@ -112,12 +101,6 @@ class TransformerConfig:
             raise ValueError("gate_open must be in [0, 1]")
         if self.d_ff <= 0:
             raise ValueError("d_ff must be positive")
-        if self.sem_weight < 0:
-            raise ValueError("sem_weight must be non-negative")
-        if not 0.0 <= self.flip_dropout < 1.0:
-            raise ValueError("flip_dropout must be in [0, 1)")
-        if self.boundary_nu is not None and self.boundary_nu < 0:
-            raise ValueError("boundary_nu must be non-negative")
         if self.init_inertia <= 0:
             raise ValueError("init_inertia must be positive")
         if self.block_init_inertia is not None and self.block_init_inertia <= 0:
@@ -130,8 +113,8 @@ class TransformerConfig:
             raise ValueError("margin_r_final must be non-negative when set")
         if self.margin_anneal_steps < 0:
             raise ValueError("margin_anneal_steps must be non-negative")
-        if self.readout_warmup_steps < 0:
-            raise ValueError("readout_warmup_steps must be non-negative")
+        if self.lm_head_warmup_steps < 0:
+            raise ValueError("lm_head_warmup_steps must be non-negative")
         if self.max_trigger_rate is not None and not (0 < self.max_trigger_rate <= 1):
             raise ValueError("max_trigger_rate must be in (0, 1] when set")
 
@@ -143,54 +126,56 @@ class Block:
         D = cfg.D
         self.cfg = cfg
         nm = f"blk{idx}"
-        nu = cfg.boundary_nu
         init_inertia = cfg.block_init_inertia or cfg.init_inertia
         update_clip = cfg.block_update_clip if cfg.block_update_clip is not None else cfg.update_clip
-        self.mha = BinaryMultiHeadAttention(
-            D, cfg.n_heads, name=f"{nm}.mha", attn_mode=cfg.attn_mode, alibi=cfg.alibi,
+        self.attn = BinaryMultiHeadAttention(
+            D, cfg.n_heads, name=f"transformer.h.{idx}.attn", attn_mode=cfg.attn_mode, alibi=cfg.alibi,
             causal=cfg.causal, causal_strict=cfg.causal_strict, attn_band=cfg.attn_band,
             value_proj=cfg.value_proj, alibi_slopes_override=cfg.alibi_slopes_override,
-            generator=generator, device=device,
-            boundary_nu=nu, init_inertia=init_inertia, update_clip=update_clip)
-        self.res_a = MajorityResidual(D, name=f"{nm}.res_a", mode=cfg.residual_mode,
-                                      p_open=cfg.gate_open, c_p_true=cfg.residual_c_p_true,
-                                      value_path=True, generator=generator, device=device,
-                                      init_inertia=init_inertia, update_clip=update_clip)
-        self.glu = BinaryGLU(D, cfg.d_ff, name=f"{nm}.glu", generator=generator, device=device,
-                             boundary_nu=nu, init_inertia=init_inertia, update_clip=update_clip)
-        self.res_f = MajorityResidual(D, name=f"{nm}.res_f", mode=cfg.residual_mode,
-                                      p_open=cfg.gate_open, c_p_true=cfg.residual_c_p_true,
-                                      value_path=False, generator=generator, device=device,
-                                      init_inertia=init_inertia, update_clip=update_clip)
+            generator=generator, device=device, init_inertia=init_inertia,
+            update_clip=update_clip)
+        self.resid_attn = MajorityResidual(D, name=f"transformer.h.{idx}.resid_attn",
+                                           mode=cfg.residual_mode, p_open=cfg.gate_open,
+                                           c_p_true=cfg.residual_c_p_true, value_path=True,
+                                           generator=generator, device=device,
+                                           init_inertia=init_inertia, update_clip=update_clip)
+        self.mlp = BinaryGLU(D, cfg.d_ff, name=f"transformer.h.{idx}.mlp",
+                             generator=generator, device=device,
+                             init_inertia=init_inertia, update_clip=update_clip)
+        self.resid_mlp = MajorityResidual(D, name=f"transformer.h.{idx}.resid_mlp",
+                                          mode=cfg.residual_mode, p_open=cfg.gate_open,
+                                          c_p_true=cfg.residual_c_p_true, value_path=False,
+                                          generator=generator, device=device,
+                                          init_inertia=init_inertia, update_clip=update_clip)
         self._cache: dict = {}
 
     def params(self) -> List[BepParam]:
-        return (self.mha.params() + self.res_a.params()
-                + self.glu.params() + self.res_f.params())
+        return (self.attn.params() + self.resid_attn.params()
+                + self.mlp.params() + self.resid_mlp.params())
 
     def forward(self, x_bit: brute.Tensor) -> brute.Tensor:
         B, n, D = x_bit.shape
-        a = self.mha.forward(x_bit)                       # attention sublayer
-        x2 = self.res_a.forward(x_bit, a)                 # majority residual
-        f = self.glu.forward(x2.reshape(B * n, D)).reshape(B, n, D)   # FFN sublayer
-        x4 = self.res_f.forward(x2, f)                    # majority residual
+        a = self.attn.forward(x_bit)                      # attention sublayer
+        x2 = self.resid_attn.forward(x_bit, a)            # binary residual
+        f = self.mlp.forward(x2.reshape(B * n, D)).reshape(B, n, D)   # MLP sublayer
+        x4 = self.resid_mlp.forward(x2, f)                # binary residual
         self._cache = {"shape": (B, n, D), "x_bit": x_bit, "x2": x2}
         return x4
 
     def backward(self, x4_star: brute.Tensor) -> brute.Tensor:
         B, n, D = self._cache["shape"]
         x_bit, x2 = self._cache["x_bit"], self._cache["x2"]
-        x2_skip, f_star = self.res_f.backward(x4_star)
-        x2_trans = self.glu.backward(f_star.reshape(B * n, D)).reshape(B, n, D)
+        x2_skip, f_star = self.resid_mlp.backward(x4_star)
+        x2_trans = self.mlp.backward(f_star.reshape(B * n, D)).reshape(B, n, D)
         x2_star = combine_desired(x2_skip, x2_trans, x2)
-        x_skip, a_star = self.res_a.backward(x2_star)
-        x_trans = self.mha.backward(a_star)
+        x_skip, a_star = self.resid_attn.backward(x2_star)
+        x_trans = self.attn.backward(a_star)
         return combine_desired(x_skip, x_trans, x_bit)
 
     def margin_loss(self, matched: torch.Tensor, *, theta_pos: float, theta_neg: float,
                     active_rows: Optional[torch.Tensor]) -> float:
-        return self.mha.margin_loss(matched, theta_pos=theta_pos, theta_neg=theta_neg,
-                                    active_rows=active_rows)
+        return self.attn.margin_loss(matched, theta_pos=theta_pos, theta_neg=theta_neg,
+                                     active_rows=active_rows)
 
 
 # ── the model ────────────────────────────────────────────────────────────────
@@ -202,32 +187,20 @@ class BinaryTransformerLM:
         self.device = torch.device(device) if device is not None else torch.device("cpu")
         self.inv = float(cfg.D) ** -0.5                    # logit scale (logging only)
         gen = torch.Generator(device="cpu").manual_seed(int(cfg.seed))
-        nu = cfg.boundary_nu
 
-        self.codebook = TokenCodebook(cfg.vocab_size, cfg.D, name="E",
-                                      structured=cfg.structured_codebook,
-                                      bef_alpha=cfg.bef_alpha, bef_sweeps=cfg.bef_sweeps,
-                                      generator=gen, device=self.device, seed=cfg.seed)
-        self.input_bind = DiagBind(cfg.D, name="in", generator=gen, device=self.device,
-                                   init_inertia=cfg.init_inertia, update_clip=cfg.update_clip)
-        self.blocks = [Block(cfg, idx=i, generator=gen, device=self.device)
-                       for i in range(cfg.n_layers)]
-        self.out_bind = DiagBind(cfg.D, name="out", generator=gen, device=self.device,
-                                 init_inertia=cfg.init_inertia, update_clip=cfg.update_clip)
-        self.lex_proj = BooleanLinear(cfg.D, cfg.D, name="lex", generator=gen,
-                                      device=self.device, boundary_nu=nu,
-                                      init_inertia=cfg.init_inertia, update_clip=cfg.update_clip)
-        self.sem_bind = DiagBind(cfg.D, name="sem", generator=gen, device=self.device,
-                                 init_inertia=cfg.init_inertia, update_clip=cfg.update_clip)
+        self.wte = TokenCodebook(cfg.vocab_size, cfg.D, name="lm_head.weight",
+                                 generator=gen, device=self.device, seed=cfg.seed)
+        self.lm_head = self.wte
+        self.h = [Block(cfg, idx=i, generator=gen, device=self.device)
+                  for i in range(cfg.n_layers)]
         self._fwd_cache: dict = {}
         self._train_step = 0
 
     # ── parameters / checkpoint ──────────────────────────────────────────────
     def parameters(self) -> List[BepParam]:
-        ps = self.codebook.params() + self.input_bind.params()
-        for b in self.blocks:
+        ps = self.lm_head.params()
+        for b in self.h:
             ps += b.params()
-        ps += self.out_bind.params() + self.lex_proj.params() + self.sem_bind.params()
         return ps
 
     def num_bit_parameters(self) -> int:
@@ -251,46 +224,20 @@ class BinaryTransformerLM:
             if name in byname:
                 byname[name].load_state_dict(psd)
 
-    # ── flip-dropout (train against the deployment bit-flip noise model) ──────
-    def _flip_noise(self, c_bit: brute.Tensor):
-        rate = self.cfg.flip_dropout
-        if not self.training or rate <= 0:
-            return c_bit, None
-        flip = torch.rand(c_bit.shape, device=self.device) < rate
-        flip_bit = brute.as_tensor(flip, dtype=brute.bit1).to(self.device)
-        noised = brute.fast.bitwise_xor(c_bit, flip_bit)
-        return noised, flip_bit
-
     # ── forward ────────────────────────────────────────────────────────────
     def forward(self, ids: torch.Tensor) -> torch.Tensor:
         ids = ids.to(self.device)
         B, n = ids.shape
         D = self.cfg.D
 
-        emb = self.codebook.embed(ids)
-        c = self.input_bind.forward(emb)
-        flip_masks = []
-        for blk in self.blocks:
-            c, fbit = self._flip_noise(c)
-            flip_masks.append(fbit)
-            c = blk.forward(c)
-        chat = self.out_bind.forward(c)
+        hidden_states = self.wte.embed(ids)
+        for blk in self.h:
+            hidden_states = blk.forward(hidden_states)
 
-        chat_flat = chat.reshape(B * n, D)
-        ell_bit, _ = self.lex_proj.forward(chat_flat)
-        lex_logits = self.codebook.decode(ell_bit)
-
-        sem_bit = None
-        if self.cfg.sem_weight > 0:
-            sem_bit = self.sem_bind.forward(chat_flat)
-            sem_logits = self.codebook.decode(sem_bit)
-            logits = lex_logits.float() + self.cfg.sem_weight * sem_logits.float()
-        else:
-            logits = lex_logits.float()
-
+        hidden_flat = hidden_states.reshape(B * n, D)
+        logits = self.lm_head.decode(hidden_flat).float()
         self._fwd_cache = {
-            "B": B, "n": n, "ell_bit": ell_bit, "sem_bit": sem_bit,
-            "chat_flat": chat_flat, "flip_masks": flip_masks, "ids": ids,
+            "B": B, "n": n, "hidden_flat": hidden_flat, "ids": ids,
         }
         return logits
 
@@ -317,7 +264,7 @@ class BinaryTransformerLM:
         cfg = self.cfg
         if cfg.margin_r_final is None or cfg.margin_anneal_steps <= 0:
             return float(cfg.r)
-        post_warmup = max(0, self._train_step - cfg.readout_warmup_steps)
+        post_warmup = max(0, self._train_step - cfg.lm_head_warmup_steps)
         t = min(1.0, post_warmup / max(1, cfg.margin_anneal_steps))
         return float(cfg.r + (cfg.margin_r_final - cfg.r) * t)
 
@@ -365,17 +312,11 @@ class BinaryTransformerLM:
         max_other, wrong = other.max(dim=1)
         margin_deficit = effective_r * D - (logit_tgt - max_other)
         trigger = valid & (margin_deficit > 0)
-        readout_warmup = (
-            cfg.train_output_codebook
-            and cfg.readout_warmup_steps > 0
-            and self._train_step < cfg.readout_warmup_steps
+        lm_head_warmup = (
+            cfg.lm_head_warmup_steps > 0
+            and self._train_step < cfg.lm_head_warmup_steps
         )
-        codebook_frozen = (
-            cfg.freeze_codebook_after_warmup
-            and cfg.readout_warmup_steps > 0
-            and self._train_step >= cfg.readout_warmup_steps
-        )
-        if readout_warmup:
+        if lm_head_warmup:
             hidden_trigger = torch.zeros_like(trigger)
         else:
             hidden_trigger = self._cap_hidden_trigger(trigger, margin_deficit, valid)
@@ -383,51 +324,34 @@ class BinaryTransformerLM:
         margin_trig_rate = float(trigger.float().mean().item()) if M else 0.0
 
         # Desired activation is discriminative: agreement coords carry no opinion.
-        proto = self.codebook.prototype(safe_tgt)          # (M, D) bit1
-        wrong_proto = self.codebook.prototype(wrong)
+        proto = self.lm_head.prototype(safe_tgt)           # (M, D) bit1
+        wrong_proto = self.lm_head.prototype(wrong)
         agree = brute.fast.eq(proto, wrong_proto)
         sel = brute.as_tensor(hidden_trigger.unsqueeze(1).expand(M, D).contiguous(),
                               dtype=brute.bit1)
-        ell_bit = self._fwd_cache["ell_bit"]
-        ell_margin_des = mux(agree, ell_bit, proto)
-        ell_des = mux(sel, ell_margin_des, ell_bit)
-        chat_flat = self._fwd_cache["chat_flat"]
-        if cfg.train_output_codebook and not codebook_frozen:
-            decode_update = trigger & (pred != tgt)
-            self.codebook.backward_decode(ell_bit, safe_tgt, wrong, decode_update)
+        hidden_flat = self._fwd_cache["hidden_flat"]
+        hidden_margin_des = mux(agree, hidden_flat, proto)
+        hidden_des = mux(sel, hidden_margin_des, hidden_flat)
+        decode_update = trigger & (pred != tgt)
+        self.lm_head.backward_decode(hidden_flat, safe_tgt, wrong, decode_update)
         # only triggered positions inject a backward signal (BEP); the rest carry
         # no opinion (desired = current activation, no weight update).
         bep.set_active(hidden_trigger)
-        g_chat = self.lex_proj.backward(ell_des)
-
-        sem_bit = self._fwd_cache["sem_bit"]
-        if sem_bit is not None:
-            sem_margin_des = mux(agree, sem_bit, proto)
-            sem_des = mux(sel, sem_margin_des, sem_bit)
-            g_chat_sem = self.sem_bind.backward(sem_des)
-            g_chat = combine_desired(g_chat, g_chat_sem, chat_flat)
-        g_chat = g_chat.reshape(B, n, D)
-
-        g_c = self.out_bind.backward(g_chat)
+        g_c = hidden_des.reshape(B, n, D)
 
         margin_val = 0.0
         if (matched is None and cfg.self_supervised_induction and cfg.margin_weight > 0):
             matched = self._synth_induction_matched(targets)
         if matched is not None and cfg.margin_weight > 0:
             active_rows = hidden_trigger.reshape(B, n)
-            for blk in self.blocks:
+            for blk in self.h:
                 margin_val += blk.margin_loss(
                     matched.to(self.device), theta_pos=cfg.margin_theta_pos,
                     theta_neg=cfg.margin_theta_neg, active_rows=active_rows)
 
-        flip_masks = self._fwd_cache["flip_masks"]
-        for blk, fbit in zip(reversed(self.blocks), reversed(flip_masks)):
+        for blk in reversed(self.h):
             g_c = blk.backward(g_c)
-            if fbit is not None:
-                g_c = brute.fast.bitwise_xor(g_c, fbit)    # un-flip the dropout noise
-        g_emb = self.input_bind.backward(g_c)
-        if not codebook_frozen:
-            self.codebook.backward_embed(g_emb)
+        self.wte.backward_embed(g_c)
         bep.set_active(None)
         self._train_step += 1
 
@@ -435,7 +359,7 @@ class BinaryTransformerLM:
                 "trigger_rate": trig_rate,
                 "margin_trigger_rate": margin_trig_rate,
                 "effective_r": effective_r,
-                "readout_warmup": readout_warmup,
+                "lm_head_warmup": lm_head_warmup,
                 "ppl": float(torch.exp(torch.tensor(loss)).item()) if n_valid else float("inf")}
 
     @torch.no_grad()

@@ -59,7 +59,6 @@ class BooleanLinear:
 
     def __init__(self, in_dim: int, out_dim: int, *, name: str,
                  generator: Optional[torch.Generator] = None, device=None,
-                 boundary_nu: Optional[float] = None,
                  init_inertia: int = 1,
                  update_clip: Optional[int] = None):
         self.in_dim, self.out_dim = in_dim, out_dim
@@ -67,7 +66,6 @@ class BooleanLinear:
                                   generator=generator, device=device,
                                   init_inertia=init_inertia,
                                   update_clip=update_clip)
-        self.boundary_nu = boundary_nu
         self._cache: dict = {}
 
     def params(self) -> List[BepParam]:
@@ -130,18 +128,18 @@ class BinaryGLU:
 
     def __init__(self, D: int, d_ff: int, *, name: str,
                  generator: Optional[torch.Generator] = None, device=None,
-                 boundary_nu: Optional[float] = None, init_inertia: int = 1,
+                 init_inertia: int = 1,
                  update_clip: Optional[int] = None):
         self.D, self.d_ff = D, d_ff
         self.Wg = BooleanLinear(D, d_ff, name=f"{name}.Wg", generator=generator,
-                                device=device, boundary_nu=boundary_nu,
-                                init_inertia=init_inertia, update_clip=update_clip)
+                                device=device, init_inertia=init_inertia,
+                                update_clip=update_clip)
         self.Wm = BooleanLinear(D, d_ff, name=f"{name}.Wm", generator=generator,
-                                device=device, boundary_nu=boundary_nu,
-                                init_inertia=init_inertia, update_clip=update_clip)
+                                device=device, init_inertia=init_inertia,
+                                update_clip=update_clip)
         self.W2 = BooleanLinear(d_ff, D, name=f"{name}.W2", generator=generator,
-                                device=device, boundary_nu=boundary_nu,
-                                init_inertia=init_inertia, update_clip=update_clip)
+                                device=device, init_inertia=init_inertia,
+                                update_clip=update_clip)
         self._cache: dict = {}
 
     def params(self) -> List[BepParam]:
@@ -198,7 +196,7 @@ class MajorityResidual:
 
     Either way the gate is initialised mostly **closed** so the block is ≈
     identity at init (an untrained branch otherwise injects ~25% bit noise into
-    the skip and destroys the signal before the readout can learn); closed
+    the skip and destroys the signal before the LM head can learn); closed
     coordinates pass the skip unchanged.  Fully packed (AND/OR/MUX only).
     """
 
@@ -285,21 +283,20 @@ class TokenCodebook:
     """
 
     def __init__(self, vocab_size: int, D: int, *, name: str = "E",
-                 structured: bool = False, bef_alpha: float = 1.0, bef_sweeps: int = 30,
                  generator: Optional[torch.Generator] = None, device=None,
                  seed: int = 0):
         self.V, self.D = vocab_size, D
-        self._input_seed = int(seed) if structured else int(seed) ^ 0x5EED_5EED
+        self._input_seed = int(seed)
         self._embed_cache: dict = {}
 
         dev = device
-        H = torch.empty(vocab_size, D, dtype=torch.int16, device=dev)
+        H = torch.empty(vocab_size, D, dtype=bep.H_DTYPE, device=dev)
         chunk = max(1, min(vocab_size, max(1, 4_194_304 // max(D, 1))))
         for start in range(0, vocab_size, chunk):
             end = min(start + chunk, vocab_size)
             ids = torch.arange(start, end, dtype=torch.long, device=dev)
             rows = balanced_hash_frame_bool(ids, D, seed=self._input_seed, device=dev)
-            H[start:end] = rows.to(torch.int16).mul_(2).sub_(1).mul_(_CODEBOOK_INIT_INERTIA)
+            H[start:end] = rows.to(bep.H_DTYPE).mul_(2).sub_(1).mul_(_CODEBOOK_INIT_INERTIA)
         self.E = BepParam(H, name=name)
 
     def params(self) -> List[BepParam]:
@@ -333,8 +330,8 @@ class TokenCodebook:
                         wrong_ids: torch.Tensor, active_mask: torch.Tensor) -> None:
         """Sparse multiclass-perceptron update for the trainable output codebook.
 
-        Triggered rows vote ``E[target] += ell`` and ``E[wrong] -= ell`` directly
-        into the existing int16 ``H`` buffer with row ``index_add_``.  No dense
+        Triggered rows vote ``E[target] += ell`` and ``E[wrong] -= ell`` into the
+        existing int8 ``H`` buffer with coalesced sparse row updates.  No dense
         ``V x D`` delta tensor and no additional per-weight state are allocated.
         """
         active = active_mask.to(device=self.E.device, dtype=torch.bool).reshape(-1)
@@ -343,10 +340,10 @@ class TokenCodebook:
         active = active & (tgt >= 0) & (tgt < self.V) & (wrong >= 0) & (wrong < self.V) & (tgt != wrong)
         if int(active.sum().item()) == 0:
             return None
-        rows = pm1_int(ell_bit, dtype=torch.int16)[active]
+        rows = pm1_int(ell_bit, dtype=torch.int32)[active]
         if self.E.lr != 1:
-            rows = (rows.to(torch.int32) * int(self.E.lr)).to(torch.int16)
-        self.E.H.index_add_(0, tgt[active], rows)
-        self.E.H.index_add_(0, wrong[active], -rows)
-        self.E._dirty = True
+            rows = rows * int(self.E.lr)
+        idx = torch.cat([tgt[active], wrong[active]], dim=0)
+        delta = torch.cat([rows, -rows], dim=0)
+        self.E.sparse_accumulate_rows(idx, delta)
         return None

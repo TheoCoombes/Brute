@@ -5,13 +5,13 @@ Covers:
 * all eight mode combinations (value_proj × attn_mode × residual_mode)
 * checkpoint round-trip (state_dict / load_state_dict + torch.save/load)
 * generate: shape, top_k, repetition_window, determinism vs sampling
-* memory contract: param_bytes() == 2 * num_bit_parameters()
+* memory contract: param_bytes() == num_bit_parameters() (int8 H)
 * config validation (ValueError for bad configs, succeeds for valid ones)
 * _synth_induction_matched: hand-verified small example
 * metrics: loss / acc / ppl match manual computation
 * Block backward returns bit1 (B,n,D) and leaves all params as valid BepParams
 * learnability probes (slow): prev-token copy with hardmax and soft attention
-* fast local-identity sanity (non-slow): readout/codebook co-adaptation check
+* fast local-identity sanity (non-slow): lm_head co-adaptation check
 """
 
 from __future__ import annotations
@@ -42,7 +42,7 @@ def _tiny_cfg(**overrides) -> TransformerConfig:
         vocab_size=16, D=128, n_layers=1, n_heads=1, d_ff=256,
         attn_mode="hardmax", residual_mode="mux", value_proj=False,
         causal=True, causal_strict=True, alibi=True,
-        sem_weight=0.0, seed=0,
+        seed=0,
     )
     kw.update(overrides)
     return TransformerConfig(**kw)
@@ -59,7 +59,7 @@ def _train_one_step(m: BinaryTransformerLM) -> dict:
     tgt = _rand_ids(B, n, V)
     logits = m.forward(ids)
     info = m.loss_and_backward(logits, tgt)
-    BepOptimizer(m.parameters(), BepConfig(r=m.cfg.r)).step()
+    BepOptimizer(m.parameters(), BepConfig()).step()
     return info
 
 
@@ -107,7 +107,7 @@ def test_eight_mode_combos(value_proj, attn_mode, residual_mode):
     cfg = TransformerConfig(
         vocab_size=48, D=128, n_heads=2, n_layers=2, d_ff=256,
         attn_mode=attn_mode, residual_mode=residual_mode,
-        value_proj=value_proj, sem_weight=0.0, seed=0,
+        value_proj=value_proj, seed=0,
     )
     m = BinaryTransformerLM(cfg)
     B, n = 3, 6
@@ -115,7 +115,7 @@ def test_eight_mode_combos(value_proj, attn_mode, residual_mode):
     tgt = _rand_ids(B, n, V=48)
     logits = m.forward(ids)
     info = m.loss_and_backward(logits, tgt)
-    BepOptimizer(m.parameters(), BepConfig(r=cfg.r)).step()
+    BepOptimizer(m.parameters(), BepConfig()).step()
     assert math.isfinite(info["loss"]), f"loss not finite: {info['loss']}"
     assert 0.0 <= info["trigger_rate"] <= 1.0, (
         f"trigger_rate out of [0,1]: {info['trigger_rate']}"
@@ -220,10 +220,10 @@ class TestGenerate:
 # ── memory contract ──────────────────────────────────────────────────────────────
 
 class TestMemoryContract:
-    def test_param_bytes_equals_twice_num_bit_parameters(self):
+    def test_param_bytes_equals_num_bit_parameters(self):
         m = BinaryTransformerLM(_tiny_cfg())
-        assert m.param_bytes() == 2 * m.num_bit_parameters(), (
-            f"param_bytes()={m.param_bytes()} != 2*num_bit_parameters()={2*m.num_bit_parameters()}"
+        assert m.param_bytes() == m.num_bit_parameters(), (
+            f"param_bytes()={m.param_bytes()} != num_bit_parameters()={m.num_bit_parameters()}"
         )
 
     def test_num_bit_parameters_equals_sum_of_param_sizes(self):
@@ -236,11 +236,11 @@ class TestMemoryContract:
             f"num_bit_parameters()={m.num_bit_parameters()} != sum of shapes={total}"
         )
 
-    def test_int16_H_buffers(self):
+    def test_int8_H_buffers(self):
         m = BinaryTransformerLM(_tiny_cfg())
         for p in m.parameters():
-            assert p.H.dtype == torch.int16, (
-                f"param '{p.name}' has H.dtype={p.H.dtype}, expected int16"
+            assert p.H.dtype == torch.int8, (
+                f"param '{p.name}' has H.dtype={p.H.dtype}, expected int8"
             )
 
 
@@ -408,26 +408,26 @@ class TestBlockBackward:
             f"expected [{B},{n},{D}], got {list(x_star.shape)}"
         )
 
-    def test_all_params_remain_int16(self):
+    def test_all_params_remain_int8(self):
         cfg = _tiny_cfg(n_layers=2)
         m = BinaryTransformerLM(cfg)
         ids = _rand_ids(2, 6)
         tgt = _rand_ids(2, 6)
         logits = m.forward(ids)
         m.loss_and_backward(logits, tgt)
-        BepOptimizer(m.parameters(), BepConfig(r=cfg.r)).step()
+        BepOptimizer(m.parameters(), BepConfig()).step()
         for p in m.parameters():
             assert isinstance(p, BepParam), f"'{p.name}' is not a BepParam"
-            assert p.H.dtype == torch.int16, (
+            assert p.H.dtype == torch.int8, (
                 f"param '{p.name}' H.dtype={p.H.dtype} after step"
             )
 
 
 # ── fast local-identity sanity (non-slow) ────────────────────────────────────────
 
-def test_local_identity_readout_sanity():
+def test_local_identity_lm_head_sanity():
     """A gate-closed config (identity init) should learn the local identity task
-    (target == current token) in ~150 steps, confirming readout/codebook training.
+    (target == current token) in ~150 steps, confirming lm_head training.
 
     This is intentionally non-slow: it uses a small batch, short sequences, and
     only ~150 steps, and should reach > 0.6 comfortably.
@@ -436,13 +436,13 @@ def test_local_identity_readout_sanity():
         vocab_size=16, D=128, n_heads=1, n_layers=1, d_ff=256,
         attn_mode="hardmax", residual_mode="mux", value_proj=True,
         causal=True, causal_strict=False, alibi=True,
-        gate_open=0.05, r=0.15, readout_warmup_steps=10,
+        gate_open=0.05, r=0.15, lm_head_warmup_steps=10,
         max_trigger_rate=0.6, block_init_inertia=6, block_update_clip=1,
         margin_weight=0.0, self_supervised_induction=False,
-        sem_weight=0.0, seed=0,
+        seed=0,
     )
     m = BinaryTransformerLM(cfg)
-    opt = BepOptimizer(m.parameters(), BepConfig(r=cfg.r))
+    opt = BepOptimizer(m.parameters(), BepConfig())
     g = torch.Generator(device="cpu").manual_seed(99)
     B, n, V = 8, 8, 16
 
@@ -462,7 +462,7 @@ def test_local_identity_readout_sanity():
 
     assert best > 0.6, (
         f"Local-identity task did not reach 0.6 in 150 steps; best={best:.3f}. "
-        f"Readout / codebook training may be broken."
+        f"LM head training may be broken."
     )
 
 

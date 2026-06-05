@@ -23,7 +23,7 @@ import torch
 import pytest
 import brute
 import bep
-from bep import BepParam, BepConfig, BepOptimizer, random_bit_param
+from bep import random_bit_param
 import vsa
 import layers
 from layers import BooleanLinear, DiagBind
@@ -313,9 +313,10 @@ def test_mux_per_coordinate_select(gen):
 # ── pm1_int ───────────────────────────────────────────────────────────────────────
 
 def test_pm1_int_true_plus1_false_minus1(gen):
-    """pm1_int maps True → +1, False → −1 as int16 (default dtype)."""
+    """pm1_int maps True → +1, False → −1 as int8 (default dtype)."""
     b = vsa.to_bit1(torch.tensor([True, False, True, False]))
     pm1 = bep.pm1_int(b)
+    assert pm1.dtype == torch.int8
     assert pm1.tolist() == [1, -1, 1, -1], (
         "pm1_int must map True→+1, False→−1"
     )
@@ -398,24 +399,21 @@ def test_bep_param_accumulate_changes_H(gen):
     H_before = p.H.clone()
     delta = torch.ones(8, 4, dtype=torch.int32)
     p.accumulate(delta)
-    assert torch.equal(p.H, (H_before + 1).to(torch.int16)), (
+    assert torch.equal(p.H, (H_before.to(torch.int32) + 1).clamp(-128, 127).to(torch.int8)), (
         "accumulate must add delta to H"
     )
     assert p._dirty, "accumulate must mark _dirty=True"
 
 
-def test_bep_param_step_clips_H(gen):
-    """BepParam.step clips H to [-(2^{bits-1}), 2^{bits-1} - 1]."""
-    p = random_bit_param((4,), "test", generator=gen, bits=3)
-    p.H.fill_(100)          # deliberately out of range (max allowed = 3)
-    p.step()
-    lim = 1 << (3 - 1)      # = 4; clip is [-4, 3]
-    assert bool((p.H <= lim - 1).all()), (
-        f"H must be clipped to max={lim - 1} after step"
-    )
-    assert bool((p.H >= -lim).all()), (
-        f"H must be clipped to min={-lim} after step"
-    )
+def test_bep_param_accumulate_saturates_int8(gen):
+    """BepParam.accumulate saturates H at the int8 rails instead of wrapping."""
+    p = random_bit_param((4,), "test", generator=gen)
+    p.H.fill_(120)
+    p.accumulate(torch.full((4,), 20, dtype=torch.int32))
+    assert bool((p.H == 127).all()), "positive int8 updates must saturate at 127"
+    p.H.fill_(-120)
+    p.accumulate(torch.full((4,), -20, dtype=torch.int32))
+    assert bool((p.H == -128).all()), "negative int8 updates must saturate at -128"
 
 
 def test_bep_param_step_reports_sign_flip_count(gen):
@@ -424,7 +422,7 @@ def test_bep_param_step_reports_sign_flip_count(gen):
     p.step()  # initialize _prev_sign
     # Force exactly one flip by changing sign of element 0
     flipped_positive = bool(p.H[0] >= 0)
-    p.H[0] = -9999 if flipped_positive else 9999
+    p.H[0] = -1 if flipped_positive else 1
     n_flip = p.step()
     assert n_flip == 1, (
         f"step should report 1 sign flip, got {n_flip}"
@@ -447,14 +445,14 @@ def test_bep_param_state_dict_roundtrip(gen):
     )
 
 
-def test_bep_param_param_bytes_is_2_numel(gen):
-    """BepParam.param_bytes() == H.nbytes == 2 * numel (int16 = 2 bytes each)."""
+def test_bep_param_param_bytes_is_numel(gen):
+    """BepParam.param_bytes() == H.nbytes == numel (int8 = 1 byte each)."""
     p = random_bit_param((8, 16), "test", generator=gen)
     assert p.param_bytes() == p.H.nbytes, (
         "param_bytes() must equal H.nbytes"
     )
-    assert p.param_bytes() == 2 * p.H.numel(), (
-        "int16 H: param_bytes must be 2 * numel"
+    assert p.param_bytes() == p.H.numel(), (
+        "int8 H: param_bytes must equal numel"
     )
 
 
@@ -465,7 +463,7 @@ def test_random_bit_param_shape_and_dtype(gen):
     shape = (16, 32)
     p = random_bit_param(shape, "rp", generator=gen)
     assert p.H.shape == torch.Size(shape)
-    assert p.H.dtype == torch.int16
+    assert p.H.dtype == torch.int8
     assert p.bit.dtype == brute.bit1
     assert p.bit.shape == torch.Size(shape)
 

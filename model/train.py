@@ -1,9 +1,9 @@
-"""Train a HÆMMR binary language model on WikiText with the GPT-2 tokenizer.
+"""Train a binary GPT-style language model on WikiText with the GPT-2 tokenizer.
 
-The hot path stays packed-bit: the codebook, binding masks, episodic address
-projections, Hopfield slots, channel-mix weights, and residual gates all live
-as ``brute.bit1`` tensors. Training uses BEP/BOLD-style integer hidden weights
-(``bep.py``): each parameter stores an int16 ``H`` buffer, the visible weight is
+The hot path stays packed-bit: token codes, attention projections, MLP weights,
+LM-head rows, and residual gates all live as ``brute.bit1`` tensors. Training
+uses BEP/BOLD-style integer hidden weights (``bep.py``): each parameter stores
+an int8 ``H`` buffer, the visible weight is
 ``sign(H)``, and the backward path threads binary desired activations instead of
 float gradients.
 
@@ -15,23 +15,18 @@ Useful flags::
 
     --D            concept hypervector dimension
     --layers       number of Boolean blocks
-    --codebook-mode {structured,random}
-                  structured balanced hash by default; random = alternate balanced hash seed
-    --r            margin trigger fraction for lexical updates
-    --bits         hidden-weight clamp width
+    --r            margin trigger fraction for LM-head / hidden updates
     --block-init-inertia
                   initial |H| for stacked blocks (default: 8 for stable depth)
     --block-update-clip
                   elementwise ΔH clamp for stacked blocks (default: 1)
-    --readout-warmup-steps
-                  early codebook-only steps before hidden BEP updates
+    --lm-head-warmup-steps
+                  early LM-head-only steps before hidden BEP updates
     --margin-r-final / --margin-anneal-steps
-                  anneal the BEP margin after readout warmup
+                  anneal the BEP margin after LM-head warmup
     --max-trigger-rate
                   cap actual hidden BEP rows per batch
     --gate-open    residual gate initial openness
-    --no-position  disable hierarchical position codes in the episodic lane
-    --sem-weight   semantic rerank weight added to lexical decode logits
     --device       cpu | mps | cuda  (default: cpu)
 """
 
@@ -51,9 +46,6 @@ import brute  # noqa: F401 — ensure the extension is importable
 from bep import BepConfig, BepOptimizer
 from data import make_lm_batches, wikitext, tiny_shakespeare, tiny_shakespeare_char
 from model import TransformerConfig, BinaryTransformerLM, IGNORE_INDEX
-
-
-CODEBOOK_MODES = ("structured", "random")
 
 
 def auto_device(choice):
@@ -128,42 +120,25 @@ def main():
     p.add_argument("--steps", type=int, default=1500, help="number of optimiser (flip) steps.")
     p.add_argument("--r", type=float, default=0.1,
                    help="BEP margin trigger: update fires when logit[tgt] − max_other < r·D.")
-    p.add_argument("--p-r", type=float, default=0.0,
-                   help="CP+R reinforcement probability (BEP §3.3).")
-    p.add_argument("--bits", type=int, default=15, help="integer hidden-weight H bit-width.")
     p.add_argument("--init-inertia", type=int, default=1,
-                   help="initial |H| for non-codebook head/readout parameters.")
+                   help="initial |H| for non-block parameters.")
     p.add_argument("--update-clip", type=int, default=None,
-                   help="optional elementwise ΔH clamp for non-codebook head/readout parameters.")
+                   help="optional elementwise ΔH clamp for non-block parameters.")
     p.add_argument("--block-init-inertia", type=int, default=8,
                    help="initial |H| for stacked blocks; higher damps first-batch rewrites.")
     p.add_argument("--block-update-clip", type=int, default=1,
                    help="optional elementwise ΔH clamp for stacked blocks.")
-    p.add_argument("--readout-warmup-steps", type=int, default=25,
-                   help="codebook-only steps before hidden/block BEP updates.")
-    p.add_argument("--freeze-codebook-after-warmup", action="store_true", default=False,
-                   help="freeze codebook after readout warmup: transformer trains against fixed char prototypes.")
+    p.add_argument("--lm-head-warmup-steps", type=int, default=25,
+                   help="LM-head-only steps before hidden/block BEP updates.")
     p.add_argument("--margin-r-final", type=float, default=0.0,
                    help="final BEP margin fraction after annealing.")
     p.add_argument("--margin-anneal-steps", type=int, default=100,
-                   help="steps after readout warmup over which r decays.")
+                   help="steps after LM-head warmup over which r decays.")
     p.add_argument("--max-trigger-rate", type=float, default=0.25,
                    help="cap actual hidden BEP update rows as a fraction of valid rows.")
     p.add_argument("--log-csv", default=None, help="append the loss curve to this CSV file.")
     p.add_argument("--gate-open", type=float, default=0.05,
                    help="residual admittance-gate init openness (→ identity init).")
-    p.add_argument(
-        "--codebook-mode",
-        choices=CODEBOOK_MODES,
-        default="structured",
-        help="structured balanced hash by default; random uses an alternate balanced hash seed.",
-    )
-    p.add_argument("--bef-sweeps", type=int, default=30)
-    p.add_argument("--sem-weight", type=float, default=0.5,
-                   help="semantic rerank weight added to lexical decode logits.")
-    p.add_argument("--boundary-nu", type=float, default=None,
-                   help="BEP-style boundary eligibility gate; unset disables it.")
-    p.add_argument("--flip-dropout", type=float, default=0.0)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="cpu", choices=["cpu", "mps", "cuda"])
     p.add_argument("--eval-every", type=int, default=100)
@@ -180,10 +155,7 @@ def main():
     torch.manual_seed(args.seed)
     print(f"device: {device}")
 
-    codebook_mode = args.codebook_mode
-    structured_codebook = codebook_mode != "random"
-
-    print(f"loading {args.dataset} with full GPT-2 tokenizer (codebook={codebook_mode}) …")
+    print(f"loading {args.dataset} with full GPT-2 tokenizer …")
     if args.dataset == "tiny-shakespeare-char":
         corpus = tiny_shakespeare_char(data_root=args.data_root)
     elif args.dataset == "tiny-shakespeare":
@@ -210,32 +182,26 @@ def main():
                             residual_mode=args.residual_mode, value_proj=args.value_proj,
                             causal_strict=args.causal_strict, alibi=args.alibi,
                             gate_open=args.gate_open,
-                            structured_codebook=structured_codebook,
-                            bef_sweeps=args.bef_sweeps, sem_weight=args.sem_weight,
-                            boundary_nu=args.boundary_nu,
                             init_inertia=args.init_inertia,
                             update_clip=args.update_clip,
                             block_init_inertia=args.block_init_inertia,
                             block_update_clip=args.block_update_clip,
-                            readout_warmup_steps=args.readout_warmup_steps,
-                            freeze_codebook_after_warmup=args.freeze_codebook_after_warmup,
+                            lm_head_warmup_steps=args.lm_head_warmup_steps,
                             margin_r_final=args.margin_r_final,
                             margin_anneal_steps=args.margin_anneal_steps,
                             max_trigger_rate=args.max_trigger_rate,
-                            flip_dropout=args.flip_dropout,
-                            r=args.r, p_r=args.p_r, bits=args.bits,
+                            r=args.r,
                             )
     model = BinaryTransformerLM(cfg, device=device)
-    opt = BepOptimizer(model.parameters(),
-                       BepConfig(r=args.r, p_r=args.p_r, bits=args.bits))
+    opt = BepOptimizer(model.parameters(), BepConfig())
     n_bits = model.num_bit_parameters()
     print(f"model: D={cfg.D} layers={cfg.n_layers} heads={cfg.n_heads} d_ff={cfg.d_ff}"
           f" attn={cfg.attn_mode} resid={cfg.residual_mode} value_proj={cfg.value_proj}"
           f" block_H0={cfg.block_init_inertia or cfg.init_inertia}"
-          f" warmup={cfg.readout_warmup_steps}"
+          f" warmup={cfg.lm_head_warmup_steps}"
           f" r={cfg.r}->{cfg.margin_r_final if cfg.margin_r_final is not None else cfg.r}"
           f" cap={cfg.max_trigger_rate}"
-          f"  |  {n_bits:,} bit-params ≈ {n_bits/8/1e6:.2f} MB")
+          f"  |  {n_bits:,} bit-params, H storage {model.param_bytes()/1e6:.2f} MB")
     init = evaluate(model, Xva, Yva, args.batch_size)
     print(f"step 0    val loss {init['loss']:.3f}  ppl {init['ppl']:.1f}  acc {init['acc']:.4f}")
 

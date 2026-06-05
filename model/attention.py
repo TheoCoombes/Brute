@@ -20,8 +20,7 @@ per-head value outputs are merged into the ``W_O`` input by concatenating the
 underlying uint64 buffers (never ``cat``/``stack`` on the logical bits), so no
 step ever unpacks.
 
-Backward is **BEP** (Boolean error propagation), lifted from the proven
-``EpisodicSlotMemory`` value-path + ``margin_loss``:
+Backward is **BEP** (Boolean error propagation):
 
   * **value path** (``backward``): the desired head output ``o*`` is routed to the
     value rows ``vⱼ`` weighted by the *same* attention weights (transposed) — the
@@ -169,7 +168,6 @@ class BinaryMultiHeadAttention:
                  causal_strict: bool = False, attn_band: int = 1, value_proj: bool = True,
                  alibi_slopes_override=None,
                  generator: Optional[torch.Generator] = None, device=None,
-                 boundary_nu: Optional[float] = None,
                  init_inertia: int = 1, update_clip: Optional[int] = None):
         if D % n_heads != 0:
             raise ValueError(f"D={D} not divisible by n_heads={n_heads}")
@@ -193,8 +191,8 @@ class BinaryMultiHeadAttention:
 
         def mk(nm, out):
             return BooleanLinear(D, out, name=f"{name}.{nm}", generator=generator,
-                                 device=device, boundary_nu=boundary_nu,
-                                 init_inertia=init_inertia, update_clip=update_clip)
+                                 device=device, init_inertia=init_inertia,
+                                 update_clip=update_clip)
         # Per-head projections D → d_h (standard MHA factorisation).
         self.Wq = [mk(f"Wq.h{h}", d_h) for h in range(n_heads)]
         self.Wk = [mk(f"Wk.h{h}", d_h) for h in range(n_heads)]
@@ -203,10 +201,10 @@ class BinaryMultiHeadAttention:
             self.Wv = [mk(f"Wv.h{h}", d_h) for h in range(n_heads)]
             self.Wo = mk("Wo", D)
         else:
-            # Raw-concept-copy attention (HÆMMR-style retrieval): the value is the
+            # Raw-concept-copy attention (diagnostic retrieval mode): the value is the
             # source concept's head slice (no W_V), the output is the gathered
             # concatenation (no W_O).  The retrieved value is therefore a *clean*
-            # codeword the readout decodes directly — exact value transport for
+            # codeword the LM head decodes directly — exact value transport for
             # copy / retrieval, with only the Q/K address lane learned.
             self.Wv = None
             self.Wo = None
@@ -347,9 +345,10 @@ class BinaryMultiHeadAttention:
                 w_t = w.transpose(1, 2).contiguous()                 # (B,n,n) w_ji
                 v_star_h = signed_bundle(w_t, o_star_h)              # (B,n,d_h)
             else:
-                # hardmax: scatter o*_i into its argmax source j; sign the int8 vote.
-                o_pm1 = pm1_int(o_star_h, torch.int8).reshape(B, n, d_h)
-                acc = torch.zeros(B, n, d_h, dtype=torch.int8, device=dev)
+                # hardmax: scatter o*_i into its argmax source j; sign the vote.
+                # A source can receive O(B*n) queries, so int8 would wrap here.
+                o_pm1 = pm1_int(o_star_h, torch.int16).reshape(B, n, d_h)
+                acc = torch.zeros(B, n, d_h, dtype=torch.int16, device=dev)
                 src = idx.unsqueeze(-1).expand(B, n, d_h)
                 acc.scatter_add_(1, src, o_pm1)
                 v_star_h = sign_to_bit1(acc)
@@ -371,8 +370,7 @@ class BinaryMultiHeadAttention:
 
         ``matched`` is ``(B, n)`` long: the supervising key index for each query
         (the self-supervised induction match; ``-1`` = no supervision).  Mirrors
-        :meth:`EpisodicSlotMemory.margin_loss`, generalised over heads — each
-        head trains its own ``W_Q^h, W_K^h``.
+        Each head trains its own ``W_Q^h, W_K^h``.
         """
         B, n = self._cache["B"], self._cache["n"]
         H, d_h = self.H, self.d_h

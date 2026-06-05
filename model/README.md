@@ -1,8 +1,8 @@
 # `model/` — a native binary decoder transformer (BEP-trained, fully packed)
 
 A **1:1 binary-native equivalent of a standard decoder transformer**: token↔token
-attention, a GLU feed-forward, residual connections and tied-codebook logits —
-built entirely on packed 1-bit `brute.bit1` (uint64) tensors and trained with
+attention, a GLU feed-forward, residual connections and Hamming LM-head logits —
+built on packed 1-bit `brute.bit1` (uint64) activations/visible weights and trained with
 **BEP** (Boolean error propagation: integer hidden weights, 1-bit visible
 weights, binary desired-activation backward). No float weights, no float
 optimiser state, and the sequence-mixing hot path never unpacks.
@@ -13,15 +13,34 @@ This replaces the earlier HÆMMR mixers (a linear-recurrence `BSR`, a
 ("extending BEP to transformer-style models … multi-head mechanisms").
 
 ```
-token → E(t) ── input-bind ──▶ position-free concept  x_i ∈ 𝔹^D
+input_ids ── wte ──▶ position-free hidden_states  x_i ∈ 𝔹^D
    ┌────────────────────────────────────────────────────────────────┐ × n_layers
-   │  a = BinaryMultiHeadAttention(x)    # token↔token (ALiBi, causal)  │
-   │  x = residual(x, a)                 # gated mux / majority         │
-   │  f = BinaryGLU(x)                   # exact XNOR-gated FFN          │
+   │  a = h[i].attn(x)                   # token↔token (ALiBi, causal)  │
+   │  x = binary residual(x, a)                                           │
+   │  f = h[i].mlp(x)                    # exact XNOR-gated GLU          │
    │  x = residual(x, f)                                                │
    └────────────────────────────────────────────────────────────────┘
-   ── out-bind ──▶ ĉ ── lex-proj ──▶ ℓ̂ ── ⟨ℓ̂, E(t)⟩ Hamming logits ──▶ softmax
+   ── lm_head ──▶ Hamming logits ──▶ softmax
 ```
+
+## GPT-2 naming map
+
+The public structure follows Hugging Face GPT-2 names where the concepts match:
+
+| GPT-2 name | Binary model equivalent |
+|------------|-------------------------|
+| `transformer.wte` | `wte` deterministic packed token codes |
+| `transformer.wpe` | no table; position is integer ALiBi in attention scores |
+| `transformer.h` | `h`, the list of decoder blocks |
+| `h[i].attn` | `BinaryMultiHeadAttention` |
+| `h[i].mlp` | `BinaryGLU` |
+| `transformer.ln_f` | no float layer norm; final hidden state goes straight to `lm_head` |
+| `lm_head` | trainable binary Hamming LM head (`lm_head.weight`) |
+
+The old lexical projection / semantic rerank lane is gone; logits are produced
+directly by `lm_head(hidden_states)`. Unlike Hugging Face GPT-2's tied
+`lm_head.weight` / `transformer.wte.weight`, this implementation keeps input
+codes fixed and trains the output `lm_head.weight`.
 
 ## The attention mechanism (`attention.py`)
 
@@ -49,7 +68,7 @@ whole forward stays packed.
   `⟨u,v⟩ = D − 2·Hamming`; the score register; ALiBi (relative, integer); the
   causal mask; **hardmax** value transport (a packed gather — bit-exact copy of
   the argmax source); the XNOR-GLU gate; the coordinate majority residual; the
-  tied-codebook Hamming logits.
+  Hamming LM-head logits.
 * **Bounded approximation (soft attention only):** the soft value combine is a
   *signed integer vote bundle* `sign(Σ_j w_ij·pm1(v_j))`. It satisfies a
   **dominance theorem** — if one source's weight exceeds the sum of all others
@@ -60,7 +79,7 @@ whole forward stays packed.
 
 ## BEP training (`bep.py`, reused verbatim)
 
-Each parameter is an int16 hidden weight `H`; the visible weight is `W = sign(H)`
+Each parameter is an int8 hidden weight `H`; the visible weight is `W = sign(H)`
 (≈1 bit/weight). The backward pass threads **binary desired activations** `a*`
 (bit1) — never a float signal:
 
@@ -77,13 +96,15 @@ Each parameter is an int16 hidden weight `H`; the visible weight is `W = sign(H)
 
 ## Hot-path-packed invariant
 
-Every *persistent* tensor is packed `brute.bit1` (uint64) end-to-end. The only
-integers are **transient registers**: the int32 score `ℓ`, the int8 attention
-weights `n(ℓ)`, and the int8 value-vote accumulator. The forward pass performs
-**zero** unpacks of any kind (verified in `tests/test_efficiency_contracts.py`);
-a full training step materialises **no** dense ±1 float (`unpack_bits`) — the only
-bit→byte unpacks (`unpack_bool`) are BEP weight-gradient / codebook updates at
-parameter granularity, never per token-pair.
+Every persistent activation and visible weight is packed `brute.bit1` (uint64)
+end-to-end. Trainable inertia is the int8 `H` buffer behind each visible weight.
+The other integers are **transient registers**: the int32 score `ℓ`, the int8
+attention weights `n(ℓ)`, and the int8 value-vote accumulator. The forward pass
+performs **zero** unpacks of any kind (verified in
+`tests/test_efficiency_contracts.py`); a full training step materialises **no**
+dense ±1 float (`unpack_bits`) — the only bit→byte unpacks (`unpack_bool`) are
+BEP weight-gradient / LM-head updates at parameter granularity, never per
+token-pair.
 
 ## The one custom kernel — `brute.signed_bundle` (Stage B)
 
@@ -107,7 +128,7 @@ test recipes in `tests/_helpers.py::retrieval_config`):
 
 * **Residual cold-start.** A summed binary residual is *not* identity at init —
   an untrained branch injects ~25% bit noise and destroys the signal before the
-  readout can learn. The residual is therefore admitted through a per-coordinate
+  LM head can learn. The residual is therefore admitted through a per-coordinate
   gate initialised mostly **closed** (≈ identity at init), opening where the
   branch predicts the target.
 * **`residual_mode`.** `mux` (open ⇒ branch *replaces* skip) is required for exact
@@ -115,13 +136,13 @@ test recipes in `tests/_helpers.py::retrieval_config`):
   is the BOLD-faithful binary residual but can only *add*, not overwrite.
 * **`value_proj`.** `True` (faithful `W_V/W_O`) is the default. `False` is
   raw-concept-copy attention: the retrieved value is the clean source codeword
-  (no projection), which the readout decodes directly — the cleanest, most stable
+  (no projection), which the LM head decodes directly — the cleanest, most stable
   transport for copy / retrieval tasks.
 * **ALiBi must scale to `d_h`.** Scores are the unnormalised `±d_h` dot, so slopes
   span `1` (content head) to `> 2·d_h` (recency head, attends the nearest key).
-* **Gentle updates.** The readout/codebook co-adaptation runs away under
+* **Gentle updates.** The LM-head/codebook co-adaptation runs away under
   aggressive hyper-parameters; small `r`, `max_trigger_rate`, `update_clip` and a
-  `readout_warmup_steps` keep it convergent.
+  `lm_head_warmup_steps` keep it convergent.
 
 **Verified end-to-end:** local next-token identity → ~1.0; previous-token copy (a
 genuine non-local attention task) → ~1.0, *matching a float transformer baseline*
@@ -135,8 +156,7 @@ itself is verified bit-exact in `tests/test_attention.py`.
 | shape | `D, n_layers, n_heads, d_ff` | `D // n_heads` must be a multiple of 64 |
 | attention | `attn_mode {soft,hardmax}`, `attn_band`, `alibi`, `causal`, `causal_strict`, `value_proj`, `alibi_slopes_override` | soft `band` ≥ 1 = temperature |
 | residual | `residual_mode {mux,majority}`, `gate_open` | `gate_open` low ⇒ identity init |
-| codebook | `structured_codebook`, `bef_*`, `sem_weight` | tied Hamming readout |
-| BEP | `r`, `margin_r_final`, `margin_anneal_steps`, `readout_warmup_steps`, `max_trigger_rate`, `p_r`, `bits`, `init_inertia`, `update_clip`, `block_init_inertia`, `block_update_clip` | margin trigger + integer step |
+| head / BEP | `r`, `margin_r_final`, `margin_anneal_steps`, `lm_head_warmup_steps`, `max_trigger_rate`, `init_inertia`, `update_clip`, `block_init_inertia`, `block_update_clip` | margin trigger + integer step |
 | margin lane | `margin_theta_pos/neg`, `margin_weight`, `self_supervised_induction` | trains `W_Q/W_K` |
 
 ## Running

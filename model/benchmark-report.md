@@ -45,17 +45,17 @@ For a `D=256, n_layers=2, n_heads=4, d_ff=512, vocab=256` model:
 | metric | value |
 |--------|-------|
 | forward unpacks (hardmax) | **0** (fully packed hot path) |
-| parameter footprint (int16 `H`) | ≈ 2.89 MB (1.44 M 1-bit params) |
-| equivalent fp32 + Adam footprint (weight + m + v) | ≈ 17.3 MB |
-| **memory ratio** | **≈ 6× smaller** |
+| parameter footprint (int8 `H`) | ≈ 1.38 MB (1.38 M 1-bit params) |
+| equivalent fp32 + Adam footprint (weight + m + v) | ≈ 16.53 MB |
+| **memory ratio** | **≈ 12× smaller** |
 
 BEP carries **no per-parameter optimiser state** (no momentum, no Adam moments),
-so the train-time parameter memory is exactly the int16 hidden weights. The soft
+so the train-time parameter memory is exactly the int8 hidden weights. The soft
 value-combine accumulator is **int8**. These contracts are enforced in
 `tests/test_memory.py` and `tests/test_efficiency_contracts.py`.
 
 ## test suite
 
-`.venv/bin/python -m pytest model/tests -q` — 169 tests (CPU + MPS), 4 slow
-end-to-end probes behind `--run-slow`, plus the Stage-B `signed_bundle` kernel
+`.venv/bin/python -m pytest model/tests -q --run-slow` — 173 tests (CPU + MPS),
+including end-to-end learnability probes and the Stage-B `signed_bundle` kernel
 parity (CPU + MPS; CUDA compile-checked only).

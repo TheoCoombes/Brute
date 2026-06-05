@@ -15,7 +15,7 @@ float) and ``unpack_bool`` (→ bool bytes; the substrate of every ``.bool()`` /
   ever materialised, forward *or* backward.  ``unpack_bool`` is permitted only at
   BEP weight-gradient / codebook granularity (never per token-pair), so its count
   is bounded far below the O(B·n²) sequence core.
-* The parameter footprint is exactly the int16 hidden weights ``H`` (≈ 2 bytes per
+* The parameter footprint is exactly the int8 hidden weights ``H`` (≈ 1 byte per
   1-bit parameter) — no float copies anywhere.
 """
 
@@ -64,7 +64,7 @@ def _unpack_guard(raise_on=(), count=True):
 def _model(attn_mode="hardmax", value_proj=True, n_layers=2):
     cfg = TransformerConfig(vocab_size=48, D=128, n_layers=n_layers, n_heads=2,
                             d_ff=256, attn_mode=attn_mode, value_proj=value_proj,
-                            sem_weight=0.5, seed=0)
+                            seed=0)
     return BinaryTransformerLM(cfg)
 
 
@@ -88,7 +88,7 @@ def test_forward_hardmax_value_proj_false_never_unpacks():
 
 def test_training_step_never_materialises_dense_pm1():
     m = _model(attn_mode="hardmax")
-    opt = BepOptimizer(m.parameters(), BepConfig(r=0.1))
+    opt = BepOptimizer(m.parameters(), BepConfig())
     ids = torch.randint(0, 48, (4, 8))
     tgt = torch.randint(0, 48, (4, 8))
     with _unpack_guard(raise_on=("unpack_bits",)) as counts:
@@ -103,7 +103,7 @@ def test_backward_unpack_bool_is_bounded():
     active-row granularity in backward — never per token-pair (O(B·n²))."""
     B, n = 4, 8
     m = _model(attn_mode="hardmax", n_layers=2)
-    opt = BepOptimizer(m.parameters(), BepConfig(r=0.1))
+    opt = BepOptimizer(m.parameters(), BepConfig())
     ids = torch.randint(0, 48, (B, n))
     tgt = torch.randint(0, 48, (B, n))
     with _unpack_guard() as counts:
@@ -114,19 +114,19 @@ def test_backward_unpack_bool_is_bounded():
     assert counts["unpack_bool"] < B * n * n, counts
 
 
-# ── parameter footprint: int16 H only ───────────────────────────────────────────
+# ── parameter footprint: int8 H only ────────────────────────────────────────────
 
-def test_param_bytes_is_int16_hidden_weight():
+def test_param_bytes_is_int8_hidden_weight():
     m = _model()
     n_bits = m.num_bit_parameters()
     pbytes = m.param_bytes()
-    assert pbytes == 2 * n_bits, f"{pbytes} != 2*{n_bits}"
+    assert pbytes == n_bits, f"{pbytes} != {n_bits}"
 
 
-def test_all_params_are_int16_no_floats():
+def test_all_params_are_int8_no_floats():
     m = _model()
     for p in m.parameters():
-        assert p.H.dtype == torch.int16, (p.name, p.H.dtype)
+        assert p.H.dtype == torch.int8, (p.name, p.H.dtype)
         assert not p.H.is_floating_point()
 
 

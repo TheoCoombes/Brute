@@ -121,9 +121,11 @@ def run_efficiency(g):
                      "fully packed"))
     n = m.num_bit_parameters()
     rows.append(_row("efficiency", "param footprint", round(m.param_bytes() / 1e6, 3), "MB",
-                     f"{n:,} bit-params, int16 H"))
-    rows.append(_row("efficiency", "vs fp32+Adam footprint", round((n * 12) / 1e6, 3), "MB",
-                     "weight+m+v; ~6x larger"))
+                     f"{n:,} bit-params, int8 H"))
+    float_adam_bytes = n * 12
+    ratio = float_adam_bytes / max(m.param_bytes(), 1)
+    rows.append(_row("efficiency", "vs fp32+Adam footprint", round(float_adam_bytes / 1e6, 3), "MB",
+                     f"weight+m+v; ~{ratio:.0f}x larger"))
     return rows
 
 

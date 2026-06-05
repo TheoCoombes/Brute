@@ -95,24 +95,23 @@ def retrieval_config(V: int, *, D: int = 128, n_heads: int = 1, n_layers: int = 
     clean codeword; strict-causal + a recency-dominant ALiBi slope so attention
     selects the previous token; the residual gate initialised mostly open (no
     cold-start transient on a clean transport); and gentle BEP updates so the
-    readout/codebook co-adaptation converges instead of running away.
+    lm_head/codebook co-adaptation converges instead of running away.
     """
     return TransformerConfig(
         vocab_size=V, D=D, n_layers=n_layers, n_heads=n_heads, d_ff=2 * D,
         attn_mode=attn_mode, residual_mode="mux", value_proj=False,
         causal_strict=True, alibi=True,
         alibi_slopes_override=tuple([2 * (D // n_heads) + 1] * n_heads),
-        gate_open=0.9, r=0.04, max_trigger_rate=0.08, readout_warmup_steps=30,
+        gate_open=0.9, r=0.04, max_trigger_rate=0.08, lm_head_warmup_steps=30,
         update_clip=3, block_init_inertia=8, block_update_clip=1,
-        self_supervised_induction=False, margin_weight=0.0, sem_weight=0.0, seed=seed)
+        self_supervised_induction=False, margin_weight=0.0, seed=seed)
 
 
 def train_prev_token(model: BinaryTransformerLM, *, steps: int = 600, B: int = 16,
-                     n: int = 16, V: int = 16, r: float = 0.04,
-                     seed: int = 1) -> float:
+                     n: int = 16, V: int = 16, seed: int = 1) -> float:
     """Train ``model`` on previous-token copy; return best masked accuracy."""
     g = torch.Generator(device="cpu").manual_seed(seed)
-    opt = BepOptimizer(model.parameters(), BepConfig(r=r))
+    opt = BepOptimizer(model.parameters(), BepConfig())
     best = 0.0
     for step in range(1, steps + 1):
         X, Y, _ = prev_token_batch(B, n, V, g)

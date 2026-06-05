@@ -2,7 +2,7 @@
 
 The whole point of a 1-bit, BEP-trained model is a tiny, fixed memory budget:
 
-* **Parameters** are *only* the int16 hidden weights ``H`` (~2 bytes / 1-bit
+* **Parameters** are *only* the int8 hidden weights ``H`` (~1 byte / 1-bit
   weight) — no float copies.
 * **Training overhead is ~zero**: BEP carries no per-parameter optimiser state
   (no Adam moments, no float momentum), unlike a float transformer which needs
@@ -37,13 +37,13 @@ def _model(attn_mode="soft", **kw):
 
 # ── parameter footprint ──────────────────────────────────────────────────────
 
-def test_parameters_are_int16_only():
+def test_parameters_are_int8_only():
     m = _model()
     total = 0
     for p in m.parameters():
-        assert p.H.dtype == torch.int16
+        assert p.H.dtype == torch.int8
         total += p.H.nbytes
-    assert total == m.param_bytes() == 2 * m.num_bit_parameters()
+    assert total == m.param_bytes() == m.num_bit_parameters()
 
 
 def test_no_float_buffers_anywhere():
@@ -70,7 +70,7 @@ def test_optimizer_has_no_per_parameter_float_state():
     for _ in range(3):
         m.loss_and_backward(m.forward(ids), tgt)
         opt.step()
-    # The only growth allowed is the (already-allocated) int16 H; nothing float.
+    # The only growth allowed is the (already-allocated) int8 H; nothing float.
     after = m.param_bytes()
     assert after == before, "param footprint changed during training"
     # The optimiser stores only references to BepParams, no momentum tensors.
@@ -80,11 +80,11 @@ def test_optimizer_has_no_per_parameter_float_state():
 
 
 def test_training_overhead_far_below_float_adam():
-    """The binary model's *total* train-time parameter memory (int16 H) is a small
+    """The binary model's *total* train-time parameter memory (int8 H) is a small
     fraction of an equivalent fp32 + Adam transformer (weight + 2 moments)."""
     m = _model()
     n = m.num_bit_parameters()
-    binary_bytes = m.param_bytes()                  # int16 H
+    binary_bytes = m.param_bytes()                  # int8 H
     float_adam_bytes = n * (4 + 4 + 4)              # fp32 weight + Adam m + v
     assert binary_bytes <= float_adam_bytes / 4, (binary_bytes, float_adam_bytes)
 
@@ -95,8 +95,8 @@ def test_soft_attention_weights_are_int8():
     m = _model(attn_mode="soft")
     ids = torch.randint(0, 256, (3, 6))
     m.forward(ids)
-    for blk in m.blocks:
-        for w in blk.mha._cache["w_heads"]:
+    for blk in m.h:
+        for w in blk.attn._cache["w_heads"]:
             assert w is not None and w.dtype == torch.int8
 
 

@@ -35,7 +35,8 @@ import as `model`, `attention`, `layers`, `bep`, `vsa`, `data` (no package prefi
 
 The non-transformer mixers (`BSR`, `HopfieldBank`, `EpisodicSlotMemory`,
 `ResidualMerge`) were removed; their useful backward patterns were lifted into
-`attention.py` (value path) and `MajorityResidual` (gate update).
+`attention.py` (value path) and `MajorityResidual` (gate update). The live model
+uses GPT-style public names: `wte`, `h[i].attn`, `h[i].mlp`, and `lm_head`.
 
 ## bit1 conventions & gotchas (read before editing the hot path)
 
@@ -98,17 +99,15 @@ not run.** After editing any `cbrute/` file: rebuild, then run both
 | `gate_open` | residual admittance init openness | `0.05` (LM) … `0.9` (clean retrieval) |
 | `alibi` / `alibi_slopes_override` | integer recency bias; slopes scale to `d_h` | last head ≈ `2·d_h+1` = recency |
 | `r` / `margin_r_final` / `margin_anneal_steps` | BEP margin trigger fraction (anneal) | `r∈[0.02,0.15]` |
-| `readout_warmup_steps` | codebook-only warm start | `15–40` |
+| `lm_head_warmup_steps` | LM-head-only warm start | `15–40` |
 | `max_trigger_rate` | cap hidden BEP update rows / step | `0.05–0.3` (gentle) |
 | `update_clip` / `block_update_clip` | per-step `ΔH` clamp | `1–3` |
 | `init_inertia` / `block_init_inertia` | initial `|H|` (plasticity vs stability) | head `1`, blocks `4–16` |
-| `bits` | `H` clip width `±2^{bits-1}` | `15` |
-| `sem_weight` | semantic rerank lane weight | `0`–`0.5` |
 | `margin_weight` / `self_supervised_induction` | train `W_Q/W_K` from induction | on for content tasks |
 
 **Gentle-update recipe for retrieval** (`tests/_helpers.py::retrieval_config`):
 `value_proj=False, residual_mode='mux', causal_strict=True, gate_open=0.9,
-recency slope, r=0.04, max_trigger_rate=0.08, readout_warmup_steps=30,
+recency slope, r=0.04, max_trigger_rate=0.08, lm_head_warmup_steps=30,
 update_clip=3, block_init_inertia=8, block_update_clip=1`.
 
 ## Adding tests

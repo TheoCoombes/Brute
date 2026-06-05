@@ -11,7 +11,7 @@ actually prescribed by the papers:
   * **BOLD** (Boolean Logic Deep Learning): the visible weight is ``W = sign(H)``
     — there is no float copy of the weight and no float optimisation signal.
 
-The only large allocation per parameter is the integer ``H`` (Int16); the
+The only large allocation per parameter is the integer ``H`` (Int8); the
 visible bit weight ``W = sign(H)`` is derived (≈1 bit/weight) and cached.  No
 float tensors are held by any parameter, and nothing float crosses a layer
 boundary — signals on the wire are bit1 desired activations plus an optional
@@ -37,6 +37,11 @@ import brute
 from brute.tensor import Tensor as _BT
 
 from vsa import sign_to_bit1
+
+
+H_DTYPE = torch.int8
+H_MIN = -128
+H_MAX = 127
 
 
 # ── packed bit helpers ─────────────────────────────────────────────────────────
@@ -70,7 +75,7 @@ def combine_desired(a_bit: brute.Tensor, b_bit: Optional[brute.Tensor],
     return mux(agree, a_bit, tie_bit)
 
 
-def pm1_int(bit: brute.Tensor, dtype=torch.int16) -> torch.Tensor:
+def pm1_int(bit: brute.Tensor, dtype=torch.int8) -> torch.Tensor:
     """bit1 → ±1 integer tensor (True→+1, False→-1).  Not an ``unpack_pm1``."""
     return bit.bool().to(dtype).mul_(2).sub_(1)
 
@@ -118,7 +123,7 @@ def active_mask() -> Optional[torch.Tensor]:
 class BepParam:
     """A single Boolean parameter trained by BEP: integer ``H``, ``W = sign(H)``.
 
-    ``H`` (Int16) is the only significant buffer — the "weight inertia/momentum"
+    ``H`` (Int8) is the only significant buffer — the "weight inertia/momentum"
     of BEP §3.3.  ``bit = sign(H)`` (``H ≥ 0 → +1/True``) is the visible 1-bit
     weight read by every forward; it is derived and cached, refreshed lazily when
     ``H`` changes.  There is **no** float ``q``, **no** float ``pm1``, **no**
@@ -126,17 +131,14 @@ class BepParam:
     """
 
     __slots__ = ("name", "H", "_bit", "_dirty", "_prev_sign", "shape", "device",
-                 "bits", "p_r", "lr", "update_clip")
+                 "lr", "update_clip")
 
-    def __init__(self, H: torch.Tensor, name: str = "", *, bits: int = 15,
-                 p_r: float = 0.0, lr: int = 1,
+    def __init__(self, H: torch.Tensor, name: str = "", *, lr: int = 1,
                  update_clip: Optional[int] = None):
         self.name = name
-        self.H = H.to(torch.int16)
+        self.H = H.to(H_DTYPE)
         self.shape = tuple(H.shape)
         self.device = H.device
-        self.bits = bits                 # H clipped to [-(2^{bits-1}), 2^{bits-1}-1]
-        self.p_r = p_r                   # CP+R reinforcement probability (BEP §3.3)
         self.lr = lr                     # integer update scale (BEP "learning rate")
         self.update_clip = update_clip   # optional per-step elementwise ΔH clamp
         self._bit: Optional[brute.Tensor] = None
@@ -157,7 +159,7 @@ class BepParam:
 
         Stores a saturated ±1 hidden weight consistent with the requested signs.
         """
-        self.H = pm1_int(new_bit).reshape(self.shape).to(self.device)
+        self.H = pm1_int(new_bit, torch.int8).reshape(self.shape).to(self.device)
         self._bit = new_bit
         self._dirty = False
 
@@ -169,18 +171,30 @@ class BepParam:
         if self.update_clip is not None:
             clip = int(self.update_clip)
             delta_int = delta_int.clamp(-clip, clip)
-        self.H += delta_int.to(torch.int16)
+        updated = self.H.to(torch.int32) + delta_int.to(torch.int32)
+        self.H.copy_(updated.clamp_(H_MIN, H_MAX).to(H_DTYPE))
         self._dirty = True
+
+    def sparse_accumulate_rows(self, indices: torch.Tensor, delta_rows: torch.Tensor) -> None:
+        """Sparse row update with duplicate-index coalescing and int8 saturation."""
+        idx = indices.to(device=self.device, dtype=torch.long).reshape(-1)
+        if idx.numel() == 0:
+            return None
+        rows = delta_rows.to(device=self.device, dtype=torch.int32).reshape(idx.numel(), -1)
+        if rows.shape[1] != self.H.shape[1]:
+            rows = rows.reshape(idx.numel(), self.H.shape[1])
+        uniq, inv = torch.unique(idx, sorted=False, return_inverse=True)
+        coalesced = torch.zeros((uniq.numel(), self.H.shape[1]), dtype=torch.int32,
+                                device=self.device)
+        coalesced.index_add_(0, inv, rows)
+        base = self.H.index_select(0, uniq).to(torch.int32)
+        self.H.index_copy_(0, uniq, (base + coalesced).clamp_(H_MIN, H_MAX).to(H_DTYPE))
+        self._dirty = True
+        return None
 
     @torch.no_grad()
     def step(self) -> int:
-        """Clip ``H``, optional CP+R reinforcement, return #bits whose sign flipped."""
-        lim = 1 << (self.bits - 1)
-        self.H.clamp_(-lim, lim - 1)
-        if self.p_r > 0:
-            mask = torch.rand(self.shape, device=self.device) < self.p_r
-            self.H += (mask * (2 * torch.sign(self.H).to(torch.int16))).to(torch.int16)
-            self.H.clamp_(-lim, lim - 1)
+        """Return #visible bits whose sign flipped since the previous step."""
         cur = self.H >= 0
         n_flip = 0 if self._prev_sign is None else int((cur != self._prev_sign).sum().item())
         self._prev_sign = cur.clone()
@@ -192,7 +206,7 @@ class BepParam:
         return {"H": self.H.detach().cpu().clone(), "shape": self.shape}
 
     def load_state_dict(self, sd: dict) -> None:
-        self.H = sd["H"].to(self.device).to(torch.int16)
+        self.H = sd["H"].to(self.device).to(torch.int32).clamp_(H_MIN, H_MAX).to(H_DTYPE)
         self.shape = tuple(sd["shape"])
         self._dirty = True
         self._prev_sign = None
@@ -248,11 +262,6 @@ def linear_backward(param: BepParam, a_star_out_bit: brute.Tensor,
 
 @dataclass
 class BepConfig:
-    r: float = 0.0          # margin trigger fraction (logit[tgt] − max_other < r·D)
-    nu: Optional[float] = None   # eligibility gate |z| ≤ ν·in_dim (stage-2; off)
-    p_r: float = 0.0        # CP+R reinforcement probability (BEP §3.3)
-    bits: int = 15          # integer H bit-width (clip range)
-    gamma: int = 1          # winner-takes-update group size (stage-2; 1 = off)
     lr: int = 1             # integer update scale
     update_clip: Optional[int] = None  # optional elementwise ΔH clamp
 
@@ -264,8 +273,6 @@ class BepOptimizer:
         self.params: List[BepParam] = list(params)
         self.config = config or BepConfig()
         for p in self.params:
-            p.p_r = self.config.p_r
-            p.bits = self.config.bits
             p.lr = self.config.lr
             if self.config.update_clip is not None:
                 p.update_clip = int(self.config.update_clip)
@@ -300,8 +307,7 @@ class BepOptimizer:
 # ── helpers ─────────────────────────────────────────────────────────────────────
 
 def random_bit_param(shape, name: str, *, generator: Optional[torch.Generator] = None,
-                     device=None, p_true: float = 0.5, bits: int = 15,
-                     init_inertia: int = 1,
+                     device=None, p_true: float = 0.5, init_inertia: int = 1,
                      update_clip: Optional[int] = None) -> BepParam:
     """A :class:`BepParam` with ``H`` initialised to small balanced ±1 ints.
 
@@ -309,8 +315,8 @@ def random_bit_param(shape, name: str, *, generator: Optional[torch.Generator] =
     backward step can already flip a bit (small ``|H|`` ⇒ fast early plasticity).
     """
     signs = (torch.rand(shape, generator=generator) < p_true)        # CPU generator
-    inertia = max(1, int(init_inertia))
-    H = signs.to(torch.int16).mul_(2).sub_(1).mul_(inertia)          # ±inertia
+    inertia = max(1, min(int(init_inertia), H_MAX))
+    H = signs.to(torch.int8).mul_(2).sub_(1).mul_(inertia)           # ±inertia
     if device is not None:
         H = H.to(device)
-    return BepParam(H, name=name, bits=bits, update_clip=update_clip)
+    return BepParam(H, name=name, update_clip=update_clip)
