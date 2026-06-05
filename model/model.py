@@ -70,6 +70,7 @@ class TransformerConfig:
     # BEP training (margin trigger + fixed prototypes, reinforcement)
     r: float = 0.1                      # margin trigger: logit[tgt] − max_other < r·D
     train_output_codebook: bool = True
+    freeze_codebook_after_warmup: bool = False  # if True: codebook frozen after warmup_steps
     margin_r_final: Optional[float] = None
     margin_anneal_steps: int = 0
     readout_warmup_steps: int = 0
@@ -369,6 +370,11 @@ class BinaryTransformerLM:
             and cfg.readout_warmup_steps > 0
             and self._train_step < cfg.readout_warmup_steps
         )
+        codebook_frozen = (
+            cfg.freeze_codebook_after_warmup
+            and cfg.readout_warmup_steps > 0
+            and self._train_step >= cfg.readout_warmup_steps
+        )
         if readout_warmup:
             hidden_trigger = torch.zeros_like(trigger)
         else:
@@ -386,7 +392,7 @@ class BinaryTransformerLM:
         ell_margin_des = mux(agree, ell_bit, proto)
         ell_des = mux(sel, ell_margin_des, ell_bit)
         chat_flat = self._fwd_cache["chat_flat"]
-        if cfg.train_output_codebook:
+        if cfg.train_output_codebook and not codebook_frozen:
             decode_update = trigger & (pred != tgt)
             self.codebook.backward_decode(ell_bit, safe_tgt, wrong, decode_update)
         # only triggered positions inject a backward signal (BEP); the rest carry
@@ -420,7 +426,8 @@ class BinaryTransformerLM:
             if fbit is not None:
                 g_c = brute.fast.bitwise_xor(g_c, fbit)    # un-flip the dropout noise
         g_emb = self.input_bind.backward(g_c)
-        self.codebook.backward_embed(g_emb)
+        if not codebook_frozen:
+            self.codebook.backward_embed(g_emb)
         bep.set_active(None)
         self._train_step += 1
 

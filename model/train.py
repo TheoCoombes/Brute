@@ -49,7 +49,7 @@ import torch
 import brute  # noqa: F401 — ensure the extension is importable
 
 from bep import BepConfig, BepOptimizer
-from data import make_lm_batches, wikitext
+from data import make_lm_batches, wikitext, tiny_shakespeare, tiny_shakespeare_char
 from model import TransformerConfig, BinaryTransformerLM, IGNORE_INDEX
 
 
@@ -104,7 +104,8 @@ def sample_demo(model, corpus, prompt, n_new, *, temperature, top_k, rep_window)
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--dataset", default="wikitext-2", choices=["wikitext-2", "wikitext-103"])
+    p.add_argument("--dataset", default="wikitext-2",
+                   choices=["wikitext-2", "wikitext-103", "tiny-shakespeare", "tiny-shakespeare-char"])
     p.add_argument("--data-root", default="./.data")
     p.add_argument("--max-train-tokens", type=int, default=None,
                    help="Truncate the training stream (faster local demo).")
@@ -140,6 +141,8 @@ def main():
                    help="optional elementwise ΔH clamp for stacked blocks.")
     p.add_argument("--readout-warmup-steps", type=int, default=25,
                    help="codebook-only steps before hidden/block BEP updates.")
+    p.add_argument("--freeze-codebook-after-warmup", action="store_true", default=False,
+                   help="freeze codebook after readout warmup: transformer trains against fixed char prototypes.")
     p.add_argument("--margin-r-final", type=float, default=0.0,
                    help="final BEP margin fraction after annealing.")
     p.add_argument("--margin-anneal-steps", type=int, default=100,
@@ -165,7 +168,7 @@ def main():
     p.add_argument("--device", default="cpu", choices=["cpu", "mps", "cuda"])
     p.add_argument("--eval-every", type=int, default=100)
     p.add_argument("--sample-every", type=int, default=100)
-    p.add_argument("--prompt", default="The history of")
+    p.add_argument("--prompt", default="ROMEO:")
     p.add_argument("--sample-len", type=int, default=40)
     p.add_argument("--temperature", type=float, default=0.8)
     p.add_argument("--sample-top-k", type=int, default=20)
@@ -181,8 +184,15 @@ def main():
     structured_codebook = codebook_mode != "random"
 
     print(f"loading {args.dataset} with full GPT-2 tokenizer (codebook={codebook_mode}) …")
-    corpus = wikitext(name=args.dataset, data_root=args.data_root,
-                      max_train_tokens=args.max_train_tokens)
+    if args.dataset == "tiny-shakespeare-char":
+        corpus = tiny_shakespeare_char(data_root=args.data_root)
+    elif args.dataset == "tiny-shakespeare":
+        # convert token cap to char cap (≈4 chars/token) so we truncate before encoding
+        max_chars = args.max_train_tokens * 5 if args.max_train_tokens is not None else None
+        corpus = tiny_shakespeare(data_root=args.data_root, max_chars=max_chars)
+    else:
+        corpus = wikitext(name=args.dataset, data_root=args.data_root,
+                          max_train_tokens=args.max_train_tokens)
     V = corpus.vocab_size
     Xtr, Ytr = make_lm_batches(corpus.train_ids, seq_len=args.seq_len,
                                seed=args.seed, shuffle=True)
@@ -208,6 +218,7 @@ def main():
                             block_init_inertia=args.block_init_inertia,
                             block_update_clip=args.block_update_clip,
                             readout_warmup_steps=args.readout_warmup_steps,
+                            freeze_codebook_after_warmup=args.freeze_codebook_after_warmup,
                             margin_r_final=args.margin_r_final,
                             margin_anneal_steps=args.margin_anneal_steps,
                             max_trigger_rate=args.max_trigger_rate,
