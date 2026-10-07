@@ -11,12 +11,6 @@ Packed 1-bit tensors for extremely fast binary neural network modelling in PyTor
 ## Installation
 
 ```bash
-pip install brute
-```
-
-### From Source
-
-```bash
 git clone --recurse-submodules -j8 https://github.com/TheoCoombes/Brute.git
 cd Brute
 pip install --no-build-isolation -ve .
